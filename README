@@ -1,0 +1,72 @@
+
+
+
+1. Introduction
+
+This FUSE fs is a service to monitor filesystem changes and send connected client apps 
+messages when events (changes) occur.
+
+Clients register itself to notifyfs by connecting to the "notifyfssocket" and send an
+initial "register" message. The client receives messages when something happens on
+watches the client is interested in.
+
+Setting of a watch is done using Extended Attributes like:
+
+mkdir %ROOT of INOTIFYFS%/some/dir
+setxattr --name=system.notifyfs_mask --value=%MASK% %ROOT of INOTIFYFS%/some/dir
+
+this will set a watch with mask %MASK% on /some/dir.
+
+When client does not have enough permissions (read access) it will be reported.
+
+When dealing with a local filesystem on Linux, notifyfs uses as default inotify
+to set/remove a watch on the backend. It's my intention to add the ability to 
+forward a request to set a watch/mask to a underlying fs. I'm thinking especially
+about other FUSE fs's, cifs and nfs.
+
+It's up to the backend filesystem to use the right backend filesystem change method.
+When dealing with a simple FUSE overlay fs, this fs will use inotify to set a watch
+on the underlying fs. CIFS for linux, cifs, will probably have to do a SMB_CHANGE_NOTIFY.
+
+
+2. Features
+
+Notifyfs is able to do the following:
+
+a. let client apps connect, and allow these to set/remove a watch with a specific mask.
+
+b. different access modes. As notifyfs is a FUSE fs, it's browseable. This is by default 
+by anyone. You can consider this as a security flaw. Therefore notifyfs has different
+accessmodes:
+ b1. Only the apps which are known to notifyfs (which are registerd) should have access, 
+ browse and set/remove watches. This is one accessmode.
+ b2. Second accessmode is to allow root.
+ b3. Third accessmode is to allow anyone.
+
+ The latest is very helpfull to test the fs.
+
+c. let client fs's connect, and forward watch requests to this fs, and listen to the fs
+for events
+
+d. monitor the mounts (via /proc/self/mountinfo), and integrate the adding and removing of 
+mounts in the fs. This means that at startup the fs is "filled" with every mountpoint found
+on the system.
+It tries to detect a filesystem is mounted by autofs or not, and if so, it is a direct or 
+indirect mount.
+
+ d1. importance of autofs mounts. When a fs is unmounted, the default behaviour is that watches
+ set on that fs, are removed. When dealing with a mount managed by autofs is unmounted, 
+ notifyfs sets the watches in "sleep mode". The "backend watches" are removed, like
+ inotify_rm_watch for inotify, but the watch reference in notifyfs is kept, as well
+ as the inode and the entry (tree). Whenever the mount is up again, the watches are
+ reestablished/set again.
+
+ 20120307:
+ When dealing with an autofs managed mount, I'm thinking about a "cache compare function":
+ when a watch on a directory is set, and it's mask tells it to watch the entries for
+ changes also, cache the contents of that directory. It is simple to keep this cache
+ up to date, since the watch set, tells notifyfs everytime something changes. It's up
+ to notifyfs to also take in account not only that something has changed, but also what.
+ When a fs is mounted (by autofs) again then its possible to compare the directory contents, 
+ and send notifyfs messages to clients reporting the changes.
+
