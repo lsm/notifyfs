@@ -1,0 +1,65 @@
+20120306
+
+. 
+
+20120301
+
+. add a fstab monitor half done
+. test with an other underlying fuse fs to forward, and receive (i)notify messages from this fs
+required is the fuse fs to register and handle forwarded messages, and send back
+
+
+
+20120226
+
+. make update_notifyfs handle MOUNTENTRY_REMOVED_KEEP done
+. add MOUNTENTRY_REMOVED_KEEP to get_next_mount_entry etc. done
+. make the mountmonitor thread do the initial reading of the mounttable done
+. add different targets of logging like EVENTLOOP, FUSEFS, MOUNTMONITOR etc.. done
+. make the fs still show entries on not mounted autofs fs's done
+
+20120212
+
+. a special thread is not a good idea, every operation should performed by the thread detecting the problem
+. add the detection of changes in the mounttable
+. test with big tables
+
+20120210
+
+. a special thread to mantain fs, with queue 
+. add I_DELETE_SELF and I_MOVE_SELF to mask for fs self, watch for I_UNMOUNT when reading events
+. add a cache???? 
+. when removing a watch, make the fs "shrink" automatically
+
+20120124
+
+. test the new access function when access a directory, create an entry
+. test permissions doe mkdir and mknod
+. remove a tree, recursive call, something like:
+
+remove_entry
+
+    for every child entry
+
+        if isdir
+
+            if children
+
+                remove_entry for every child 
+
+            else
+
+                remove_entry
+
+
+
+        else
+
+            remove_entry
+
+    done
+
+
+.
+
+
