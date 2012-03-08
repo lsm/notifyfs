@@ -113,10 +113,10 @@ static int check_groupmember(fuse_req_t req, gid_t group)
 
 */
 
-int check_access(fuse_req_t req, const struct fuse_ctx *ctx, struct stat *st, int mask)
+int check_access(fuse_req_t req, struct stat *st, int mask)
 {
     int nreturn=0, res;
-
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     /* deny execute and write on everything but directories */
 

@@ -822,6 +822,7 @@ void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_st
     call_info->next=NULL;
     call_info->prev=NULL;
     call_info->mount_entry=NULL;
+    call_info->ctx=NULL;
 
 }
 

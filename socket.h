@@ -38,6 +38,7 @@
 #define NOTIFYFS_MESSAGE_TYPE_DELWATCH         7
 #define NOTIFYFS_MESSAGE_TYPE_SLEEPWATCH       8
 #define NOTIFYFS_MESSAGE_TYPE_WAKEWATCH        9
+#define NOTIFYFS_MESSAGE_TYPE_MOUNTENTRY       10
 
 
 struct client_message_struct {

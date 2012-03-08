@@ -34,9 +34,9 @@ struct xattr_workspace_struct {
 
 // Prototypes
 
-int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call_info, const char *name, const char *value);
-void getxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call_info, const char *name, struct xattr_workspace_struct *xattr_workspace);
-int listxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call_info, char *list, size_t size);
+int setxattr4workspace(struct call_info_struct *call_info, const char *name, const char *value);
+void getxattr4workspace(struct call_info_struct *call_info, const char *name, struct xattr_workspace_struct *xattr_workspace);
+int listxattr4workspace(struct call_info_struct *call_info, char *list, size_t size);
 
 #endif
 

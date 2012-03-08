@@ -159,9 +159,9 @@ if ( st_to && st_from) {
 
     /* time defined as timespec */
 
-    st_to->st_atim.tv_nsec=st_from->st_atim.tv_nsec
-    st_to->st_mtim.tv_nsec=st_from->st_mtim.tv_nsec
-    st_to->st_ctim.tv_nsec=st_from->st_ctim.tv_nsec
+    st_to->st_atim.tv_nsec=st_from->st_atim.tv_nsec;
+    st_to->st_mtim.tv_nsec=st_from->st_mtim.tv_nsec;
+    st_to->st_ctim.tv_nsec=st_from->st_ctim.tv_nsec;
 
 #else
 

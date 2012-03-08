@@ -27,6 +27,12 @@
 #define NOTIFYFS_INODE_STATUS_REMOVED	2
 #define NOTIFYFS_INODE_STATUS_SLEEP	3
 
+#define NOTIFYFS_INODE_ACTION_NOTSET	0
+#define NOTIFYFS_INODE_ACTION_CREATE	1
+#define NOTIFYFS_INODE_ACTION_REMOVE	2
+#define NOTIFYFS_INODE_ACTION_SLEEP	3
+#define NOTIFYFS_INODE_ACTION_WAKEUP	4
+
 #define BACKEND_METHOD_NOTSET   0
 #define BACKEND_METHOD_INOTIFY  1
 #define BACKEND_METHOD_POLLING  2
@@ -108,6 +114,7 @@ struct call_info_struct {
     struct call_info_struct *next;
     struct call_info_struct *prev;
     struct mount_entry_struct *mount_entry;
+    const struct fuse_ctx *ctx;
 };
 
 // Prototypes

@@ -56,7 +56,7 @@
 extern struct notifyfs_options_struct notifyfs_options;
 
 
-int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call_info, const char *name, const char *value)
+int setxattr4workspace(struct call_info_struct *call_info, const char *name, const char *value)
 {
     int nvalue, nreturn=-ENOATTR;
 
@@ -124,7 +124,7 @@ int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call
         int res=0;
         int oldmask=0, newmask=0;
         struct notifyfs_inode_struct *inode;
-        struct client_struct *client=lookup_client(ctx->pid, 0);
+        struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
 
         if ( notifyfs_options.testmode==0 ) {
 
@@ -248,7 +248,12 @@ int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call
             if ( newmask != oldmask ) {
 
 		effective_watch->mask=newmask;
-        	set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+		if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+
+        	    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+		}
 
 	    }
 
@@ -263,7 +268,7 @@ int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call
 
         while (watch) {
 
-            if (watch->client->pid==ctx->pid) break;
+            if (watch->client->pid==call_info->ctx->pid) break;
             watch=watch->next_per_watch;
 
         }
@@ -332,7 +337,12 @@ int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call
                 if ( newmask != oldmask ) {
 
 		    effective_watch->mask=newmask;
-            	    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+		    if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+
+        		set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+		    }
 
 		}
 
@@ -370,7 +380,12 @@ int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call
 		    if ( newmask != oldmask ) {
 
 			effective_watch->mask=newmask;
-			set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+			if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+
+        		    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+			}
 
 		    }
 
@@ -379,7 +394,11 @@ int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call
                     effective_watch->mask=0;
                     newmask=0;
 
-		    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+		    if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+
+			set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+		    }
 
 		}
 
@@ -420,7 +439,11 @@ int setxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call
 
 			effective_watch->mask=newmask;
 
-			set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+			if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+
+			    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+
+			}
 
 		    }
 
@@ -517,7 +540,7 @@ static void fill_in_simplestring(struct xattr_workspace_struct *xattr_workspace,
 
 }
 
-void getxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call_info, const char *name, struct xattr_workspace_struct *xattr_workspace)
+void getxattr4workspace(struct call_info_struct *call_info, const char *name, struct xattr_workspace_struct *xattr_workspace)
 {
 
     xattr_workspace->nerror=-ENOATTR; /* start with attr not found */
@@ -594,7 +617,7 @@ void getxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *cal
         return;
 
     } else if ( strcmp(name, "mask")==0 ) {
-        struct client_struct *client=lookup_client(ctx->pid, 0);
+        struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
 
         logoutput3("getxattr4workspace, found: mask");
 
@@ -609,7 +632,7 @@ void getxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *cal
 
                 /* watch found for this client */
 
-                mask=get_clientmask(call_info->entry->inode->effective_watch, ctx->pid, 0);
+                mask=get_clientmask(call_info->entry->inode->effective_watch, call_info->ctx->pid, 0);
 
             }
 
@@ -639,7 +662,7 @@ void getxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *cal
 
     } else if ( strcmp(name, "id")==0 ) {
         unsigned long id=0;
-        struct client_struct *client=lookup_client(ctx->pid, 0);
+        struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
 
         logoutput3("getxattr4workspace, found: id");
 
@@ -651,7 +674,7 @@ void getxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *cal
 
             if ( call_info->entry->inode->effective_watch ) {
 
-                id=get_clientid(call_info->entry->inode->effective_watch, ctx->pid, 0);
+                id=get_clientid(call_info->entry->inode->effective_watch, call_info->ctx->pid, 0);
 
             }
 
@@ -714,11 +737,11 @@ static int add_xattr_to_list(struct xattr_workspace_struct *xattr_workspace, cha
 }
 
 
-int listxattr4workspace(const struct fuse_ctx *ctx, struct call_info_struct *call_info, char *list, size_t size)
+int listxattr4workspace(struct call_info_struct *call_info, char *list, size_t size)
 {
     unsigned nlenlist=0;
     struct xattr_workspace_struct *xattr_workspace;
-    struct client_struct *client=lookup_client(ctx->pid, 0);
+    struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
 
 
     logoutput2("listxattr4workspace");

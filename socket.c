@@ -365,3 +365,266 @@ int send_notify_message(int fd, unsigned char type, unsigned long id, int mask, 
     return res;
 
 }
+
+/* sending mount data via socket to clients */
+
+int send_mount_message(int fd, struct mount_entry_struct *mount_entry)
+{
+    struct msghdr msg;
+    struct iovec io_vector[14];
+    char *controlbuffer;
+    struct cmsghdr *cmptr;
+    int nreturn=0;
+
+    /* create the control buffer, a control message plus unsigned char */
+
+    msg.msg_controllen=CMSG_SPACE(sizeof(unsigned char);
+
+    controlbuffer=malloc(msg.msg_controllen);
+
+    if ( ! controlbuffer ) {
+
+	nreturn=-ENOMEM;
+	goto out;
+
+    }
+
+    msg.msg_control=controlbuffer;
+
+    /* first header is used to indicate what kind of message this is (stored in unsigned char) */
+
+    cmptr=CMSG_FIRSTHDR(&msg);
+    cmptr->cmsg_len=CMSG_LEN(sizeof(unsigned char));
+    cmptr->cmsg_type=0;
+    *((unsigned char *) CMSG_DATA(cmptr))=NOTIFYFS_MESSAGE_TYPE_MOUNTENTRY;
+
+    msg.msg_name=NULL;
+    msg.msg_namelen=0;
+
+    msg.msg_iov=io_vector;
+    msg.msg_iovlen=14;
+
+    /* mountpoint */
+
+    if ( mount_entry->mountpoint ) {
+
+	io_vector[0].iov_base=(void *) mount_entry->mountpoint;
+	io_vextor[0].iov_len=strlen(mount_entry->mountpoint);
+
+    } else {
+
+	io_vector[0].iov_base=NULL;
+	io_vextor[0].iov_len=0;
+
+    }
+
+
+    /* fstype */
+
+    io_vector[1].iov_base=(void *) mount_entry->fstype;
+    io_vextor[1].iov_len=strlen(mount_entry->fstype);
+
+
+    /* mountsource */
+
+    io_vector[2].iov_base=(void *) mount_entry->mountsource;
+    io_vextor[2].iov_len=strlen(mount_entry->mountsource);
+
+
+    /* superoptions */
+
+    io_vector[3].iov_base=(void *) mount_entry->superoptions;
+    io_vextor[3].iov_len=strlen(mount_entry->superoptions);
+
+    /* rootpath */
+
+    if ( mount_entry->rootpath ) {
+
+	io_vector[4].iov_base=mount_entry->rootpath;
+	io_vextor[4].iov_len=strlen(mount_entry->rootpath);
+
+    } else {
+
+	io_vector[4].iov_base=NULL;
+	io_vextor[4].iov_len=0;
+
+    }
+
+    /* minor */
+
+    io_vector[5].iov_base=(void *) &(mount_entry->minor);
+    io_vextor[5].iov_len=sizeof(int);
+
+    /* major */
+
+    io_vector[6].iov_base=(void *) &(mount_entry->major);
+    io_vextor[6].iov_len=sizeof(int);
+
+    /* isbind */
+
+    io_vector[7].iov_base=(void *) &(mount_entry->isbind);
+    io_vextor[7].iov_len=sizeof(unsigned char);
+
+    /* isroot */
+
+    io_vector[8].iov_base=(void *) &(mount_entry->isroot);
+    io_vextor[8].iov_len=sizeof(unsigned char);
+
+    /* isautofs */
+
+    io_vector[9].iov_base=(void *) &(mount_entry->isautofs);
+    io_vextor[9].iov_len=sizeof(unsigned char);
+
+    /* autofs_indirect */
+
+    io_vector[10].iov_base=(void *) &(mount_entry->autofs_indirect);
+    io_vextor[10].iov_len=sizeof(unsigned char);
+
+    /* autofs_mounted */
+
+    io_vector[11].iov_base=(void *) &(mount_entry->autofs_mounted);
+    io_vextor[11].iov_len=sizeof(unsigned char);
+
+    /* status */
+
+    io_vector[12].iov_base=(void *) &(mount_entry->status);
+    io_vextor[12].iov_len=sizeof(unsigned char);
+
+    /* remount */
+
+    io_vector[13].iov_base=(void *) &(mount_entry->remount);
+    io_vextor[13].iov_len=sizeof(unsigned char);
+
+
+    /* the actual sending */
+
+    nreturn=sendmsg(fd, &msg, 0);
+
+    free(controlbuffer);
+
+    out:
+
+    return nreturn;
+
+}
+
+
+send_fd_message(int fd, int fdtosend)
+{
+    struct msghdr msg;
+    char *controlbuffer;
+    struct cmsghdr *cmptr;
+    int nreturn=0;
+
+    /* create the control buffer, a control message plus unsigned char */
+
+    msg.msg_controllen=CMSG_SPACE(sizeof(unsigned char) + CMSG_SPACE(sizeof(int);
+
+    controlbuffer=malloc(msg.msg_controllen);
+
+    if ( ! controlbuffer ) {
+
+	nreturn=-ENOMEM;
+	goto out;
+
+    }
+
+    msg.msg_control=controlbuffer;
+
+    msg.msg_control=control_union.controldata;
+    msg.msg_controllen=sizeof(control_un.controldata);
+
+    /* first header is used to indicate what kind of message this is (stored in unsigned char) */
+
+    cmptr=CMSG_FIRSTHDR(&msg);
+    cmptr->cmsg_len=CMSG_LEN(sizeof(unsigned char));
+    cmptr->cmsg_level=SOL_SOCKET;
+    cmptr->cmsg_type=0;
+    *((unsigned char *) CMSG_DATA(cmptr))=NOTIFYFS_MESSAGE_TYPE_FD;
+
+    /* second header is used for the fd */
+
+    cmptr=CMSG_NXTHDR(&msg, cmptr);
+    cmptr->cmsg_len=CMSG_LEN(sizeof(int));
+    cmptr->cmsg_level=SOL_SOCKET;
+    cmptr->cmsg_type=SCM_RIGHTS;
+    *((int *) CMSG_DATA(cmptr))=fdtosend;
+
+
+    msg.msg_name=NULL;
+    msg.msg_namelen=0;
+
+    /* no futher data */
+
+    msg.msg_iov=NULL;
+    msg.msg_iovlen=0;
+
+    /* the actual sending */
+
+    nreturn=sendmsg(fd, &msg, 0);
+
+    free(controlbuffer);
+
+    out:
+
+    return nreturn;
+
+}
+
+int receive_message(int fd, void **prt)
+{
+    struct msghdr msg;
+    struct cmsghdr *cmptr;
+    int nreturn=0;
+    ssize_t lenread;
+    unsigned char *typemessage;
+
+    lenread=recvmesg(fd, &msg, 0);
+
+    if ( lenread<0 ) {
+
+	nreturn=lenread;
+	goto out;
+
+    }
+
+    cmptr=CMSG_FIRSTHDR(msg);
+
+    if ( ! cmptr ) {
+
+	nreturn=-EIO;
+	goto out;
+
+    }
+
+    typemessage=(unsigned char *) CMSG_DATA(cmptr);
+
+    if ( *typemessage==NOTIFYFS_MESSAGE_TYPE_FD ) {
+	int newfd;
+
+	/* dealing with a message to parse a fd.... */
+	/* here read the fd from the second header */
+
+	cmptr=CMSG_NXTHDR(&msg, cmptr);
+
+	newfd=*((int *) CMSG_DATA(cmptr));
+
+	/* what to do here ?? */
+
+    } else if ( *typemessage==NOTIFYFS_MESSAGE_TYPE_MOUNTENTRY ) {
+	struct mount_entry_struct *mount_entry;
+
+
+	/* dealing with a message to parse a mount entry */
+	/* here read the io vector */
+
+	mount_entry=get_mount_entry();
+
+	if ( ! mount_entry ) {
+
+	    logoutput(
+
+    }
+
+    
+

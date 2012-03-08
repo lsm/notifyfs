@@ -22,7 +22,7 @@
 
 // Prototypes
 
-int check_access(fuse_req_t req, const struct fuse_ctx *ctx, struct stat *st, int mask);
+int check_access(fuse_req_t req, struct stat *st, int mask);
 
 #endif
 
