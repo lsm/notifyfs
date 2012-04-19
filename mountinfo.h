@@ -78,12 +78,6 @@ struct mount_list_struct {
     struct mount_entry_struct *last;
 };
 
-struct fstab_list_struct {
-    struct mntent *fstab_entry;
-    struct fstab_list_struct *next;
-    struct fstab_list_struct *prev;
-};
-
 int get_new_mount_list(struct mountinfo_list_struct *mi_list);
 void set_parents_raw(struct mountinfo_list_struct *mi_list);
 struct mount_entry_struct *get_next_mount_entry(struct mount_entry_struct *mount_entry, unsigned char type);
@@ -96,6 +90,5 @@ unsigned char mount_is_up(struct mount_entry_struct *mount_entry);
 unsigned char mounted_by_autofs(struct mount_entry_struct *mount_entry);
 struct mount_entry_struct *get_rootmount();
 
-void read_fstab();
 
 #endif

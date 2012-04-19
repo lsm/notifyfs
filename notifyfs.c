@@ -3504,7 +3504,6 @@ int main(int argc, char *argv[])
     /* signal the mountmonitor to do the initial reading of the mounttable */
 
     signal_mountmonitor(1);
-    // read_fstab();
 
 
     /* add the fuse channel(=fd) to the mainloop */
