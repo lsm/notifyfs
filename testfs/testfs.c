@@ -42,6 +42,7 @@
 
 #include <sys/types.h>
 #include <sys/inotify.h>
+#include <sys/epoll.h>
 #include <pthread.h>
 
 
@@ -58,592 +59,32 @@
 #include <fuse/fuse_lowlevel.h>
 
 #include "entry-management.h"
+#include "path-resolution.h"
+#include "watches.h"
 #include "logging.h"
 #include "testfs.h"
 
-#include "fuse-loop-epoll-mt.h"
+
+#include "epoll-utils.h"
+#include "handlefuseevent.h"
 
 #include "utils.h"
 #include "options.h"
 #include "xattr.h"
 #include "socket.h"
+#include "client.h"
+#include "changestate.h"
 
-pthread_mutex_t changestate_mutex=PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t changestate_condition=PTHREAD_COND_INITIALIZER;
+#include "message.h"
+#include "message-client.h"
 
-struct call_info_struct *changestate_call_info_first=NULL;
-struct call_info_struct *changestate_call_info_last=NULL;
-
-struct testfs_commandline_options_struct testfs_commandline_options;
 struct testfs_options_struct testfs_options;
 
-struct fuse_opt testfs_help_options[] = {
-     TESTFS_OPT("--notifyfssocket=%s",		notifyfssocket, 0),
-     TESTFS_OPT("notifyfssocket=%s",		notifyfssocket, 0),
-     TESTFS_OPT("logging=%i",			logging, 1),
-     TESTFS_OPT("--logging=%i",			logging, 1),
-     TESTFS_OPT("logarea=%i",			logarea, 0),
-     TESTFS_OPT("--logarea=%i",			logarea, 0),
-     FUSE_OPT_KEY("-V",            		KEY_VERSION),
-     FUSE_OPT_KEY("--version",      		KEY_VERSION),
-     FUSE_OPT_KEY("-h",             		KEY_HELP),
-     FUSE_OPT_KEY("--help",         		KEY_HELP),
-     FUSE_OPT_END
-};
-
-
-static struct fuse_chan *testfs_chan;
+struct fuse_chan *testfs_chan;
 struct testfs_entry_struct *root_entry;
 
 unsigned char loglevel=0;
-unsigned char logarea=0;
-
-void cachechanges(struct call_info_struct *call_info, int mask)
-{
-    int res;
-
-    if ( call_info->entry ) {
-
-	if ( ! call_info->path ) {
-
-	    res=determine_path(call_info, TESTFS_PATH_FORCE);
-	    if (res<0) return;
-
-	}
-
-	if ( mask & IN_ATTRIB ) {
-	    struct stat st;
-	    unsigned char statchanged=0;
-
-	    res=lstat(call_info->path, &st);
-
-	    /* compare with the cached ones */
-
-	    if ( call_info->entry->inode->st.st_mode != st.st_mode ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_mode = st.st_mode;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_nlink != st.st_nlink ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_nlink = st.st_nlink;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_uid != st.st_uid ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_uid = st.st_uid;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_gid != st.st_gid ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_gid = st.st_gid;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_rdev != st.st_rdev ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_rdev = st.st_rdev;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_size != st.st_size ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_size = st.st_size;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_atime != st.st_atime ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_atime = st.st_atime;
-
-	    }
-
-#ifdef  __USE_MISC
-
-	    // time defined as timespec
-
-	    if ( call_info->entry->inode->st.st_atim.tv_nsec != st.st_atim.tv_nsec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_atim.tv_nsec = st.st_atim.tv_nsec;
-
-	    }
-
-#else
-
-	    if ( call_info->entry->inode->st.st_atimensec != st.st_atimensec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_atimensec = st.st_atimensec;
-
-	    }
-
-
-#endif
-
-	    if ( call_info->entry->inode->st.st_mtime != st.st_mtime ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_mtime = st.st_mtime;
-
-	    }
-
-#ifdef  __USE_MISC
-
-	    // time defined as timespec
-
-	    if ( call_info->entry->inode->st.st_mtim.tv_nsec != st.st_mtim.tv_nsec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_mtim.tv_nsec = st.st_mtim.tv_nsec;
-
-	    }
-
-#else
-
-	    if ( call_info->entry->inode->st.st_mtimensec != st.st_mtimensec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_mtimensec = st.st_mtimensec;
-
-	    }
-
-
-#endif
-
-
-	    if ( call_info->entry->inode->st.st_ctime != st.st_ctime ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_ctime = st.st_ctime;
-
-	    }
-
-#ifdef  __USE_MISC
-
-	    // time defined as timespec
-
-	    if ( call_info->entry->inode->st.st_ctim.tv_nsec != st.st_ctim.tv_nsec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_ctim.tv_nsec = st.st_ctim.tv_nsec;
-
-	    }
-
-#else
-
-	    if ( call_info->entry->inode->st.st_ctimensec != st.st_ctimensec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_ctimensec = st.st_ctimensec;
-
-	    }
-
-
-#endif
-
-
-	    if ( call_info->entry->inode->st.st_blksize != st.st_blksize ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_blksize = st.st_blksize;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_blocks != st.st_blocks ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_blocks = st.st_blocks;
-
-	    }
-
-	    if ( statchanged==1 ) {
-
-		logoutput2("cachechanges: stat changed for %s", call_info->path);
-
-	    }
-
-	    /* here also the xattr ?? */
-
-	}
-
-    }
-
-}
-
-/*
-   function to change the state of an effective watch 
-   one of the possibilities is of course the removal, but also possible is
-   the setting into sleep when the underlying fs is unmounted or
-   waking it up when previously is has been set to sleep and the underlying
-   fs is mounted
-   this setting to sleep and waking up again is typically the case with autofs 
-   managed filesystems
-   - remove: remove the effective_watch, and the notify backend method
-   - sleep: change the state of the effective_watch into sleep, and remove the notify backend method
-   - wakeup: change the state of the effective_watch into active, and set the notify backend method
-   this function calls change_state_watches to make changes effective to the individual watches
-
-*/
-
-int changestate_effective_watch(struct testfs_inode_struct *inode, unsigned char lockset, unsigned char typeaction, char *path)
-{
-    int nreturn=0;
-    int res;
-
-    if ( inode->effective_watch ) {
-        struct effective_watch_struct *effective_watch=inode->effective_watch;
-
-        /* try to lock the effective watch */
-
-        res=pthread_mutex_lock(&effective_watch->lock_mutex);
-
-        if ( effective_watch->lock==1 ) {
-
-            while (effective_watch->lock==1) {
-
-                res=pthread_cond_wait(&effective_watch->lock_condition, &effective_watch->lock_mutex);
-
-            }
-
-        }
-
-        effective_watch->lock=1;
-
-        /* after here: the effective watch is locked by this thread */
-
-        /* backend specific */
-
-        if ( typeaction==WATCH_ACTION_REMOVE ) {
-
-            res=inotify_rm_watch(testfs_options.inotify_fd, effective_watch->id);
-
-            logoutput2("changestate_effective_watch: removing watch %i.", effective_watch->id);
-
-
-        } else if ( typeaction==WATCH_ACTION_WAKEUP ) {
-
-            /* wake up a backend specific watch again */
-
-            res=inotify_add_watch(testfs_options.inotify_fd, path, effective_watch->mask);
-
-            if (res>0 ) {
-
-                effective_watch->id=res;
-                logoutput2("changestate_effective_watch: setting watch %i on %s.", effective_watch->id, path);
-
-            } else {
-
-                logoutput0("changestate_effective_watch: setting watch %i on %s.", effective_watch->id, path);
-
-            }
-
-        }
-
-        effective_watch->lock=0;
-        res=pthread_cond_broadcast(&effective_watch->lock_condition);
-        res=pthread_mutex_unlock(&effective_watch->lock_mutex);
-
-        if ( typeaction==WATCH_ACTION_REMOVE ) {
-
-            /* remove from global list */
-
-            remove_effective_watch_from_list(effective_watch);
-
-            /* detach from inode */
-
-            inode->effective_watch=NULL;
-            effective_watch->inode=NULL;
-
-            /* free and destroy */
-
-            pthread_mutex_destroy(&effective_watch->lock_mutex);
-            pthread_cond_destroy(&effective_watch->lock_condition);
-
-            free(effective_watch);
-
-        }
-
-    }
-
-    return nreturn;
-
-}
-
-
-static void changestate_recursive(struct testfs_entry_struct *entry, char *path, int pathlen, unsigned char typeaction)
-{
-    int res, nlen, pathlen_orig=pathlen;
-
-    logoutput2("changestate_recursive: entry %s", entry->name);
-
-    if ( entry->child ) {
-        struct testfs_entry_struct *child_entry=entry->child;
-        /* check every child */
-
-        while (child_entry) {
-
-            entry->child=child_entry->dir_next;
-            child_entry->dir_prev=NULL;
-            child_entry->dir_next=NULL;
-
-            /* here something like copy child_entry->name to path */
-
-            *(path+pathlen)='/';
-            pathlen++;
-            nlen=strlen(child_entry->name);
-            memcpy(path+pathlen, child_entry->name, nlen);
-            pathlen+=nlen;
-
-            changestate_recursive(child_entry, path, pathlen, typeaction ); /* recursive */
-
-            child_entry=entry->child;
-
-        }
-
-    }
-
-    /* when here the directory is empty */
-
-    if ( entry->inode ) {
-
-        /* set path back to original state */
-
-        *(path+pathlen_orig)='\0';
-
-        res=changestate_effective_watch(entry->inode, 0, typeaction, path);
-
-    }
-
-    if ( typeaction==WATCH_ACTION_REMOVE ) {
-
-        remove_entry_from_name_hash(entry);
-
-        if ( entry->parent ) {
-
-            /* send invalidate entry */
-            /* use notify_delete or notify_inval_entry ?? */
-
-            res=fuse_lowlevel_notify_delete(testfs_chan, entry->parent->inode->ino, entry->inode->ino, entry->name, strlen(entry->name));
-
-            /* remove from child list parent if not detached already */
-
-            if ( entry->parent->child==entry ) entry->parent->child=entry->dir_next;
-            if ( entry->dir_prev ) entry->dir_prev->dir_next=entry->dir_next;
-            if ( entry->dir_next ) entry->dir_next->dir_prev=entry->dir_prev;
-
-        }
-
-        remove_entry(entry);
-
-    }
-
-}
-
-/* function to test queueing a remove entry is necessary 
-
-   note the queue has to be locked 
-    TODO: the type of the action is required??
-   */
-
-unsigned char queue_changestate(struct testfs_entry_struct *entry, char *path1)
-{
-    unsigned char doqueue=0;
-
-    if ( ! changestate_call_info_first ) {
-
-        /* queue is empty: put it on queue */
-
-        doqueue=1;
-
-    } else {
-        struct call_info_struct *call_info_tmp=changestate_call_info_last;
-        char *path2;
-        int len1=strlen(path1), len2;
-
-        doqueue=1;
-
-        /* walk through queue to check there is a related call already there */
-
-        while(call_info_tmp) {
-
-            path2=call_info_tmp->path;
-            len2=strlen(path2);
-
-            if ( len2>len1 ) {
-
-                /* test path2 is a subdirectory of path1 */
-
-                if ( call_info_tmp!=changestate_call_info_first ) {
-
-                    if ( strncmp(path2+len1, "/", 1)==0 && strncmp(path1, path2, len1)==0 ) {
-
-                        /* here replace the already pending entry 2 remove by this one...
-                        do this only when it's not the first!!*/
-
-                        call_info_tmp->entry2remove=entry;
-                        strcpy(path2, (const char *) path1); /* this possible cause len(path2)>len(path1) HA !!!! */
-                        doqueue=0;
-                        break;
-
-                    }
-
-                }
-
-            } else {
-
-                /* len2<=len1, test path1 is a subdirectory of path2 */
-
-                if ( strncmp(path1+len2, "/", 1)==0 && strncmp(path2, path1, len2)==0 ) {
-
-                    /* ready: already queued... */
-                    doqueue=0;
-
-                    break;
-
-                }
-
-            }
-
-            call_info_tmp=call_info_tmp->prev;
-
-        }
-
-    }
-
-    return doqueue;
-
-}
-
-/* wait for the call_info to be the first in remove entry queue, and process when it's the first 
-  the lock has to be set
-*/
-
-void wait_in_queue_and_process(struct call_info_struct *call_info, unsigned char typeaction)
-{
-    int res;
-    pathstring path;
-
-    if ( call_info != changestate_call_info_first ) {
-
-        /* wait till it's the first */
-
-        while ( call_info != changestate_call_info_first ) {
-
-            res=pthread_cond_wait(&changestate_condition, &changestate_mutex);
-
-        }
-
-    }
-
-    /* call_info is the first in the queue, release the queue for other queues and go to work */
-
-    res=pthread_mutex_unlock(&changestate_mutex);
-
-    memset(path, '\0', sizeof(pathstring));
-    strcpy(path, call_info->path);
-
-    changestate_recursive(call_info->entry2remove, path, strlen(path), typeaction);
-
-    /* remove from queue... */
-
-    res=pthread_mutex_lock(&changestate_mutex);
-
-    changestate_call_info_first=call_info->next;
-
-    if ( changestate_call_info_first ) changestate_call_info_first->prev=NULL;
-
-    call_info->next=NULL;
-    call_info->prev=NULL;
-
-    if ( changestate_call_info_last==call_info ) changestate_call_info_last=changestate_call_info_first;
-
-    /* signal other threads if the queue is not empty */
-
-    if ( changestate_call_info_first ) res=pthread_cond_broadcast(&changestate_condition);
-
-}
-
-/* important function to react on signals which imply that the state of entries and watches 
-   has changed
-
-   this is called by the fuse threads, but also from the mainloop, which reacts on inotify events,
-   and mountinfo when mounts are removed or added
-
-   to do so a queue is used
-   every call is added to the tail, and when it has become the first, it's processed
-   every time the first call is removed, and thus the next call has become the first, 
-   a broadcast is done to the other waiting threads
-   the one who has become first is taking action
-
-   very nice of this queue is the ability to check other pending calls
-   when there is a related request present in the queue, it's not necessary to queue this request again
-   when in a tree different watches are set, and the whole tree is removed this will result in a burst
-   of inotify events: this queue will filter out doubles
-   */
-
-void changestate(struct call_info_struct *call_info, unsigned char typeaction)
-{
-    int res;
-    unsigned char doqueue=1;
-
-    call_info->entry2remove=call_info->entry;
-    call_info->next=NULL;
-    call_info->prev=NULL;
-
-    if ( call_info->entry ) {
-
-        logoutput1("changestate: processing %s, entry %s", call_info->path, call_info->entry->name);
-
-    } else {
-
-        logoutput1("changestate: processing %s, entry not set", call_info->path);
-
-    }
-
-    /* lock the remove entry queue */
-
-    res=pthread_mutex_lock(&changestate_mutex);
-
-    doqueue=queue_changestate(call_info->entry, call_info->path);
-
-    if ( doqueue==1 ) {
-
-        if ( ! changestate_call_info_first ) {
-
-            /* queue is empty: put it on queue */
-
-            changestate_call_info_first=call_info;
-            changestate_call_info_last=call_info;
-
-        } else {
-
-            /* add at tail of queue */
-
-            changestate_call_info_last->next=call_info;
-            call_info->prev=changestate_call_info_last;
-            call_info->next=NULL;
-            changestate_call_info_last=call_info;
-
-        }
-
-        wait_in_queue_and_process(call_info, typeaction);
-
-    }
-
-    res=pthread_mutex_unlock(&changestate_mutex);
-
-}
+int logarea=0;
 
 static void testfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name)
 {
@@ -652,8 +93,8 @@ static void testfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name
     struct testfs_inode_struct *inode;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
     int nreturn=0;
-    unsigned char entryexists=0;
     struct call_info_struct call_info;
+    unsigned char entrycreated=0;
 
     logoutput1("LOOKUP, name: %s", name);
 
@@ -662,17 +103,38 @@ static void testfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name
     entry=find_entry(parentino, name);
 
     if ( ! entry ) {
+	struct testfs_inode_struct *pinode;
 
-	nreturn=-ENOENT;
-	goto out;
+	pinode=find_inode(parentino);
+
+	if ( pinode ) {
+	    struct testfs_entry_struct *pentry;
+
+	    pentry=pinode->alias;
+
+	    entry=create_entry(pentry, name, NULL);
+	    if ( ! entry ) {
+
+		nreturn=-ENOMEM;
+		goto out;
+
+	    }
+
+	} else {
+
+	    nreturn=-ENOENT;
+	    goto out;
+
+	}
+
+	entrycreated=1;
 
     }
 
     inode=entry->inode;
 
     call_info.entry=entry;
-
-    entryexists=1;
+    call_info.ctx=ctx;
 
     /* translate entry into path */
 
@@ -683,13 +145,21 @@ static void testfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name
 
     nreturn=lstat(call_info.path, &(e.attr));
 
-    /* here copy e.attr to inode->st */
+    if ( nreturn==-1 ) {
 
-    if (nreturn!=-1) copy_stat(&inode->st, &(e.attr));
+	nreturn=-errno;
+
+    } else {
+
+	/* here copy e.attr to inode->st */
+
+	if (inode) copy_stat(&(inode->st), &(e.attr));
+
+    }
 
     out:
 
-    if ( nreturn==-ENOENT) {
+    if ( nreturn==-ENOENT ) {
 
 	logoutput2("lookup: entry does not exist (ENOENT)");
 
@@ -704,14 +174,23 @@ static void testfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name
 
 	// no error
 
+	if ( entrycreated==1 ) {
+
+	    // when created here, add it to the various tables, is not done yet
+
+	    assign_inode(entry);
+
+	    add_to_inode_hash_table(entry->inode);
+	    add_to_name_hash_table(entry);
+
+	}
+
 	entry->inode->nlookup++;
 	e.ino = entry->inode->ino;
 	e.attr.st_ino = e.ino;
 	e.generation = 0;
 	e.attr_timeout = testfs_options.attr_timeout;
 	e.entry_timeout = testfs_options.entry_timeout;
-
-	logoutput2("lookup return size: %zi", e.attr.st_size);
 
     }
 
@@ -733,11 +212,22 @@ static void testfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) changestate(&call_info, WATCH_ACTION_REMOVE);
+        if ( entrycreated==0 ) {
+
+	    logoutput("lookup: changestate");
+    	    changestate(&call_info, WATCH_ACTION_REMOVE);
+
+	}
 
     }
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.path ) {
+
+	logoutput("lookup: free path");
+	free(call_info.path);
+	logoutput("lookup: free path after");
+
+    }
 
 }
 
@@ -807,6 +297,7 @@ static void testfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info
 
     entryexists=1;
     call_info.entry=entry;
+    call_info.ctx=ctx;
 
     /* if dealing with an autofs managed fs do not stat
        but what to do when there is no cached stat??
@@ -824,7 +315,15 @@ static void testfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info
 
     /* copy the st -> inode->st */
 
-    if ( nreturn!=-1 ) copy_stat(&inode->st, &st);
+    if ( nreturn==-1 ) {
+
+	nreturn=-errno;
+
+    } else {
+
+	copy_stat(&inode->st, &st);
+
+    }
 
     out:
 
@@ -854,13 +353,183 @@ static void testfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info
 
 }
 
+static void testfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *name, mode_t mode, dev_t dev)
+{
+    struct fuse_entry_param e;
+    struct testfs_entry_struct *entry;
+    int nreturn=0;
+    unsigned char entrycreated=0;
+    struct call_info_struct call_info;
+
+    logoutput("MKNOD, name: %s", name);
+
+    init_call_info(&call_info, NULL);
+    call_info.ctx=fuse_req_ctx(req);
+
+    entry=find_entry(parentino, name);
+
+    if ( ! entry ) {
+        struct testfs_inode_struct *pinode;
+
+	pinode=find_inode(parentino);
+
+	if ( pinode ) {
+            struct testfs_entry_struct *pentry;
+
+	    pentry=pinode->alias;
+	    entry=create_entry(pentry, name, NULL);
+	    entrycreated=1;
+
+	    if ( !entry ) {
+
+		nreturn=-ENOMEM; /* not able to create due to memory problems */
+		entrycreated=0;
+		goto error;
+
+	    } 
+
+	} else { 
+
+	    nreturn=-EIO; /* parent inode not found !!?? some strange error */
+	    goto error;
+
+	}
+
+    } else {
+
+	/* here an error, the entry does exist already */
+
+	nreturn=-EEXIST;
+	goto error;
+
+    }
+
+    call_info.entry=entry;
+
+    /* translate entry into path */
+
+    nreturn=determine_path(&call_info, TESTFS_PATH_NONE);
+    if ( nreturn<0 ) goto out;
+
+    /* only create something here when it does exist in the underlying fs */
+
+    nreturn=mknod(call_info.path, mode, dev);
+
+    if ( nreturn==-1 ) {
+
+	if ( errno==EEXIST ) {
+
+	    if ( entrycreated==1 ) {
+
+		/* when created: handle it as if it is created here */
+
+		nreturn=0;
+
+	    } else {
+
+		nreturn=-errno;
+
+	    }
+
+	} else {
+
+	    nreturn=-errno;
+
+	}
+
+    }
+
+    if ( nreturn==0 ) {
+
+	nreturn=lstat(call_info.path, &(e.attr));
+
+	if ( nreturn==-1 ) {
+
+	    nreturn=-errno;
+
+	}
+
+    }
+
+
+    out:
+
+    if ( nreturn==0 ) {
+
+	// no error
+
+        assign_inode(entry);
+
+        if ( ! entry->inode ) {
+
+            nreturn=-ENOMEM;
+            goto error;
+
+        }
+
+	entry->inode->nlookup++;
+
+	copy_stat(&entry->inode->st, &(e.attr));
+
+	e.ino = entry->inode->ino;
+	e.attr.st_ino = e.ino;
+	e.generation = 0;
+	e.attr_timeout = testfs_options.attr_timeout;
+	e.entry_timeout = testfs_options.entry_timeout;
+
+        add_to_inode_hash_table(entry->inode);
+        add_to_name_hash_table(entry);
+
+        /* insert in directory (some lock required (TODO)????) */
+
+        if ( entry->parent ) {
+
+            entry->dir_next=NULL;
+            entry->dir_prev=NULL;
+
+            if (entry->parent->child) {
+
+                entry->parent->child->dir_prev=entry;
+                entry->dir_next=entry->parent->child;
+
+            }
+
+            entry->parent->child=entry;
+
+        }
+
+        logoutput("mknod succesfull");
+
+        fuse_reply_entry(req, &e);
+        if ( call_info.path ) free(call_info.path);
+
+        return;
+
+    }
+
+    error:
+
+    logoutput("mknod: error %i", nreturn);
+
+    if ( entrycreated==1 ) remove_entry(entry);
+
+    e.ino = 0;
+    e.entry_timeout = testfs_options.negative_timeout;
+
+    fuse_reply_err(req, abs(nreturn));
+
+    if ( call_info.path ) free(call_info.path);
+
+}
+
+
 int readlink_localhost(struct call_info_struct *call_info, char **link)
 {
     int size = PATH_MAX;
     char *buf=NULL;
     int res, nreturn=0;
 
-    logoutput2("readlink_localhost");
+    logoutput("readlink_localhost");
 
     buf = malloc(size);
 
@@ -877,6 +546,7 @@ int readlink_localhost(struct call_info_struct *call_info, char **link)
 
 	if ( res==-1) {
 	    nreturn=-errno;
+	    *link=NULL;
 	    free(buf);
 	    break;
 	}
@@ -895,7 +565,7 @@ int readlink_localhost(struct call_info_struct *call_info, char **link)
 
 	buf=realloc(buf, size);
 
-	if ( buf==NULL ) {
+	if ( ! buf ) {
 
 	    nreturn=-ENOMEM;
 	    break;
@@ -922,8 +592,6 @@ void testfs_readlink(fuse_req_t req, fuse_ino_t ino)
     char *link=NULL;
     int nreturn=0;
     struct call_info_struct call_info;
-    unsigned char entryexists=0;
-
 
     logoutput1("READLINK");
 
@@ -948,7 +616,6 @@ void testfs_readlink(fuse_req_t req, fuse_ino_t ino)
     init_call_info(&call_info, NULL);
 
     call_info.entry=entry;
-    entryexists=1;
 
     nreturn=determine_path(&call_info, TESTFS_PATH_NONE);
     if (nreturn<0) goto out;
@@ -957,13 +624,15 @@ void testfs_readlink(fuse_req_t req, fuse_ino_t ino)
 
     out:
 
-    logoutput1("readlink, return %i", nreturn);
-
     if (nreturn < 0) {
+
+	logoutput("readlink, return %i", nreturn);
 
 	fuse_reply_err(req, -nreturn);
 
     } else {
+
+	logoutput("readlink, link %s", link);
 
 	fuse_reply_readlink(req, link);
 
@@ -1036,6 +705,8 @@ static void testfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info
         goto out;
 
     }
+
+    call_info->ctx=ctx;
 
     /* translate entry into path */
 
@@ -1377,7 +1048,7 @@ static void testfs_statfs(fuse_req_t req, fuse_ino_t ino)
     struct testfs_entry_struct *entry; 
     struct testfs_inode_struct *inode;
 
-    logoutput1("STATFS");
+    logoutput("STATFS");
 
     inode=find_inode(ino);
 
@@ -1445,7 +1116,7 @@ static void testfs_statfs(fuse_req_t req, fuse_ino_t ino)
 
     }
 
-    logoutput1("statfs, B, nreturn: %i", nreturn);
+    logoutput("statfs, B, nreturn: %i", nreturn);
 
 }
 
@@ -1483,6 +1154,7 @@ static void testfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, co
     }
 
     call_info.entry=entry;
+    call_info.ctx=ctx;
     entryexists=1;
 
     /* translate entry to path..... and try to determine the backend */
@@ -1603,6 +1275,7 @@ static void testfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, si
     }
 
     call_info.entry=entry;
+    call_info.ctx=ctx;
 
     entryexists=1;
 
@@ -1790,6 +1463,7 @@ static void testfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     }
 
     call_info.entry=entry;
+    call_info.ctx=ctx;
     entryexists=1;
 
     /* translate entry to path..... */
@@ -2075,21 +1749,16 @@ static int print_mask(unsigned int mask, char *string, size_t size)
 #define INOTIFY_EVENT_SIZE (sizeof(struct inotify_event))
 #define INOTIFY_BUFF_LEN (1024 * (INOTIFY_EVENT_SIZE + 16))
 
-void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
+void handle_data_on_inotify_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
 {
     int nreturn=0;
     char outputstring[256];
 
     logoutput1("handle_data_on_inotify_fd.");
 
-    if ( epoll_event->events & EPOLLIN ) {
-        struct epoll_extended_data_struct *epoll_xdata;
+    if ( events & EPOLLIN ) {
         int lenread=0;
         char buff[INOTIFY_BUFF_LEN];
-
-        /* get the epoll_xdata from event */
-
-        epoll_xdata=(struct epoll_extended_data_struct *) epoll_event->data.ptr;
 
         lenread=read(epoll_xdata->fd, buff, INOTIFY_BUFF_LEN);
 
@@ -2101,7 +1770,6 @@ void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
             int i=0, res;
             struct inotify_event *i_event;
             struct effective_watch_struct *effective_watch;
-
 
             while(i<lenread) {
 
@@ -2146,97 +1814,179 @@ void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
 
                 }
 
-                effective_watch=lookup_watch(BACKEND_METHOD_INOTIFY, i_event->wd);
+                effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_INOTIFY, i_event->wd);
 
                 if ( effective_watch ) {
-                    struct testfs_entry_struct *entry=NULL;
+
+		    /* test it's an event on a watch long gone 
+		       watches should be disabled and removed when entry/inodes are removed, 
+		       so receiving messages on them should 
+		       not happen, but to make sure */
+
+		    if ( ! effective_watch->inode ) {
+
+			goto next;
+
+		    } else if ( effective_watch->inode->status!=FSEVENT_INODE_STATUS_OK ) {
+
+			goto next;
+
+		    }
 
                     if ( i_event->name && i_event->len>0 ) {
 
                         /* something happens on an entry in the directory.. check it's in use
-                           by this fs, the find command will return NULL if it isn't */
+                           by this fs, the find command will return NULL if it isn't 
 
-                        entry=find_entry(effective_watch->inode->ino, i_event->name);
+                           do nothing with close, open and access*/
 
-                    } else {
+			if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_ATTRIB | IN_CREATE | IN_MOVED_TO | IN_IGNORED | IN_UNMOUNT ) ) {
+			    struct testfs_entry_struct *entry=NULL;
 
-                        entry=effective_watch->inode->alias;
+			    entry=find_entry(effective_watch->inode->ino, i_event->name);
 
-                    }
+			    if ( entry ) {
+                    		struct call_info_struct call_info;
 
-                    if ( entry ) {
-                        struct call_info_struct call_info;
+				/* entry is part of this fs */
 
-                        init_call_info(&call_info, entry);
+                    		init_call_info(&call_info, entry);
 
-                        /* translate entry to path.....(force) */
+                    		nreturn=determine_path(&call_info, TESTFS_PATH_FORCE);
+                    		if (nreturn<0) continue;
 
-                        nreturn=determine_path(&call_info, TESTFS_PATH_NONE);
-                        if (nreturn<0) continue;
+				if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED | IN_UNMOUNT ) ) {
+				    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVE;
+				    struct testfs_inode_struct *inode=entry->inode;
 
-                        /* in case of delete, move or unmount: update fs */
+				    /* entry deleted (here) so adjust the filesystem */
 
-                        if ( i_event->mask & ( IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_FROM ) ) {
+				    if ( inode ) prestatus=inode->status;
 
-                            /* something is deleted/moved from in the directory or the directory self */
+				    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
 
-                            /* remove entry, and if directory and contents, do that recursive
-                               also remove any watch set there, notify clients about that 
-                               and invalidate the removed entries/inodes
-                            */
+				    if ( prestatus!=FSEVENT_INODE_STATUS_REMOVE ) {
 
-                            changestate(&call_info, WATCH_ACTION_REMOVE);
+					if ( inode && inode->status==FSEVENT_INODE_STATUS_REMOVE) {
 
-                        } else {
+					    /* send a message to server/client to inform */
 
-			    cachechanges(&call_info, i_event->mask);
+					    send_notify_message(testfs_options.notifyfssocket_fd, effective_watch->id, i_event->mask, i_event->name, i_event->len);
+
+					}
+
+				    }
+
+				} else if ( i_event->mask & ( IN_CREATE | IN_MOVED_TO ) ) {
+				    unsigned char filechanged=0;
+
+				    /* entry created... and does exist already here... huhhh??? */
+
+				    /* here compare the new values (attributes) with the cached ones,
+			    		and only forward a message when there has something really changed..*/
+
+				    filechanged=determinechanges(&call_info, i_event->mask);
+
+				    if ( filechanged != TESTFS_FILECHANGED_NONE ) {
+
+					send_notify_message(testfs_options.notifyfssocket_fd, effective_watch->id, i_event->mask, i_event->name, i_event->len);
+
+				    }
+
+				} else if ( i_event->mask & IN_ATTRIB ) {
+				    unsigned char filechanged=0;
+
+				    /* here compare the new values (attributes) with the cached ones,
+			    		and only forward a message when there has something really changed..*/
+
+				    filechanged=determinechanges(&call_info, i_event->mask);
+
+				    if ( filechanged != TESTFS_FILECHANGED_NONE ) {
+
+					send_notify_message(testfs_options.notifyfssocket_fd, effective_watch->id, i_event->mask, i_event->name, i_event->len);
+
+				    }
+
+				}
+
+			    } else {
+
+				/* entry not part of fs */
+
+				send_notify_message(testfs_options.notifyfssocket_fd, effective_watch->id, i_event->mask, i_event->name, i_event->len);
+
+			    }
 
 			}
 
-                    } else {
+		    } else {
 
-                        /* entry not found... */
+			/* event on watch self
 
-                        if ( i_event->name && i_event->len>0 ) {
+                           do nothing with close, open and access*/
 
-                            if ( effective_watch->inode->alias ) {
-                                struct call_info_struct call_info;
+			if ( i_event->mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB | IN_IGNORED | IN_UNMOUNT ) ) {
+			    struct testfs_entry_struct *entry=NULL;
 
-				call_info.entry=effective_watch->inode->alias;
+			    entry=effective_watch->inode->alias;
 
-                                /* translate entry to path.....(force) */
+			    if ( entry ) {
+                    		struct call_info_struct call_info;
 
-                                nreturn=determine_path(&call_info, TESTFS_PATH_FORCE);
-                                if (nreturn<0) continue;
+				/* entry is part of this fs */
 
-                                memset(outputstring, '\0', 256);
-                                res=print_mask(i_event->mask, outputstring, 256);
+                    		init_call_info(&call_info, entry);
 
-                                if ( res>0 ) {
+                    		nreturn=determine_path(&call_info, TESTFS_PATH_FORCE);
+                    		if (nreturn<0) continue;
 
-                                    logoutput1("Inotify event on entry not managed by this fs: %s/%s:%i/%s", call_info.path, i_event->name, i_event->mask, outputstring);
+				if ( i_event->mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_UNMOUNT ) ) {
+				    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVE;
+				    struct testfs_inode_struct *inode=entry->inode;
 
-                                } else {
+				    /* entry deleted (here) so adjust the filesystem */
 
-                                    logoutput1("Inotify event on entry not managed by this fs: %s/%s:%i", call_info.path, i_event->name, i_event->mask);
+				    if ( inode ) prestatus=inode->status;
 
-                                }
+				    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
 
-                            } else {
+				    if ( prestatus!=FSEVENT_INODE_STATUS_REMOVE ) {
 
-                                logoutput0("Error....inotify event received but entry not found....");
+					if ( inode && inode->status==FSEVENT_INODE_STATUS_REMOVE) {
 
-                            }
+					    /* send a message to server/client to inform */
 
-                        } else {
+					    send_notify_message(testfs_options.notifyfssocket_fd, effective_watch->id, i_event->mask, NULL, 0);
 
-                            logoutput0("Error....inotify event received.. entry not found");
+					}
 
-                        }
+				    }
+
+				} else if ( i_event->mask & IN_ATTRIB ) {
+				    unsigned char filechanged=0;
+
+				    /* here compare the new values (attributes) with the cached ones,
+			    		and only forward a message when there has something really changed..*/
+
+				    filechanged=determinechanges(&call_info, i_event->mask);
+
+				    if ( filechanged != TESTFS_FILECHANGED_NONE ) {
+
+					send_notify_message(testfs_options.notifyfssocket_fd, effective_watch->id, i_event->mask, NULL, 0);
+
+				    }
+
+				}
+
+			    }
+
+			}
 
                     }
 
-                }
+		}
+
+		next:
 
                 i += INOTIFY_EVENT_SIZE + i_event->len;
 
@@ -2249,6 +1999,340 @@ void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
 }
 
 
+
+/* callback which acts on the recieving of a setwatch by ino message */
+
+void handle_setwatch_byino(struct notifyfs_fsevent_message *fsevent, unsigned long long ino)
+{
+    struct testfs_inode_struct *inode=NULL;
+    int nreturn=0;
+
+    inode=find_inode(ino);
+
+    if ( ! inode ) {
+
+	/* inode has to exist */
+
+	nreturn=-ENOENT;
+	goto out;
+
+    }
+
+    if ( fsevent->mask==0 ) {
+
+	/* mask may not be null (possible remove an existing watch??) */
+
+	nreturn=-EINVAL;
+	goto out;
+
+    }
+
+
+    {
+
+	struct call_info_struct call_info;
+	struct testfs_entry_struct *entry=NULL;
+	struct effective_watch_struct *effective_watch;
+	int oldmask, res;
+
+	init_call_info(&call_info, NULL);
+
+	// the entry, it has to exist
+
+	entry=inode->alias;
+
+	if ( ! entry ) {
+
+	    nreturn=-ENOENT;
+	    goto out;
+
+	}
+
+	call_info.entry=entry;
+
+	/* translate entry into path */
+
+	nreturn=determine_path(&call_info, TESTFS_PATH_NONE);
+	if (nreturn<0) goto out;
+
+        effective_watch=inode->effective_watch;
+
+        if ( ! effective_watch ) {
+
+	    /* create the watch */
+
+	    effective_watch=get_effective_watch();
+
+            if ( ! effective_watch ) {
+
+                nreturn=-ENOMEM;
+                goto out;
+
+            }
+
+	    /* use the id from sender (server) for later communication */
+
+	    effective_watch->id=fsevent->id;
+
+	    /* mutual links */
+
+            effective_watch->inode=inode;
+            inode->effective_watch=effective_watch;
+
+	    effective_watch->path=call_info.path; /* make sure when call_info is freed, keep the path */
+
+            add_effective_watch_to_list(effective_watch);
+
+	}
+
+	res=lock_effective_watch(effective_watch);
+
+	if ( effective_watch->typebackend==FSEVENT_BACKEND_METHOD_NOTSET ) {
+
+	    set_backend(&call_info, effective_watch);
+
+	}
+
+	oldmask=effective_watch->mask;
+
+	if ( oldmask!=fsevent->mask ) {
+
+	    /* only set when different */
+
+	    set_watch_at_backend(effective_watch, fsevent->mask);
+
+	    effective_watch->mask=fsevent->mask;
+
+	}
+
+	res=unlock_effective_watch(effective_watch);
+
+    }
+
+    out:
+
+    if ( nreturn<0 ) {
+
+	logoutput("handle_setwatch_byino: error %i", nreturn);
+
+    }
+
+}
+
+/* callback which acts on the recieving of a setwatch by path message 
+   this path may not exist in the fs, it is created here 
+   TODO permissions checking to do so... */
+
+void handle_setwatch_bypath(struct notifyfs_fsevent_message *fsevent, char *path)
+{
+    struct testfs_inode_struct *inode=NULL;
+    struct testfs_entry_struct *entry=NULL;
+    int nreturn=0;
+
+    entry=create_fs_path(path);
+
+    if ( ! entry ) {
+
+	nreturn=-ENOENT;
+	goto out;
+
+    }
+
+    inode=entry->inode;
+
+    if ( ! inode ) {
+
+	/* inode has to exist */
+
+	nreturn=-ENOENT;
+	goto out;
+
+    }
+
+    if ( fsevent->mask==0 ) {
+
+	/* mask may not be null (possible remove an existing watch??) */
+
+	nreturn=-EINVAL;
+	goto out;
+
+    }
+
+
+    {
+
+	struct call_info_struct call_info;
+	struct effective_watch_struct *effective_watch;
+	int oldmask, res;
+
+	init_call_info(&call_info, NULL);
+
+	// the entry, it has to exist
+
+	entry=inode->alias;
+
+	if ( ! entry ) {
+
+	    nreturn=-ENOENT;
+	    goto out;
+
+	}
+
+	call_info.entry=entry;
+	call_info.path=path;
+
+        effective_watch=inode->effective_watch;
+
+        if ( ! effective_watch ) {
+
+	    /* create the watch */
+
+	    effective_watch=get_effective_watch();
+
+            if ( ! effective_watch ) {
+
+                nreturn=-ENOMEM;
+                goto out;
+
+            }
+
+	    /* use the id from sender (server) for later communication */
+
+	    effective_watch->id=fsevent->id;
+
+	    /* mutual links */
+
+            effective_watch->inode=inode;
+            inode->effective_watch=effective_watch;
+
+	    effective_watch->path=strdup(path);
+
+            add_effective_watch_to_list(effective_watch);
+
+	}
+
+	res=lock_effective_watch(effective_watch);
+
+	if ( effective_watch->typebackend==FSEVENT_BACKEND_METHOD_NOTSET ) {
+
+	    set_backend(&call_info, effective_watch);
+
+	}
+
+	oldmask=effective_watch->mask;
+
+	if ( oldmask!=fsevent->mask ) {
+
+	    /* only set when different */
+
+	    set_watch_at_backend(effective_watch, fsevent->mask);
+
+	    effective_watch->mask=fsevent->mask;
+
+	}
+
+	res=unlock_effective_watch(effective_watch);
+
+    }
+
+    out:
+
+    if ( nreturn<0 ) {
+
+	logoutput("handle_setwatch_byino: error %i", nreturn);
+
+    }
+
+}
+
+
+/* remove a watch, identified by fsevent->id, which has been set before.. */
+
+void handle_delwatch(struct notifyfs_fsevent_message *fsevent)
+{
+    struct effective_watch_struct *effective_watch;
+
+    effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_NOTSET, fsevent->id);
+
+    if ( effective_watch ) {
+	int res;
+
+	res=lock_effective_watch(effective_watch);
+
+	del_watch_at_backend(effective_watch);
+
+	remove_effective_watch_from_list(effective_watch, 0);
+
+	move_effective_watch_to_unused(effective_watch);
+
+	res=unlock_effective_watch(effective_watch);
+
+    } else {
+
+	logoutput("handle_delwatch: error removing watch with id %li, watch not found.", fsevent->id);
+
+    }
+
+}
+
+void handle_fsevent_message(struct client_struct *client,  struct notifyfs_fsevent_message *fsevent_message, void *data1, int len1)
+{
+    unsigned char type=fsevent_message->type;
+
+    if ( type==NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYPATH ) {
+
+	logoutput("handle_fsevent_message: setwatch_bypath");
+
+	/* here read the data, it must be complete:
+	   - path and mask 
+	   then set the watch at backend
+	*/
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYINO ) {
+
+	logoutput("handle_fsevent_message: setwatch_byino");
+
+	/* here read the data, it must be complete:
+	   - ino and mask 
+	   then set the watch at backend
+	*/
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_NOTIFY ) {
+
+	logoutput("handle_fsevent_message: notify");
+
+	/* read the data from the client fs 
+	   and pass it through to client apps 
+	   but first filter it out as it maybe an event caused by this fs
+	   and because it comes through a message it's an event on the backend
+	   howto determine....
+	   it's a fact that inotify events have been realised on the VFS,
+	   with events on the backend this is not so
+	   but first filter out the events caused by this host....*/
+
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_DELWATCH ) {
+
+	logoutput("handle_fsevent_message: delwatch");
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_SLEEPWATCH ) {
+
+	logoutput("handle_fsevent_message: sleepwatch");
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_WAKEWATCH ) {
+
+	logoutput("handle_fsevent_message: wakewatch");
+
+    } else {
+
+	logoutput("handle_fsevent_message: unknown message");
+
+    }
+
+}
+
+
+
 /* todo: (symlink,) readlink, open, read, (write,) close, setattr */
 
 static struct fuse_lowlevel_ops testfs_oper = {
@@ -2257,6 +2341,7 @@ static struct fuse_lowlevel_ops testfs_oper = {
 	.lookup		= testfs_lookup,
 	.forget		= testfs_forget,
 	.getattr	= testfs_getattr,
+	.mknod		= testfs_mknod,
 	.readlink	= testfs_readlink,
 	.opendir	= testfs_opendir,
 	.readdir	= testfs_readdir,
@@ -2270,13 +2355,12 @@ static struct fuse_lowlevel_ops testfs_oper = {
 
 int main(int argc, char *argv[])
 {
-    struct fuse_args testfs_args = FUSE_ARGS_INIT(argc, argv);
+    struct fuse_args testfs_fuse_args = FUSE_ARGS_INIT(0, NULL);
     struct fuse_session *testfs_session;
     char *testfs_mountpoint;
-    int foreground=0;
     int res, epoll_fd;
-    struct stat st;
-
+    struct epoll_extended_data_struct xdata_inotify={0, 0, NULL, NULL, NULL, NULL}; 
+    struct epoll_extended_data_struct xdata_socket={0, 0, NULL, NULL, NULL, NULL};
 
     umask(0);
 
@@ -2284,61 +2368,16 @@ int main(int argc, char *argv[])
 
     openlog("fuse.testfs", 0,0); 
 
-    // clear commandline options
+    /* parse commandline options and initialize fuse options */
 
-    testfs_commandline_options.notifyfssocket=NULL;
-    testfs_commandline_options.logging=1;
+    res=parse_arguments(argc, argv, &testfs_fuse_args);
 
-    // set defaults
+    if (res<0) {
 
-    testfs_options.logging=0;
-    testfs_options.logarea=0;
-
-    memset(testfs_options.notifyfssocket, '\0', UNIX_PATH_MAX);
-    memset(testfs_options.pidfile, '\0', PATH_MAX);
-
-
-    // read commandline options
-
-    res = fuse_opt_parse(&testfs_args, &testfs_commandline_options, testfs_help_options, testfs_options_output_proc);
-
-    if (res == -1) {
-
-	fprintf(stderr, "Error parsing options.\n");
-	exit(1);
+	if ( res==-2 ) fprintf(stderr, "Error parsing options.\n");
+	goto skipeverything;
 
     }
-
-    res = fuse_opt_insert_arg(&testfs_args, 1, "-oallow_other,nodev,nosuid");
-
-
-    // socket
-
-    if ( testfs_commandline_options.notifyfssocket ) {
-
-        if ( strlen(testfs_commandline_options.notifyfssocket) >= UNIX_PATH_MAX ) {
-
-	    fprintf(stderr, "Length of socket %s is too big.\n", testfs_commandline_options.notifyfssocket);
-	    exit(1);
-
-	}
-
-	res=stat(testfs_commandline_options.notifyfssocket, &st);
-
-	if ( res==-1 ) {
-
-	    fprintf(stdout, "Notifyfssocket %s not found. Cannot conytinue.\n", testfs_commandline_options.notifyfssocket);
-
-	}
-
-
-	unslash(testfs_commandline_options.notifyfssocket);
-	strcpy(testfs_options.notifyfssocket, testfs_commandline_options.notifyfssocket);
-
-	fprintf(stdout, "Taking socket %s.\n", testfs_options.notifyfssocket);
-
-    }
-
 
     //
     // init the name and inode hashtables
@@ -2355,37 +2394,20 @@ int main(int argc, char *argv[])
 
     //
     // create the root inode and entry
-    // (and the root directory data)
     //
 
-    root_entry=create_entry(NULL,".",NULL);
+    res=create_root();
 
-    if ( ! root_entry ) {
+    if ( res<0 ) {
 
-	fprintf(stderr, "Error, failed to create the root entry.\n");
+	fprintf(stderr, "Error, failed to create the root entry(error: %i).\n", res);
 	exit(1);
 
     }
-
-    assign_inode(root_entry);
-
-    if ( ! root_entry->inode ) {
-
-	fprintf(stderr, "Error, failed to create the root inode.\n");
-	exit(1);
-
-    }
-
-    add_to_inode_hash_table(root_entry->inode);
-
 
     //
     // set default options
     //
-
-    if ( testfs_commandline_options.logging>0 ) testfs_options.logging=testfs_commandline_options.logging;
-    if ( testfs_commandline_options.logarea>0 ) testfs_options.logarea=testfs_commandline_options.logarea;
-
 
     loglevel=testfs_options.logging;
     logarea=testfs_options.logarea;
@@ -2394,25 +2416,14 @@ int main(int argc, char *argv[])
     testfs_options.entry_timeout=1.0;
     testfs_options.negative_timeout=1.0;
 
-    res = -1;
-
-    if (fuse_parse_cmdline(&testfs_args, &testfs_mountpoint, NULL, &foreground) == -1 ) {
-
-        logoutput0("Error parsing options.");
-        goto out;
-
-    }
-
-    testfs_options.mountpoint=testfs_mountpoint;
-
-    if ( (testfs_chan = fuse_mount(testfs_mountpoint, &testfs_args)) == NULL) {
+    if ( (testfs_chan = fuse_mount(testfs_options.mountpoint, &testfs_fuse_args)) == NULL) {
 
         logoutput0("Error mounting and setting up a channel.");
         goto out;
 
     }
 
-    testfs_session=fuse_lowlevel_new(&testfs_args, &testfs_oper, sizeof(testfs_oper), NULL);
+    testfs_session=fuse_lowlevel_new(&testfs_fuse_args, &testfs_oper, sizeof(testfs_oper), NULL);
 
     if ( testfs_session == NULL ) {
 
@@ -2421,7 +2432,7 @@ int main(int argc, char *argv[])
 
     }
 
-    res = fuse_daemonize(foreground);
+    res = fuse_daemonize(0);
 
     if ( res!=0 ) {
 
@@ -2442,6 +2453,7 @@ int main(int argc, char *argv[])
     }
 
     if ( strlen(testfs_options.notifyfssocket)>0 ) {
+	struct epoll_extended_data_struct *epoll_xdata=NULL;
 
 	/*
     	    connect to the notify fs socket clients
@@ -2452,36 +2464,45 @@ int main(int argc, char *argv[])
 
 	if ( testfs_options.notifyfssocket_fd<=0 ) {
 
-    	    logoutput0("Error connecting to notifyfs socket: %i.", testfs_options.notifyfssocket_fd);
+    	    logoutput("Error connecting to notifyfs socket: %i.", testfs_options.notifyfssocket_fd);
     	    goto out;
 
 	}
 
+	/* set the callbacks, only setting and deleting is here used */
+
+	assign_message_callback_client(NOTIFYFS_MESSAGE_TYPE_FSEVENT, &handle_fsevent_message);
+
 	/* add notifyfs socket to epoll */
 
-	res=add_to_epoll(testfs_options.notifyfssocket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_socket_fd, NULL);
-	if ( res<0 ) {
+	epoll_xdata=add_to_epoll(testfs_options.notifyfssocket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_connection_fd, NULL, &xdata_socket);
 
-    	    logoutput0("Error adding socket fd to epoll: %i.", res);
+	if ( ! epoll_xdata ) {
+
+    	    logoutput("Error adding socket fd %i to mainloop", testfs_options.notifyfssocket_fd);
     	    goto out;
 
 	} else {
 
-    	    logoutput0("socket fd %i added to epoll", testfs_options.notifyfssocket_fd);
+    	    logoutput("socket fd %i added to mainloop", testfs_options.notifyfssocket_fd);
+
+	    add_xdata_to_list(epoll_xdata);
 
 	}
 
 	/* register as client fs to notifyfs */
 
-	res=send_notify_message(testfs_options.notifyfssocket_fd, NOTIFYFS_MESSAGE_TYPE_REGISTERFS, 0, 0, strlen(testfs_options.mountpoint), testfs_options.mountpoint);
+	sleep(1);
+
+	send_client_message(testfs_options.notifyfssocket_fd, NOTIFYFS_MESSAGE_CLIENT_REGISTERFS, testfs_options.mountpoint, strlen(testfs_options.mountpoint));
 
 	if ( res<=0 ) {
 
-	    logoutput0("Error sending register fs message to notifyfs: %i.", res);
+	    logoutput("Error sending register fs message to notifyfs: %i.", res);
 
 	} else {
 
-	    logoutput0("Sending register fs message: %i nr bytes written.", res);
+	    logoutput("Sending register fs message: %i nr bytes written.", res);
 
 	}
 
@@ -2497,41 +2518,75 @@ int main(int argc, char *argv[])
 
     if ( testfs_options.inotify_fd<=0 ) {
 
-        logoutput0("Error creating inotify fd: %i.", testfs_options.inotify_fd);
-        goto out;
-
-    }
-
-    /* add inotify to epoll */
-
-    res=add_to_epoll(testfs_options.inotify_fd, EPOLLIN, TYPE_FD_INOTIFY, &handle_data_on_inotify_fd, NULL);
-
-    if ( res<0 ) {
-
-        logoutput0("Error adding inotify fd to epoll: %i.", res);
+        logoutput("Error creating inotify fd: %i.", testfs_options.inotify_fd);
         goto out;
 
     } else {
+	struct epoll_extended_data_struct *epoll_xdata=NULL;
 
-        logoutput0("inotify fd %i added to epoll", testfs_options.inotify_fd);
+	/* add inotify to mainloop */
+
+	epoll_xdata=add_to_epoll(testfs_options.inotify_fd, EPOLLIN, TYPE_FD_INOTIFY, &handle_data_on_inotify_fd, NULL, &xdata_inotify);
+
+	if ( ! epoll_xdata ) {
+
+    	    logoutput("Error adding inotify fd %i to mainloop.", testfs_options.inotify_fd);
+    	    goto out;
+
+	} else {
+
+    	    logoutput("inotify fd %i added to epoll", testfs_options.inotify_fd);
+
+	    add_xdata_to_list(epoll_xdata);
+
+	}
 
     }
 
+    /* add the fuse channel(=fd) to the mainloop */
 
-    res=fuse_session_loop_epoll_mt(testfs_session);
+    res=addfusechannelstomainloop(testfs_session, testfs_mountpoint);
 
-    fuse_session_remove_chan(testfs_chan);
+    /* handle error here */
 
-    fuse_session_destroy(testfs_session);
+    res=startfusethreads();
 
-    fuse_unmount(testfs_mountpoint, testfs_chan);
+    /* handle error again */
+
+    res=epoll_mainloop();
 
     out:
 
-    fuse_opt_free_args(&testfs_args);
+    terminatefuse(NULL);
+
+    if ( xdata_inotify.fd>0 ) {
+
+	res=remove_xdata_from_epoll(&xdata_inotify, 0);
+	close(xdata_inotify.fd);
+	xdata_inotify.fd=0;
+	testfs_options.inotify_fd=0;
+	remove_xdata_from_list(&xdata_inotify);
+
+    }
+
+    if ( xdata_socket.fd>0 ) {
+
+	res=remove_xdata_from_epoll(&xdata_socket, 0);
+	close(xdata_socket.fd);
+	xdata_socket.fd=0;
+	testfs_options.notifyfssocket_fd=0;
+	remove_xdata_from_list(&xdata_socket);
+
+    }
+
+    destroy_mainloop();
+
+    fuse_opt_free_args(&testfs_fuse_args);
+
+    skipeverything:
 
     closelog();
 
-    return res ? 1 : 0;
+    return 0;
 
 }

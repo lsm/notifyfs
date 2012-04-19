@@ -20,32 +20,26 @@
 #ifndef ENTRY_MANAGEMENT_H
 #define ENTRY_MANAGEMENT_H
 
-#define ENTRY_STATUS_OK         0
-#define ENTRY_STATUS_REMOVED    1
+#define ENTRY_STATUS_OK         	0
+#define ENTRY_STATUS_REMOVED    	1
 
-#define NOTIFYFS_INODE_STATUS_OK	1
-#define NOTIFYFS_INODE_STATUS_REMOVED	2
-#define NOTIFYFS_INODE_STATUS_SLEEP	3
+#define FSEVENT_INODE_STATUS_OK		1
+#define FSEVENT_INODE_STATUS_REMOVED	2
+#define FSEVENT_INODE_STATUS_SLEEP	3
 
-#define NOTIFYFS_INODE_ACTION_NOTSET	0
-#define NOTIFYFS_INODE_ACTION_CREATE	1
-#define NOTIFYFS_INODE_ACTION_REMOVE	2
-#define NOTIFYFS_INODE_ACTION_SLEEP	3
-#define NOTIFYFS_INODE_ACTION_WAKEUP	4
+#define FSEVENT_INODE_ACTION_NOTSET	0
+#define FSEVENT_INODE_ACTION_CREATE	1
+#define FSEVENT_INODE_ACTION_REMOVE	2
+#define FSEVENT_INODE_ACTION_SLEEP	3
+#define FSEVENT_INODE_ACTION_WAKEUP	4
 
-#define BACKEND_METHOD_NOTSET   0
-#define BACKEND_METHOD_INOTIFY  1
-#define BACKEND_METHOD_POLLING  2
-#define BACKEND_METHOD_FORWARD  3
+#define FSEVENT_FILECHANGED_NONE	0
+#define FSEVENT_FILECHANGED_FILE	1
+#define FSEVENT_FILECHANGED_METADATA	2
 
-#define NOTIFYFS_PATH_NONE      0
-#define NOTIFYFS_PATH_FORCE     1
-#define NOTIFYFS_PATH_BACKEND   2
-
-#define WATCH_ACTION_NOTSET     0
-#define WATCH_ACTION_REMOVE     1
-#define WATCH_ACTION_SLEEP      2
-#define WATCH_ACTION_WAKEUP     3
+#define FSEVENT_ACTION_TREE_NOTSET	0
+#define FSEVENT_ACTION_TREE_UP		1
+#define FSEVENT_ACTION_TREE_REMOVE	2
 
 struct notifyfs_inode_struct {
     fuse_ino_t ino;
@@ -56,39 +50,6 @@ struct notifyfs_inode_struct {
     struct effective_watch_struct *effective_watch;
     unsigned char status;
 };
-
-struct effective_watch_struct {
-    struct notifyfs_inode_struct *inode;
-    unsigned int mask; /* every inode has a mask here but not used always (then 0 )*/
-    unsigned int nrwatches; /* number of watches in the list watches */
-    struct watch_struct *watches; /* every inode has a list of watches but not used always (then NULL)*/
-    pthread_mutex_t lock_mutex;
-    pthread_cond_t lock_condition;
-    unsigned char lock;
-    struct effective_watch_struct *next;
-    struct effective_watch_struct *prev;
-    unsigned char typebackend;
-    void *backend;
-    unsigned long id;
-};
-
-// struct to describe the watch which has been set
-// it has been set on an inode by a client
-// and has a mask
-// is part of a list per inode
-// is part of a list per client
-
-struct watch_struct {
-    unsigned int mask;
-    struct effective_watch_struct *effective_watch;
-    struct client_struct *client;
-    unsigned long id;
-    struct watch_struct *next_per_watch;
-    struct watch_struct *prev_per_watch;
-    struct watch_struct *next_per_client;
-    struct watch_struct *prev_per_client;
-};
-
 
 struct notifyfs_entry_struct {
     char *name;
@@ -102,19 +63,7 @@ struct notifyfs_entry_struct {
     size_t namehash;
     unsigned char status;
     struct mount_entry_struct *mount_entry;
-};
-
-struct call_info_struct {
-    struct notifyfs_entry_struct *entry;
-    struct notifyfs_entry_struct *entry2remove;
-    pthread_t threadid;
-    char *path;
-    void *backend;
-    unsigned char typebackend;
-    struct call_info_struct *next;
-    struct call_info_struct *prev;
-    struct mount_entry_struct *mount_entry;
-    const struct fuse_ctx *ctx;
+    unsigned char synced;
 };
 
 // Prototypes
@@ -123,35 +72,17 @@ int init_hashtables();
 void add_to_inode_hash_table(struct notifyfs_inode_struct *inode);
 void add_to_name_hash_table(struct notifyfs_entry_struct *entry);
 void remove_entry_from_name_hash(struct notifyfs_entry_struct *entry);
-struct notifyfs_inode_struct *find_inode(fuse_ino_t inode);
+struct notifyfs_inode_struct *find_inode(fuse_ino_t ino);
 struct notifyfs_entry_struct *find_entry(fuse_ino_t parent, const char *name);
 struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent, const char *name, struct notifyfs_inode_struct *inode);
 void remove_entry(struct notifyfs_entry_struct *entry);
 void assign_inode(struct notifyfs_entry_struct *entry);
 struct notifyfs_entry_struct *new_entry(fuse_ino_t parent, const char *name);
-unsigned char rootinode(struct notifyfs_inode_struct *inode);
+
+int create_root();
+unsigned char isrootinode(struct notifyfs_inode_struct *inode);
 unsigned long long get_inoctr();
-
-
-int determine_path(struct call_info_struct *call_info, unsigned char flags);
-
-
-struct effective_watch_struct *get_effective_watch();
-void add_effective_watch_to_list(struct effective_watch_struct *effective_watch);
-void remove_effective_watch_from_list(struct effective_watch_struct *effective_watch);
-struct effective_watch_struct *lookup_watch(unsigned char type, unsigned long id);
-struct watch_struct *get_watch();
-int calculate_effmask(struct effective_watch_struct *effective_watch, unsigned char lockset);
-int get_clientmask(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset);
-unsigned long get_clientid(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset);
-
-void set_backend(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch);
-
-
-struct call_info_struct *get_call_info(struct notifyfs_entry_struct *entry);
-void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_struct *entry);
-int lookup_call_info(char *path, unsigned char lockset);
-int wait_for_calls(char *path);
-void remove_call_info(struct call_info_struct *call_info);
+struct notifyfs_inode_struct *get_rootinode();
+struct notifyfs_entry_struct *get_rootentry();
 
 #endif

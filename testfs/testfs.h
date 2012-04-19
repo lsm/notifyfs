@@ -28,9 +28,9 @@ typedef char smallpathstring[SMALL_PATH_MAX+1];
 
 struct testfs_options_struct {
      char notifyfssocket[UNIX_PATH_MAX];
-     char *mountpoint;
+     pathstring mountpoint;
      unsigned char logging;
-     unsigned char logarea;
+     int logarea;
      int notifyfssocket_fd;
      int inotify_fd;
      pathstring pidfile;

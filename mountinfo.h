@@ -31,12 +31,6 @@
 #define MOUNTENTRY_NEW_SORTED           5
 #define MOUNTENTRY_REMOVED_KEEP         6
 
-#define MOUNT_STATUS_NOTSET             0
-#define MOUNT_STATUS_UP                 1
-#define MOUNT_STATUS_SLEEP              2
-#define MOUNT_STATUS_REMOVE             3
-
-
 struct mountinfo_entry_struct {
     int mountid;
     int parentid;
@@ -93,14 +87,14 @@ struct fstab_list_struct {
 int get_new_mount_list(struct mountinfo_list_struct *mi_list);
 void set_parents_raw(struct mountinfo_list_struct *mi_list);
 struct mount_entry_struct *get_next_mount_entry(struct mount_entry_struct *mount_entry, unsigned char type);
-void signal_mountmonitor(struct epoll_event *e_event);
+void signal_mountmonitor(unsigned char doinit);
 int start_mountmonitor_thread(pthread_t *pthreadid);
 int lock_mountlist(unsigned char type);
 int unlock_mountlist(unsigned char type);
-struct mount_entry_struct *get_root_mount();
 
 unsigned char mount_is_up(struct mount_entry_struct *mount_entry);
 unsigned char mounted_by_autofs(struct mount_entry_struct *mount_entry);
+struct mount_entry_struct *get_rootmount();
 
 void read_fstab();
 

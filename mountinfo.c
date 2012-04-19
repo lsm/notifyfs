@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <sys/param.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include <glib.h>
 #include <mntent.h>
@@ -41,7 +42,15 @@
 #define LOG_LOGAREA LOG_LOGAREA_MOUNTMONITOR
 
 #include "logging.h"
+#include "epoll-utils.h"
 #include "mountinfo.h"
+#include "mountstatus.h"
+
+/* external function which is called after every change in mountinfo is processed 
+   possible to make this a configurable callback */
+
+extern int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_struct *removed_mounts, struct mount_list_struct *removed_mounts_keep, unsigned char doinit);
+
 
 struct mountinfo_list_struct new_mountinfo_list;
 struct mountinfo_list_struct current_mountinfo_list;
@@ -69,10 +78,9 @@ struct fstab_list_struct *fstab_list_last=NULL;
 
 struct fstab_list_struct *fstab_list_unused=NULL;
 
-struct mount_entry_struct *root_mount=NULL;
-extern struct notifyfs_entry_struct *root_entry;
-
-
+struct mount_entry_struct *rootmount=NULL;
+extern struct notifyfs_entry_struct *root_entry; /*used??*/
+unsigned char firstrun=1;
 
 /*
 * compare entries 
@@ -441,7 +449,6 @@ void logoutput_list(unsigned char type, unsigned char lockset)
 
             } else if ( mount_entry->autofs_mounted==1 ) {
 
-
                 logoutput("(mounted by autofs) %s on %s type %s", mount_entry->mountsource, mount_entry->mountpoint, mount_entry->fstype);
 
             } else {
@@ -458,20 +465,6 @@ void logoutput_list(unsigned char type, unsigned char lockset)
 
     if (lockset==0) res=unlock_mountlist(type);
 
-}
-
-struct mount_entry_struct *get_root_mount()
-{
-    struct mount_entry_struct *mount_entry=NULL;
-    int res;
-
-    res=lock_mountlist(MOUNTENTRY_CURRENT);
-
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_CURRENT);
-
-    res=unlock_mountlist(MOUNTENTRY_CURRENT);
-
-    return mount_entry;
 }
 
 /* adding and removing to/from a list */
@@ -613,6 +606,8 @@ int get_new_mount_list(struct mountinfo_list_struct *mi_list)
                 /* this mount_entry is always the first in mountinfo file
                    so there are other ways possible, but it works */
 
+		if ( ! rootmount ) rootmount=mount_entry;
+
                 mount_entry->isroot=1;
 
             }
@@ -708,9 +703,12 @@ int get_new_mount_list(struct mountinfo_list_struct *mi_list)
     return nreturn;
 
 }
+/* */
 
 void test_mounted_by_autofs(struct mount_entry_struct *mount_entry)
 {
+
+    logoutput(" path %s", mount_entry->mountpoint);
 
     /* direct or indirect */
 
@@ -742,6 +740,8 @@ void test_mounted_by_autofs(struct mount_entry_struct *mount_entry)
 
                             /* only if this mountdirectory is a subdirectory (and not deeper!) of the autofs managed mountpoint */
 
+                            logoutput("test_mounted_by_autofs: parent is autofs/indirect");
+
                             mount_entry->autofs_mounted=1;
 
                         }
@@ -763,6 +763,8 @@ void test_mounted_by_autofs(struct mount_entry_struct *mount_entry)
         mountpoint2=(const char *)mount_entry->mountpoint;
 
         if ( strcmp(mountpoint1, mountpoint2)==0 ) {
+
+	    logoutput("test_mounted_by_autofs: parent is autofs/direct");
 
             mount_entry->autofs_mounted=1;
 
@@ -869,15 +871,21 @@ void set_parents_added(struct mount_list_struct *mount_list)
 
         }
 
+	mount_entry->autofs_mounted=0;
+
         if ( mount_entry->parent ) {
 
             /* test it's mounted by the autofs */
 
-            mount_entry->autofs_mounted=0;
-
             if ( mount_entry->parent->isautofs==1 && mount_entry->isautofs==0 ) test_mounted_by_autofs(mount_entry);
 
         }
+
+	if ( mount_entry->autofs_mounted==1 ) {
+
+	    logoutput("mount_entry %s is mounted by autofs", mount_entry->mountpoint);
+
+	}
 
         mount_entry=mount_entry->next;
 
@@ -898,7 +906,7 @@ void set_parents_added(struct mount_list_struct *mount_list)
 
 */
 
-static void *handle_change_mounttable()
+static void handle_change_mounttable()
 {
     struct mount_entry_struct *mount_entry;
     struct mountinfo_entry_struct *mi_entry, *mi_entry_2remove, *mi_entry_new, *mi_entry_tmp1, *mi_entry_tmp2;
@@ -1206,7 +1214,9 @@ static void *handle_change_mounttable()
         /* do something with the changed and the removed:
            update the fs */
 
-        res=update_notifyfs(&added_mounts, &removed_mounts, &removed_mounts_keep);
+        res=update_notifyfs(&added_mounts, &removed_mounts, &removed_mounts_keep, firstrun);
+
+	firstrun=0;
 
     }
 
@@ -1233,12 +1243,16 @@ unsigned char mounted_by_autofs(struct mount_entry_struct *mount_entry)
 
 }
 
+struct mount_entry_struct *get_rootmount()
+{
+    return rootmount;
+}
+
 int start_mountmonitor_thread(pthread_t *pthreadid)
 {
     int nreturn=0;
 
-
-    nreturn=pthread_create(pthreadid, NULL, handle_change_mounttable, NULL);
+    nreturn=pthread_create(pthreadid, NULL, (void *) &handle_change_mounttable, NULL);
 
     if ( nreturn==-1 ) {
 
@@ -1253,11 +1267,11 @@ int start_mountmonitor_thread(pthread_t *pthreadid)
 
 }
 
-void signal_mountmonitor(struct epoll_event *e_event)
+void signal_mountmonitor(unsigned char doinit)
 {
     int res;
 
-    if ( ! e_event ) {
+    if ( doinit==1 ) {
 
         /* called from main: init */
 
@@ -1284,7 +1298,7 @@ void signal_mountmonitor(struct epoll_event *e_event)
 
     res=pthread_mutex_lock(&mountinfo_changed_mutex);
 
-    if ( ! e_event ) {
+    if ( doinit==1 ) {
 
 	mountinfo_changed=2;
 
@@ -1297,7 +1311,6 @@ void signal_mountmonitor(struct epoll_event *e_event)
     /* pthread_cond_signal is also possible here */
 
     res=pthread_cond_broadcast(&mountinfo_changed_cond);
-
     res=pthread_mutex_unlock(&mountinfo_changed_mutex);
 
 }

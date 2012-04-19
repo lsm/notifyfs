@@ -28,11 +28,12 @@ typedef char smallpathstring[SMALL_PATH_MAX+1];
 
 struct notifyfs_options_struct {
      char socket[UNIX_PATH_MAX];
-     char *mountpoint;
+     pathstring mountpoint;
      unsigned char logging;
-     unsigned char logarea;
+     int logarea;
      unsigned char accessmode;
      unsigned char testmode;
+     unsigned char filesystems;
      int socket_fd;
      int inotify_fd;
      pathstring pidfile;
@@ -55,17 +56,6 @@ struct notifyfs_generic_dirp_struct {
     off_t upperfs_offset;
     off_t underfs_offset;
     struct call_info_struct *call_info;
-};
-
-
-/* inotify specific */
-
-struct inotify_watch_struct {
-    int wd;
-    struct notifyfs_inode_struct *inode;
-    int mask;
-    struct inotify_watch_struct *next;
-    struct inotify_watch_struct *prev;
 };
 
 #endif

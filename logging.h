@@ -20,6 +20,17 @@
 
 #include <syslog.h>
 
+#define LOG_LOGAREA_FILESYSTEM		1
+#define LOG_LOGAREA_PATH_RESOLUTION	2
+#define LOG_LOGAREA_MOUNTMONITOR	4
+#define LOG_LOGAREA_MAINLOOP		8
+#define LOG_LOGAREA_SOCKET		16
+#define LOG_LOGAREA_XATTR		32
+#define LOG_LOGAREA_WATCHES		64
+#define LOG_LOGAREA_INODES		128
+#define LOG_LOGAREA_MESSAGE		256
+#define LOG_LOGAREA_MAX			511
+
 #define logoutput(args ...) syslog(LOG_DEBUG, args)
 
 #define logoutput0(args ...) writelog(0, args)
@@ -29,13 +40,8 @@
 
 #ifdef LOGGING
 
-#ifndef LOG_LOGAREA
-/* if not defined log everything, 255 = 1+2+4+8+16+32+64+128 */
-#define LOG_LOGAREA 255
-#endif
-
 extern unsigned char loglevel;
-extern unsigned char logarea;
+extern int logarea;
 #define writelog(arg1, ...) if ( loglevel>arg1 && (logarea&LOG_LOGAREA) ) syslog(LOG_DEBUG, __VA_ARGS__)
 #else
 static inline void dummy_nolog()

@@ -40,7 +40,7 @@
 
 //
 // unslash a path, remove double slashes and a trailing slash
-//
+// 20120412: replaced by realpath
 
 void unslash(char *p)
 {
@@ -180,3 +180,49 @@ if ( st_to && st_from) {
 
 }
 
+/* function to test path1 is a subdirectory of path2 */
+
+unsigned char issubdirectory(const char *path1, const char *path2, unsigned char maybethesame)
+{
+    int lenpath2=strlen(path2);
+    int lenpath1=strlen(path1);
+    unsigned char issubdir=0;
+
+    if ( maybethesame==1 ) {
+
+	if ( lenpath1 < lenpath2 ) goto out;
+
+    } else {
+
+	if ( lenpath1 <= lenpath2 ) goto out;
+
+    }
+
+    if ( strncmp(path2, path1, lenpath2)==0 ) {
+
+	if ( lenpath1>lenpath2 ) {
+
+	    if ( strncmp(path1+lenpath2, "/", 1)==0 ) {
+
+		/* is a real subdirectory */
+		issubdir=2;
+
+	    }
+
+	} else {
+
+	    /* here: lenpath1==lenpath2, since the case lenpath1<lenpath2 is checked earlier */
+
+	    /* directories are the same here... and earlier tested this is only a subdir when maybethesame==1 */
+
+	    issubdir=1;
+
+	}
+
+    }
+
+    out:
+
+    return issubdir;
+
+}

@@ -17,8 +17,8 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef CDFS_UTILS_H
-#define CDFS_UTILS_H
+#ifndef GENERAL_UTILS_H
+#define GENERAL_UTILS_H
 
 
 // Prototypes
@@ -26,6 +26,7 @@
 void unslash(char *p);
 int compare_stat_time(struct stat *ast, struct stat *bst, unsigned char ntype);
 void copy_stat(struct stat *st_to, struct stat *st_from);
+unsigned char issubdirectory(const char *path1, const char *path2, unsigned char maybethesame);
 
 #endif
 

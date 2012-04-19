@@ -50,17 +50,20 @@
 #include "notifyfs.h"
 #include "client.h"
 #include "entry-management.h"
+#include "path-resolution.h"
+#include "mountinfo.h"
+#include "watches.h"
+#include "changestate.h"
 #include "xattr.h"
 
 
 extern struct notifyfs_options_struct notifyfs_options;
 
-
 int setxattr4workspace(struct call_info_struct *call_info, const char *name, const char *value)
 {
     int nvalue, nreturn=-ENOATTR;
 
-    if ( rootinode(call_info->entry->inode)==1 ) {
+    if ( isrootinode(call_info->entry->inode)==1 ) {
 
 	// setting system values only on root entry
 
@@ -124,9 +127,11 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
         int res=0;
         int oldmask=0, newmask=0;
         struct notifyfs_inode_struct *inode;
-        struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
+        struct client_struct *client=NULL;
 
         if ( notifyfs_options.testmode==0 ) {
+
+	    client=lookup_client(call_info->ctx->pid, 0);
 
             /* only clients can set a mask */
 
@@ -150,27 +155,14 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
         }
 
 
-	logoutput2("setxattr: value found %i", nvalue);
+	logoutput("setxattr: value found %i", nvalue);
 
         if ( notifyfs_options.testmode==0 ) {
 
             /* here lock client */
 
-            res=pthread_mutex_lock(&client->lock_mutex);
-
-            if ( client->lock==1 ) {
-
-                while (client->lock==1) {
-
-                    res=pthread_cond_wait(&client->lock_condition, &client->lock_mutex);
-
-                }
-
-            }
-
-            if ( client->status!=NOTIFYFS_CLIENTSTATUS_UP ) goto unlockclient;
-
-            client->lock=1;
+	    res=lock_client(client);
+	    if ( client->status_app!=NOTIFYFS_CLIENTSTATUS_UP ) goto unlockclient;
 
         }
 
@@ -179,7 +171,7 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
         /* check a watch is already present for this client 
            somehow lock the watches set in this inode ... */
 
-        logoutput2("setxattr: looking for effective_watch");
+        logoutput("setxattr: looking for effective_watch");
 
         effective_watch=inode->effective_watch;
 
@@ -196,8 +188,13 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
                 }
 
+		effective_watch->id=new_watchid();
+
                 effective_watch->inode=inode;
                 inode->effective_watch=effective_watch;
+
+		effective_watch->path=call_info->path;
+		call_info->freepath=0; /* do not free it */
 
                 add_effective_watch_to_list(effective_watch);
 
@@ -214,48 +211,48 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
         /* lock the effective watch */
 
-        res=pthread_mutex_lock(&effective_watch->lock_mutex);
-
-        if ( effective_watch->lock==1 ) {
-
-            while (effective_watch->lock==1) {
-
-                res=pthread_cond_wait(&effective_watch->lock_condition, &effective_watch->lock_mutex);
-
-            }
-
-        }
-
-        effective_watch->lock=1;
+	res=lock_effective_watch(effective_watch);
 
         if ( notifyfs_options.testmode!=0 ) {
 
-            logoutput2("setxattr: testmode: setting the watch");
+            logoutput("setxattr: testmode: setting the watch");
 
             /* when backend not set get it */
 
-            if ( effective_watch->typebackend==BACKEND_METHOD_NOTSET ) {
+            if ( effective_watch->typebackend==FSEVENT_BACKEND_METHOD_NOTSET ) {
 
                 set_backend(call_info, effective_watch);
 
-                logoutput2("setxattr: setting backend to %i", effective_watch->typebackend);
+                logoutput("setxattr: setting backend to %i", effective_watch->typebackend);
 
             }
 
             oldmask=effective_watch->mask;
             newmask=nvalue;
 
-            if ( newmask != oldmask ) {
+	    /* here deal with newmask==0 means a remove */
 
-		effective_watch->mask=newmask;
+	    if ( newmask==0 ) {
 
-		if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+		del_watch_backend(effective_watch);
 
-        	    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+	    } else {
+
+        	if ( newmask != oldmask ) {
+
+		    effective_watch->mask=newmask;
+
+		    if ( effective_watch->inode->status==FSEVENT_INODE_STATUS_OK ) {
+
+        		set_watch_backend(effective_watch, newmask, 1);
+
+		    }
 
 		}
 
 	    }
+
+	    nreturn=0;
 
             goto unlockwatch;
 
@@ -273,14 +270,13 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
         }
 
-
         if ( ! watch ) {
 
             if ( nvalue==0 ) {
 
                 /* no action: client has no watch set here  */
 
-                logoutput1("setxattr: no action: no watch found..");
+                logoutput("setxattr: no action: no watch found..");
                 nreturn=-EINVAL;
                 goto unlockwatch;
 
@@ -289,35 +285,11 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
                 /* create a new watch for inode/client */
 
-                logoutput1("setxattr: no watch found for this client.... creating one ");
-                nreturn=0;
+                logoutput("setxattr: no watch found for this client.... creating one ");
 
-                watch=get_watch();
+                nreturn=add_new_client_watch(effective_watch, nvalue, client);
 
-                if ( ! watch ) {
-
-                    nreturn=-ENOMEM;
-                    goto unlockwatch;
-
-                }
-
-                /* add to effective watch */
-
-                watch->effective_watch=effective_watch;
-                if ( effective_watch->watches ) effective_watch->watches->prev_per_watch=watch;
-                watch->next_per_watch=effective_watch->watches;
-                effective_watch->watches=watch;
-
-                /* add to client */
-
-                watch->client=client;
-                if ( client->watches ) client->watches->prev_per_client=watch;
-                watch->next_per_client=client->watches;
-                client->watches=watch;
-
-                /* set the mask */
-
-                watch->mask=nvalue;
+		if ( nreturn<0 ) goto unlockwatch;
 
                 /* recalculate the effective mask */
 
@@ -328,7 +300,7 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
                 newmask|=(IN_DELETE_SELF | IN_MOVE_SELF);
 
-                if ( effective_watch->typebackend==BACKEND_METHOD_NOTSET ) {
+                if ( effective_watch->typebackend==FSEVENT_BACKEND_METHOD_NOTSET ) {
 
                     set_backend(call_info, effective_watch);
 
@@ -338,9 +310,9 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
 		    effective_watch->mask=newmask;
 
-		    if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+		    if ( effective_watch->inode->status==FSEVENT_INODE_STATUS_OK ) {
 
-        		set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+        		set_watch_backend(effective_watch, newmask, 1);
 
 		    }
 
@@ -355,25 +327,18 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
                 /* remove watch */
                 /* from effective watch */
 
-                logoutput1("setxattr: watch found, removing it");
+                logoutput("setxattr: watch found, removing it");
                 nreturn=0;
 
-                if ( effective_watch->watches==watch ) effective_watch->watches=watch->next_per_watch;
-                if ( watch->prev_per_watch ) watch->prev_per_watch->next_per_watch=watch->next_per_watch;
-                if ( watch->next_per_watch ) watch->next_per_watch->prev_per_watch=watch->prev_per_watch;
+		remove_client_watch_from_inode(watch);
 
-                watch->prev_per_watch=NULL;
-                watch->next_per_watch=NULL;
-                watch->effective_watch=NULL;
-
-                effective_watch->nrwatches--;
                 oldmask=effective_watch->mask;
 
                 if ( effective_watch->nrwatches>0 ) {
 
                     newmask=calculate_effmask(effective_watch, 1);
 
-                    /* add events to monitor the move and delete actions */
+                    /* add events to monitor the move and delete actions of watch self */
 
                     newmask|=(IN_DELETE_SELF | IN_MOVE_SELF);
 
@@ -381,9 +346,9 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
 			effective_watch->mask=newmask;
 
-			if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+			if ( effective_watch->inode->status==FSEVENT_INODE_STATUS_OK ) {
 
-        		    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+        		    set_watch_backend(effective_watch, newmask, 1);
 
 			}
 
@@ -391,26 +356,18 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
                 } else {
 
+		    /* when there are no watches any more */
+
                     effective_watch->mask=0;
                     newmask=0;
 
-		    if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
-
-			set_watch_backend(call_info->path, effective_watch, newmask, NULL);
-
-		    }
+		    del_watch_backend(effective_watch);
 
 		}
 
                 /* from client */
 
-                if ( client->watches==watch ) client->watches=watch->next_per_client;
-                if ( watch->prev_per_client ) watch->prev_per_client->next_per_client=watch->next_per_client;
-                if ( watch->next_per_client ) watch->next_per_client->prev_per_client=watch->prev_per_client;
-
-                watch->prev_per_client=NULL;
-                watch->next_per_client=NULL;
-                watch->client=NULL;
+		remove_client_watch_from_client(watch);
 
                 free(watch);
 
@@ -419,7 +376,7 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
                 /* watch exists and new mask>0 */
 
-                logoutput1("setxattr: watch found, changing the mask");
+                logoutput("setxattr: watch found, changing the mask");
                 nreturn=0;
 
                 if ( watch->mask!=nvalue ) {
@@ -439,9 +396,9 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
 			effective_watch->mask=newmask;
 
-			if ( effective_watch->inode->status==NOTIFYFS_INODE_STATUS_OK ) {
+			if ( effective_watch->inode->status==FSEVENT_INODE_STATUS_OK ) {
 
-			    set_watch_backend(call_info->path, effective_watch, newmask, NULL);
+			    set_watch_backend(effective_watch, newmask, 1);
 
 			}
 
@@ -449,7 +406,7 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
                 } else {
 
-                    logoutput1("setxattr: no action, new value %i is the same as the current", nvalue);
+                    logoutput("setxattr: no action, new value %i is the same as the current", nvalue);
 
                 }
 
@@ -461,17 +418,35 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
         unlockwatch:
 
-        effective_watch->lock=0;
-        res=pthread_cond_broadcast(&effective_watch->lock_condition);
-        res=pthread_mutex_unlock(&effective_watch->lock_mutex);
+	if ( effective_watch->nrwatches==0 ) {
+
+	    /* when not in testmode, remove the eff watch when no client watches */
+
+	    if ( notifyfs_options.testmode==0 ) {
+
+		/* remove the watch */
+
+		if (effective_watch->inode) {
+
+		    effective_watch->inode->effective_watch=NULL;
+		    effective_watch->inode=NULL;
+
+		}
+
+		remove_effective_watch_from_list(effective_watch, 0);
+		move_effective_watch_to_unused(effective_watch);
+
+	    }
+
+	}
+
+	res=unlock_effective_watch(effective_watch);
 
         unlockclient:
 
         if ( notifyfs_options.testmode==0 ) {
 
-            client->lock=0;
-            res=pthread_cond_broadcast(&client->lock_condition);
-            res=pthread_mutex_unlock(&client->lock_mutex);
+	    res=unlock_client(client);
 
         }
 
@@ -548,7 +523,7 @@ void getxattr4workspace(struct call_info_struct *call_info, const char *name, st
 
     logoutput2("getxattr4workspace, name: %s, size: %i", name, xattr_workspace->size);
 
-    if ( rootinode(call_info->entry->inode)==1 ) {
+    if ( isrootinode(call_info->entry->inode)==1 ) {
 
 	// only the system related
 
@@ -778,7 +753,7 @@ int listxattr4workspace(struct call_info_struct *call_info, char *list, size_t s
 
     // system related attributes, only available on root
 
-    if ( rootinode(call_info->entry->inode)==1 ) {
+    if ( isrootinode(call_info->entry->inode)==1 ) {
 
 	// level of logging
 

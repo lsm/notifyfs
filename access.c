@@ -44,6 +44,8 @@
 
 #include "access.h"
 
+#define LOG_LOGAREA LOG_LOGAREA_PATH_RESOLUTION
+
 unsigned char call_path_lock;
 pthread_mutex_t call_path_mutex;
 pthread_cond_t call_path_condition;
@@ -131,6 +133,17 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
 
         }
 
+    } else {
+
+	/* when a directory, everybody can read */
+
+	if ( mask==R_OK ) {
+
+	    nreturn=1;
+	    goto out;
+
+	}
+
     }
 
 
@@ -143,6 +156,8 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
         logoutput2("CHECK_ACCESS, testing owner permissions");
 
         res=(st->st_mode & S_IRWXU) >> 6;
+
+	logoutput2("comparing %i with mask %i", res, mask);
 
         nreturn=(res & mask);
 
@@ -181,6 +196,8 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
 
         res=(st->st_mode & S_IRWXG) >> 3;
 
+	logoutput2("comparing %i with mask %i", res, mask);
+
         nreturn=(res & mask);
 
         if ( nreturn ) {
@@ -195,6 +212,8 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
         if ( mask&W_OK && S_ISDIR(st->st_mode)) {
 
             /* allow when read and execute permission */
+
+	    logoutput2("comparing %i with mask %i", res, mask);
 
             nreturn=(res & ( R_OK | X_OK ));
 
@@ -219,6 +238,8 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
     if ( res==1 ) {
 
         res=(st->st_mode & S_IRWXG) >> 3;
+
+	logoutput2("comparing %i with mask %i", res, mask);
 
         nreturn=(res & mask);
 
@@ -249,8 +270,6 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
     }
 
     /* TODO check the ACL via Xattr 
-
-
     */
 
     /* check the other mask */
@@ -259,11 +278,13 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
 
     res=(st->st_mode & S_IRWXO);
 
+    logoutput2("comparing %i with mask %i", res, mask);
+
     nreturn=(res & mask);
 
     if ( nreturn ) {
 
-        logoutput2("CHECK_ACCESS granted");
+        logoutput2("CHECK_ACCESS granted (%i)", nreturn);
         goto out;
 
     }
@@ -287,9 +308,8 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
 
     out:
 
-    return (nreturn>0) ? 1 : nreturn;
+    logoutput2("check_access: value nreturn %i", nreturn);
+
+    return (nreturn>0) ? 1 : 0;
 
 }
-
-
-

@@ -22,11 +22,11 @@
 #define NOTIFYFS_CLIENTTYPE_UNKNOWN     0
 #define NOTIFYFS_CLIENTTYPE_FS          1
 #define NOTIFYFS_CLIENTTYPE_APP         2
-#define NOTIFYFS_CLIENTTYPE_POLL        3
 
 #define NOTIFYFS_CLIENTSTATUS_NOTSET    0
 #define NOTIFYFS_CLIENTSTATUS_UP        1
 #define NOTIFYFS_CLIENTSTATUS_DOWN      2
+#define NOTIFYFS_CLIENTSTATUS_SLEEP     3
 
 
 // struct to describe the client
@@ -43,15 +43,17 @@ struct client_struct {
     pid_t pid;
     uid_t uid;
     gid_t gid;
-    unsigned long idctr;
     struct client_struct *next;
     struct client_struct *prev;
-    struct watch_struct *watches;
     pthread_mutex_t lock_mutex;
     pthread_cond_t lock_condition;
     unsigned char lock;
-    unsigned char status;
+    unsigned char status_app;
+    unsigned char status_fs;
+    unsigned char messagemask;
+    struct watch_struct *watches;
     struct mount_entry_struct *mount_entry;
+    char *path;
 };
 
 
@@ -62,8 +64,9 @@ struct client_struct *lookup_client(pid_t pid, unsigned char lockset);
 int lock_clientslist();
 int unlock_clientslist();
 struct client_struct *get_clientslist();
+int lock_client(struct client_struct *client);
+int unlock_client(struct client_struct *client);
+void assign_mountpoint_clientfs(struct client_struct *client, struct mount_entry_struct *mount_entry);
+
 
 #endif
-
-
-

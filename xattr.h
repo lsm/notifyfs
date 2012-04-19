@@ -16,8 +16,8 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef INOTIFYFS_XATTR_H
-#define INOTIFYFS_XATTR_H
+#ifndef NOTIFYFS_XATTR_H
+#define NOTIFYFS_XATTR_H
 
 #ifndef XATTR_SYSTEM_NAME
 #define XATTR_SYSTEM_NAME  "notifyfs"

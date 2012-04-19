@@ -27,12 +27,15 @@
 #include <unistd.h>
 #include <errno.h>
 #include <err.h>
+#include <dirent.h>
 
 #include <inttypes.h>
 #include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/param.h>
+#include <sys/epoll.h>
+#include <sys/inotify.h>
 
 #include <pthread.h>
 
@@ -40,7 +43,7 @@
 #define ENOATTR ENODATA        /* No such attribute */
 #endif
 
-#define LOG_LOGAREA LOG_LOGAREA_PATH_RESOLUTION
+#define LOG_LOGAREA LOG_LOGAREA_INODES
 
 #include <fuse/fuse_lowlevel.h>
 
@@ -48,7 +51,6 @@
 #include "testfs.h"
 #include "entry-management.h"
 
-pthread_mutex_t inodectrmutex=PTHREAD_MUTEX_INITIALIZER;
 
 #ifdef SIZE_INODE_HASHTABLE
 static size_t id_table_size=SIZE_INODE_HASHTABLE;
@@ -65,19 +67,12 @@ static size_t name_table_size=32768;
 struct testfs_inode_struct **inode_hash_table;
 struct testfs_entry_struct **name_hash_table;
 
+pthread_mutex_t inodectrmutex=PTHREAD_MUTEX_INITIALIZER;
 unsigned long long inoctr = FUSE_ROOT_ID;
 
-unsigned char call_info_lock;
-pthread_mutex_t call_info_mutex;
-pthread_cond_t call_info_condition;
-struct call_info_struct *call_info_list=NULL;
-
-struct call_info_struct *call_info_unused=NULL;
-pthread_mutex_t call_info_unused_mutex;
-
-
-struct effective_watch_struct *effective_watches_list=NULL;
-pthread_mutex_t effective_watches_mutex;
+struct testfs_inode_struct rootinode;
+struct testfs_entry_struct rootentry;
+unsigned char rootcreated=0;
 
 //
 // basic functions for managing inodes and entries
@@ -87,7 +82,7 @@ int init_hashtables()
 {
     int nreturn=0;
 
-    inode_hash_table = calloc(id_table_size, sizeof(struct testfs_entry_struct *));
+    inode_hash_table = calloc(id_table_size, sizeof(struct testfs_inode_struct *));
 
     if ( ! inode_hash_table ) {
 
@@ -104,6 +99,7 @@ int init_hashtables()
 	goto error;
 
     }
+
 
     return 0;
 
@@ -251,6 +247,7 @@ static struct testfs_inode_struct *create_inode()
 	memset(inode, 0, sizeof(struct testfs_inode_struct));
 	inode->ino = inoctr;
 	inode->nlookup = 0;
+	inode->status=FSEVENT_INODE_STATUS_OK;
 
 	inoctr++;
 
@@ -268,7 +265,7 @@ static void init_entry(struct testfs_entry_struct *entry)
     entry->name=NULL;
 
     entry->parent=NULL;
-    entry->ptr=NULL;
+    entry->mount_entry=NULL;
 
     // to maintain a table overall
     entry->name_next=NULL;
@@ -369,7 +366,7 @@ struct testfs_entry_struct *new_entry(fuse_ino_t parent, const char *name)
     return entry;
 }
 
-unsigned char rootinode(struct testfs_inode_struct *inode)
+unsigned char isrootinode(struct testfs_inode_struct *inode)
 {
 
     return (inode->ino==FUSE_ROOT_ID) ? 1 : 0;
@@ -381,385 +378,62 @@ unsigned long long get_inoctr()
     return inoctr;
 }
 
-int determine_path(struct call_info_struct *call_info, unsigned char flags)
+
+/* create the root inode and entry */
+
+int create_root()
 {
-    char *pathstart=NULL;
-    size_t lenname;
     int nreturn=0;
-    struct testfs_entry_struct *tmpentry=call_info->entry;
-    pathstring tmppath;
-    size_t size=sizeof(pathstring);
 
-    logoutput1("determine_path, name: %s", tmpentry->name);
+    if ( rootcreated!=0 ) goto out;
 
-    /* start of path */
+    /* rootentry */
 
-    pathstart = tmppath + size - 1;
-    *pathstart = '\0';
+    init_entry(&rootentry);
 
-    if ( tmpentry->status==ENTRY_STATUS_REMOVED && ! (flags & TESTFS_PATH_FORCE) ) {
+    rootentry.name=strdup(".");
 
-        nreturn=-ENOENT;
-        goto error;
+    if ( ! rootentry.name ) {
+
+	nreturn=-ENOMEM;
+	goto out;
 
     }
 
-    if ( ! call_info->ptr ) call_info->ptr=tmpentry->ptr;
+    /* rootinode */
 
-    if ( tmpentry->inode ) {
+    pthread_mutex_lock(&inodectrmutex);
 
-        if ( rootinode(tmpentry->inode)==1 ) {
+    rootinode.ino = inoctr;
+    rootinode.nlookup = 0;
+    rootinode.status=FSEVENT_INODE_STATUS_OK;
 
-	    logoutput1("determine_path, testing is rootentry: yes");
+    inoctr++;
 
-            pathstart-=1;
-            *pathstart = '.';
-	    goto out;
+    pthread_mutex_unlock(&inodectrmutex);
 
-        } else {
+    /* create the mutual links */
 
-	    logoutput1("determine_path, testing is rootentry: no");
+    rootentry.inode=&rootinode;
+    rootinode.alias=&rootentry;
 
-	}
-
-    }
-
-    logoutput2("normal entry, adding %s", tmpentry->name);
-
-    lenname=strlen(tmpentry->name);
-    pathstart -= (long) lenname;
-    memcpy(pathstart, tmpentry->name, lenname);
-
-    while (tmpentry->parent) {
-
-	tmpentry=tmpentry->parent;
-
-        if ( ! call_info->ptr ) call_info->ptr=tmpentry->ptr;
-
-	if ( rootinode(tmpentry->inode)==1 ) break;
-
-        if ( tmpentry->status==ENTRY_STATUS_REMOVED && ! (flags & TESTFS_PATH_FORCE) ) {
-
-            nreturn=-ENOENT;
-            goto error;
-
-        }
-
-	// add the name of this entry (at the start of path) and a slash to separate it
-
-	lenname=strlen(tmpentry->name);
-
-	if ( pathstart - tmppath < 1 + (long) lenname ) {
-
-	    nreturn=-ENAMETOOLONG;
-	    goto error;
-
-	}
-
-	pathstart--;
-	*pathstart = '/';
-
-	pathstart -= lenname;
-
-	memcpy(pathstart, tmpentry->name, lenname);
-
-    }
+    add_to_inode_hash_table(&rootinode);
+    rootcreated=1;
 
     out:
 
-    /* create a path just big enough */
-
-    call_info->path=malloc(tmppath+size-pathstart+1);
-
-    if ( call_info->path ) {
-
-        memset(call_info->path, '\0', tmppath+size-pathstart+1);
-        memcpy(call_info->path, pathstart, tmppath+size-pathstart);
-        logoutput2("result after memcpy: %s", call_info->path);
-
-    } else {
-
-        nreturn=-ENOMEM;
-
-    }
-
-
-    error:
-
-    if ( nreturn<0 ) {
-
-        logoutput2("determine_path, error: %i", nreturn);
-
-    }
-
     return nreturn;
 
 }
 
-struct effective_watch_struct *get_effective_watch()
+/* get the root inode */
+
+struct testfs_inode_struct *get_rootinode()
 {
-    struct effective_watch_struct *effective_watch=NULL;
-
-    effective_watch=malloc(sizeof(struct effective_watch_struct));
-
-    if ( effective_watch ) {
-
-        effective_watch->mask=0;
-        effective_watch->inode=NULL;
-        effective_watch->next=NULL;
-        effective_watch->prev=NULL;
-        pthread_mutex_init(&effective_watch->lock_mutex, NULL);
-        pthread_cond_init(&effective_watch->lock_condition, NULL);
-        effective_watch->lock=0;
-        effective_watch->id=0;
-
-    }
-
-    return effective_watch;
-
+    return &rootinode;
 }
 
-
-void add_effective_watch_to_list(struct effective_watch_struct *effective_watch)
+struct testfs_entry_struct *get_rootentry()
 {
-    int res;
-
-    res=pthread_mutex_lock(&effective_watches_mutex);
-
-    effective_watch->next=effective_watches_list;
-    if ( effective_watches_list ) effective_watches_list->prev=effective_watch;
-    effective_watches_list=effective_watch;
-    effective_watch->prev=NULL;
-
-    res=pthread_mutex_unlock(&effective_watches_mutex);
-
-}
-
-void remove_effective_watch_from_list(struct effective_watch_struct *effective_watch)
-{
-    int res;
-
-    res=pthread_mutex_lock(&effective_watches_mutex);
-
-    if ( effective_watches_list==effective_watch ) effective_watches_list=effective_watch->next;
-    if ( effective_watch->next ) effective_watch->next->prev=effective_watch->prev;
-    if ( effective_watch->prev ) effective_watch->prev->next=effective_watch->next;
-
-    res=pthread_mutex_unlock(&effective_watches_mutex);
-
-}
-
-struct effective_watch_struct *lookup_watch(unsigned char type, unsigned long id)
-{
-    struct effective_watch_struct *effective_watch=NULL;
-    int res;
-
-    /* lock */
-
-    res=pthread_mutex_lock(&effective_watches_mutex);
-
-    effective_watch=effective_watches_list;
-
-    while (effective_watch) {
-
-        if ( effective_watch->id==id ) break;
-
-        effective_watch=effective_watch->next;
-
-    }
-
-    /* unlock */
-
-    res=pthread_mutex_unlock(&effective_watches_mutex);
-
-    return effective_watch;
-
-}
-
-/* functions to manage the calls:
-   - add call_info 
-   - lookup_call_info
-   - remove call_info
-
-*/
-
-struct call_info_struct *create_call_info()
-{
-    struct call_info_struct *call_info=NULL;
-
-
-    call_info=malloc(sizeof(struct call_info_struct));
-
-
-    return call_info;
-
-}
-
-void add_call_info_to_list(struct call_info_struct *call_info)
-{
-    int res;
-
-    /* add to list */
-
-    res=pthread_mutex_lock(&call_info_mutex);
-
-    if ( call_info_list ) call_info_list->prev=call_info;
-    call_info->next=call_info_list;
-    call_info->prev=NULL;
-    call_info_list=call_info;
-
-    res=pthread_mutex_unlock(&call_info_mutex);
-
-}
-
-void init_call_info(struct call_info_struct *call_info, struct testfs_entry_struct *entry)
-{
-
-    call_info->threadid=pthread_self();
-    call_info->entry=entry;
-    call_info->entry2remove=entry;
-    call_info->path=NULL;
-    call_info->backend=NULL;
-    call_info->next=NULL;
-    call_info->prev=NULL;
-    call_info->ptr=NULL;
-
-}
-
-
-
-struct call_info_struct *get_call_info(struct testfs_entry_struct *entry)
-{
-    int res;
-    struct call_info_struct *call_info=NULL;
-
-    res=pthread_mutex_lock(&call_info_unused_mutex);
-
-    if (call_info_unused) {
-
-        call_info=call_info_unused;
-        call_info_unused=call_info->next;
-
-    } else {
-
-        call_info=create_call_info();
-
-        if ( ! call_info ) goto out;
-
-    }
-
-    res=pthread_mutex_unlock(&call_info_unused_mutex);
-
-    init_call_info(call_info, entry);
-
-    out:
-
-    return call_info;
-
-}
-
-/* function to test a call is present with 
-   a subdirectory/child of path
-
-   return:
-   0: not found
-   1: found
-*/
-
-int lookup_call_info(char *path, unsigned char lockset)
-{
-    int nreturn=0, res;
-
-    if (lockset==0) res=pthread_mutex_lock(&call_info_mutex);
-
-    if ( call_info_list ) {
-        struct call_info_struct *call_info=call_info_list;
-
-        while(call_info) {
-
-            if ( strlen(call_info->path) > strlen(path) && strncmp(path, call_info->path, strlen(path))==0 ) {
-
-                nreturn=1;
-                break;
-
-            }
-
-            call_info=call_info->next;
-
-        }
-
-    }
-
-    if (lockset==0) res=pthread_mutex_unlock(&call_info_mutex);
-
-    return nreturn;
-
-}
-
-int wait_for_calls(char *path)
-{
-    int nreturn=0, res;
-
-    res=pthread_mutex_lock(&call_info_mutex);
-
-    res=lookup_call_info(path, 1);
-
-    if ( res==1 ) {
-
-        /* there is at least one call... wait for it to finish */
-
-        wait:
-
-        res=pthread_cond_wait(&call_info_condition, &call_info_mutex);
-
-        res=lookup_call_info(path, 1);
-
-        if ( res==1 ) goto wait;
-
-    }
-
-    res=pthread_mutex_unlock(&call_info_mutex);
-
-    return nreturn;
-
-}
-
-void remove_call_info_from_list(struct call_info_struct *call_info)
-{
-    int res=0;
-
-    res=pthread_mutex_lock(&call_info_mutex);
-
-    if ( call_info->prev ) call_info->prev->next=call_info->next;
-    if ( call_info->next ) call_info->next->prev=call_info->prev;
-    if ( call_info_list==call_info ) call_info_list=call_info->next;
-
-    /* signal waiting operations call on path is removed*/
-
-    res=pthread_cond_broadcast(&call_info_condition);
-
-    res=pthread_mutex_unlock(&call_info_mutex);
-
-}
-
-
-
-
-void remove_call_info(struct call_info_struct *call_info)
-{
-    int res=0;
-
-    if (call_info->path) free(call_info->path);
-
-    /* move to unused list */
-
-    res=pthread_mutex_lock(&call_info_unused_mutex);
-
-    if (call_info_unused) call_info_unused->prev=call_info;
-    call_info->next=call_info_unused;
-    call_info_unused=call_info;
-    call_info->prev=NULL;
-
-    res=pthread_mutex_unlock(&call_info_unused_mutex);
-
+    return &rootentry;
 }

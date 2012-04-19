@@ -42,6 +42,7 @@
 
 #include <sys/types.h>
 #include <sys/inotify.h>
+#include <sys/epoll.h>
 #include <pthread.h>
 
 
@@ -58,10 +59,12 @@
 #include <fuse/fuse_lowlevel.h>
 
 #include "entry-management.h"
+#include "path-resolution.h"
 #include "logging.h"
 #include "notifyfs.h"
 
-#include "fuse-loop-epoll-mt.h"
+#include "epoll-utils.h"
+#include "handlefuseevent.h"
 
 #include "utils.h"
 #include "options.h"
@@ -70,885 +73,123 @@
 #include "socket.h"
 #include "access.h"
 #include "mountinfo.h"
+#include "mountstatus.h"
+#include "watches.h"
+#include "changestate.h"
 
-pthread_mutex_t changestate_mutex=PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t changestate_condition=PTHREAD_COND_INITIALIZER;
+#include "message.h"
+#include "message-server.h"
 
-struct call_info_struct *changestate_call_info_first=NULL;
-struct call_info_struct *changestate_call_info_last=NULL;
-
-struct notifyfs_commandline_options_struct notifyfs_commandline_options;
 struct notifyfs_options_struct notifyfs_options;
 
-struct fuse_opt notifyfs_help_options[] = {
-     NOTIFYFS_OPT("--socket=%s",		socket, 0),
-     NOTIFYFS_OPT("socket=%s",		        socket, 0),
-     NOTIFYFS_OPT("logging=%i",			logging, 0),
-     NOTIFYFS_OPT("--logging=%i",		logging, 0),
-     NOTIFYFS_OPT("logarea=%i",			logarea, 0),
-     NOTIFYFS_OPT("--logarea=%i",		logarea, 0),
-     NOTIFYFS_OPT("accessmode=%i",		accessmode, 0),
-     NOTIFYFS_OPT("--accessmode=%i",		accessmode, 0),
-     NOTIFYFS_OPT("testmode",		        testmode, 1),
-     NOTIFYFS_OPT("--testmode",		        testmode, 1),
-     FUSE_OPT_KEY("-V",            		KEY_VERSION),
-     FUSE_OPT_KEY("--version",      		KEY_VERSION),
-     FUSE_OPT_KEY("-h",             		KEY_HELP),
-     FUSE_OPT_KEY("--help",         		KEY_HELP),
-     FUSE_OPT_END
-};
-
-
-static struct fuse_chan *notifyfs_chan;
+struct fuse_chan *notifyfs_chan;
 struct notifyfs_entry_struct *root_entry;
 extern struct mount_entry_struct *root_mount;
 unsigned char loglevel=0;
-unsigned char logarea=0;
+int logarea=0;
 
+/* function to remove a client app */
 
-/* function to read the contents of a directory when a watch is set on that directory */
-
-
-
-
-
-/* 	function to call backend notify methods like:
-	- inotify_add_watch
-
-	called when setting a watch via xattr, but also
-	when a fs is unmounted normally or via autofs
-
-*/
-
-void set_watch_backend(char *path, struct effective_watch_struct *effective_watch, int newmask, struct mount_entry_struct *mount_entry)
+void remove_client_app(struct client_struct *client)
 {
     int res;
 
-    if ( effective_watch->typebackend==BACKEND_METHOD_INOTIFY ) {
+    /* remove every watch of this client */
 
-	if ( newmask>0 ) {
+    if ( client->watches ) {
+	struct watch_struct *watch=client->watches;
+	struct effective_watch_struct *effective_watch=NULL;
+	int newmask,oldmask;
 
-            logoutput2("set_watch_backend: setting inotify watch on %s with mask %i", path, newmask);
+	/* remove the watch from the inodes, and if there no watches left there, 
+	   remove the effective_watch */
 
-            res=inotify_add_watch(notifyfs_options.inotify_fd, path, newmask);
+	while (watch) {
 
-            if ( res==-1 ) {
+	    /* here remove from effective watch */
 
-                logoutput2("set_watch_backend: setting inotify watch gives error: %i", errno);
+	    effective_watch=watch->effective_watch;
 
-            } else {
+	    if ( effective_watch ) {
 
-		/* here a check res is the same as id when the watch existed */
+    		/* lock the effective watch */
 
-                effective_watch->id=(unsigned long) res;
+		res=lock_effective_watch(effective_watch);
 
-    	    }
+		/* remove watch from inode/effective_watch */
 
-        } else {
+		if ( effective_watch->watches==watch ) effective_watch->watches=watch->next_per_watch;
 
-	    /* newmask==0 means remove */
+		if ( watch->next_per_watch ) {
 
-            res=inotify_rm_watch(notifyfs_options.inotify_fd, (int) effective_watch->id);
-
-            if ( res==-1 ) {
-
-                logoutput2("set_watch_backend: deleting inotify watch %i gives error: %i", (int) effective_watch->id, errno);
-
-            } else {
-
-                effective_watch->id=0;
-
-            }
-
-        }
-
-    } else if ( effective_watch->typebackend==BACKEND_METHOD_FORWARD ) {
-	struct client_struct *client=(struct client_struct *) effective_watch->backend;
-
-	if ( client->status == NOTIFYFS_CLIENTSTATUS_UP ) {
-
-	    /* forward the setting of the mask to the fs */
-
-	    if ( newmask>0 ) {
-
-		logoutput2("set_watch_backend: forward watch on %s with mask %i", path, newmask);
-
-		/*  setting of watch with mask on client fs 
-		    translate the internal inotify mask to a mask understood 
-		    by the fs
-		*/
-
-		/* here also something like inotify_add_watch a reference to the watch
-		   and possibly communicate with the fs using the path or in the ino
-		   the ino is known since this function is called from setxattr where the
-		  stat is checked (or from cache)
-		*/
-
-		res=send_notify_message(client->fd, NOTIFYFS_MESSAGE_TYPE_SETWATCH, 0, newmask, strlen(path), path);
-
-		/* here also a check of the result, and possibly a ack message */
-
-	    } else {
-
-		logoutput2("set_watch_backend: forward delwatch on %s", path);
-
-		res=send_notify_message(client->fd, NOTIFYFS_MESSAGE_TYPE_DELWATCH, 0, newmask, strlen(path), path);
-
-		/* here also a check of the result, and possibly a ack message */
-
-	    }
-
-	} else {
-
-	    if ( client->mount_entry ) {
-
-		logoutput("set_watch_backend: forward watch on %s not possible: client %s is not up", path, client->mount_entry->fstype);
-
-	    } else {
-
-		logoutput("set_watch_backend: forward watch on %s not possible: client (unknown) is not up", path);
-
-	    }
-
-	}
-
-    } else {
-
-        logoutput("Error: backend %i not reckognized.", effective_watch->typebackend);
-
-    }
-
-}
-
-/* function to match the path which is send by a client fs as his
-   mountpoint (=path) to a mountpoint/entry known to notifyfs
-
-   this function is called whenever a client registers itself at
-   notifyfs as clientfs, and provides the mountpoint as additional
-   data
-
-   */
-
-void assign_mountpoint_clientfs(struct client_struct *client, char *path)
-{
-    struct mount_entry_struct *mount_entry;
-    int res;
-
-    logoutput("assign_mountpoint_clientfs: lookup mount entry matching %s", path);
-
-    res=lock_mountlist(MOUNTENTRY_CURRENT);
-
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_CURRENT);
-
-    while (mount_entry) {
-
-
-	if ( strcmp(mount_entry->mountpoint, path)==0 ) {
-
-	    mount_entry->client=(void *) client;
-	    client->mount_entry=mount_entry;
-
-	    logoutput("assign_mountpoint_clientfs: mount entry found");
-
-	    break;
-
-	}
-
-
-        mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_CURRENT);
-
-    }
-
-    if ( ! mount_entry ) logoutput("assign_mountpoint_clientfs: mount entry not found");
-
-    res=unlock_mountlist(MOUNTENTRY_CURRENT);
-
-}
-
-
-void cachechanges(struct call_info_struct *call_info, int mask)
-{
-    int res;
-
-    if ( call_info->entry ) {
-
-	if ( ! call_info->path ) {
-
-	    res=determine_path(call_info, NOTIFYFS_PATH_FORCE);
-	    if (res<0) return;
-
-	}
-
-	if ( mask & IN_ATTRIB ) {
-	    struct stat st;
-	    unsigned char statchanged=0;
-
-	    res=lstat(call_info->path, &st);
-
-	    /* compare with the cached ones */
-
-	    if ( call_info->entry->inode->st.st_mode != st.st_mode ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_mode = st.st_mode;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_nlink != st.st_nlink ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_nlink = st.st_nlink;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_uid != st.st_uid ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_uid = st.st_uid;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_gid != st.st_gid ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_gid = st.st_gid;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_rdev != st.st_rdev ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_rdev = st.st_rdev;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_size != st.st_size ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_size = st.st_size;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_atime != st.st_atime ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_atime = st.st_atime;
-
-	    }
-
-#ifdef  __USE_MISC
-
-	    // time defined as timespec
-
-	    if ( call_info->entry->inode->st.st_atim.tv_nsec != st.st_atim.tv_nsec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_atim.tv_nsec = st.st_atim.tv_nsec;
-
-	    }
-
-#else
-
-	    if ( call_info->entry->inode->st.st_atimensec != st.st_atimensec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_atimensec = st.st_atimensec;
-
-	    }
-
-
-#endif
-
-	    if ( call_info->entry->inode->st.st_mtime != st.st_mtime ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_mtime = st.st_mtime;
-
-	    }
-
-#ifdef  __USE_MISC
-
-	    // time defined as timespec
-
-	    if ( call_info->entry->inode->st.st_mtim.tv_nsec != st.st_mtim.tv_nsec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_mtim.tv_nsec = st.st_mtim.tv_nsec;
-
-	    }
-
-#else
-
-	    if ( call_info->entry->inode->st.st_mtimensec != st.st_mtimensec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_mtimensec = st.st_mtimensec;
-
-	    }
-
-
-#endif
-
-
-	    if ( call_info->entry->inode->st.st_ctime != st.st_ctime ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_ctime = st.st_ctime;
-
-	    }
-
-#ifdef  __USE_MISC
-
-	    // time defined as timespec
-
-	    if ( call_info->entry->inode->st.st_ctim.tv_nsec != st.st_ctim.tv_nsec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_ctim.tv_nsec = st.st_ctim.tv_nsec;
-
-	    }
-
-#else
-
-	    if ( call_info->entry->inode->st.st_ctimensec != st.st_ctimensec ) {
-
-		// access: no statchanged=1;
-		call_info->entry->inode->st.st_ctimensec = st.st_ctimensec;
-
-	    }
-
-
-#endif
-
-
-	    if ( call_info->entry->inode->st.st_blksize != st.st_blksize ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_blksize = st.st_blksize;
-
-	    }
-
-	    if ( call_info->entry->inode->st.st_blocks != st.st_blocks ) {
-
-		statchanged=1;
-		call_info->entry->inode->st.st_blocks = st.st_blocks;
-
-	    }
-
-	    if ( statchanged==1 ) {
-
-		logoutput2("cachechanges: stat changed for %s", call_info->path);
-
-	    }
-
-	    /* here also the xattr ?? */
-
-	}
-
-    }
-
-}
-
-
-/* function to remove every watch attached to an effective_watch 
-   effective_watch must be locked
-   when a watch is removed, a message is send to the client owning the watch
-   */
-
-int changestate_watches(struct effective_watch_struct *effective_watch, unsigned char typeaction)
-{
-    struct watch_struct *watch=effective_watch->watches;
-    int nreturn=0;
-    int res;
-
-    while (watch) {
-
-        effective_watch->watches=watch->next_per_watch;
-
-        /* notify client */
-
-        if ( watch->client ) {
-            struct client_struct *client=watch->client;
-
-            if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
-
-                /* only send a message when client is up */
-
-                if ( typeaction==WATCH_ACTION_REMOVE ) {
-
-                    res=send_notify_message(client->fd, NOTIFYFS_MESSAGE_TYPE_DELWATCH, watch->id, 0, 0, NULL);
-
-                    if (res<0) logoutput1("error writing to %i when sending remove watch message", client->fd);
-
-                } else if ( typeaction==WATCH_ACTION_SLEEP ) {
-
-                    res=send_notify_message(client->fd, NOTIFYFS_MESSAGE_TYPE_SLEEPWATCH, watch->id, 0, 0, NULL);
-
-                    if (res<0) logoutput1("error writing to %i when sending sleep watch message", client->fd);
-
-                } else if ( typeaction==WATCH_ACTION_WAKEUP ) {
-
-                    res=send_notify_message(client->fd, NOTIFYFS_MESSAGE_TYPE_WAKEWATCH, watch->id, 0, 0, NULL);
-
-                    if (res<0) logoutput1("error writing to %i when sending wakeup watch message", client->fd);
-
-                }
-
-            }
-
-            if ( typeaction==WATCH_ACTION_REMOVE ) {
-
-                /* if remove remove from client */
-
-                res=pthread_mutex_lock(&client->lock_mutex);
-
-                if ( client->lock==1 ) {
-
-                    while (client->lock==1) {
-
-                        res=pthread_cond_wait(&client->lock_condition, &client->lock_mutex);
-
-                    }
-
-                }
-
-                client->lock=1;
-
-                if ( client->watches==watch ) client->watches=watch->next_per_client;
-                if ( watch->prev_per_client ) watch->prev_per_client->next_per_client=watch->next_per_client;
-                if ( watch->next_per_client ) watch->next_per_client->prev_per_client=watch->prev_per_client;
-
-                watch->prev_per_client=NULL;
-                watch->next_per_client=NULL;
-                watch->client=NULL;
-
-                client->lock=0;
-                res=pthread_cond_broadcast(&client->lock_condition);
-                res=pthread_mutex_unlock(&client->lock_mutex);
-
-            }
-
-        }
-
-        if ( typeaction==WATCH_ACTION_REMOVE ) free(watch);
-
-        watch=effective_watch->watches;
-
-    }
-
-    return nreturn;
-
-}
-
-/*
-   function to change the state of an effective watch 
-   one of the possibilities is of course the removal, but also possible is
-   the setting into sleep when the underlying fs is unmounted or
-   waking it up when previously is has been set to sleep and the underlying
-   fs is mounted
-   this setting to sleep and waking up again is typically the case with autofs 
-   managed filesystems
-   - remove: remove the effective_watch, and the notify backend method
-   - sleep: change the state of the effective_watch into sleep, and remove the notify backend method
-   - wakeup: change the state of the effective_watch into active, and set the notify backend method
-   this function calls change_state_watches to make changes effective to the individual watches
-
-*/
-
-int changestate_effective_watch(struct notifyfs_inode_struct *inode, unsigned char lockset, unsigned char typeaction, char *path)
-{
-    int nreturn=0;
-    int res;
-
-    if ( inode->effective_watch ) {
-        struct effective_watch_struct *effective_watch=inode->effective_watch;
-
-        /* try to lock the effective watch */
-
-        res=pthread_mutex_lock(&effective_watch->lock_mutex);
-
-        if ( effective_watch->lock==1 ) {
-
-            while (effective_watch->lock==1) {
-
-                res=pthread_cond_wait(&effective_watch->lock_condition, &effective_watch->lock_mutex);
-
-            }
-
-        }
-
-        effective_watch->lock=1;
-
-        /* after here: the effective watch is locked by this thread */
-
-        res=changestate_watches(effective_watch, typeaction);
-
-        /* correct backend: backend and mount status and specific */
-
-        if ( typeaction==WATCH_ACTION_REMOVE || typeaction==WATCH_ACTION_SLEEP ) {
-
-	    /* when remove or sleep: remove the backend */
-
-	    set_watch_backend(path, effective_watch, 0, NULL);
-
-        } else if ( typeaction==WATCH_ACTION_WAKEUP ) {
-
-            /* when wake up and or set: set the backend */
-
-	    set_watch_backend(path, effective_watch, effective_watch->mask, NULL);
-
-        }
-
-        effective_watch->lock=0;
-        res=pthread_cond_broadcast(&effective_watch->lock_condition);
-        res=pthread_mutex_unlock(&effective_watch->lock_mutex);
-
-        if ( typeaction==WATCH_ACTION_REMOVE ) {
-
-            /* remove from global list */
-
-            remove_effective_watch_from_list(effective_watch);
-
-            /* detach from inode */
-
-            inode->effective_watch=NULL;
-            effective_watch->inode=NULL;
-
-            /* free and destroy */
-
-            pthread_mutex_destroy(&effective_watch->lock_mutex);
-            pthread_cond_destroy(&effective_watch->lock_condition);
-
-            free(effective_watch);
-
-         }
-
-    }
-
-    return nreturn;
-
-}
-
-
-static void changestate_recursive(struct notifyfs_entry_struct *entry, char *path, int pathlen, unsigned char typeaction)
-{
-    int res, nlen, pathlen_orig=pathlen;
-
-    logoutput2("changestate_recursive: entry %s, action %i", entry->name, typeaction);
-
-    if ( entry->child ) {
-        struct notifyfs_entry_struct *child_entry=entry->child;
-        /* check every child */
-
-        while (child_entry) {
-
-            entry->child=child_entry->dir_next;
-            child_entry->dir_prev=NULL;
-            child_entry->dir_next=NULL;
-
-            /* here something like copy child_entry->name to path */
-
-            *(path+pathlen)='/';
-            pathlen++;
-            nlen=strlen(child_entry->name);
-            memcpy(path+pathlen, child_entry->name, nlen);
-            pathlen+=nlen;
-
-            changestate_recursive(child_entry, path, pathlen, typeaction ); /* recursive */
-
-            child_entry=entry->child;
-
-        }
-
-    }
-
-    /* when here the directory is empty */
-
-    /* set path back to original state */
-
-    pathlen=pathlen_orig;
-    *(path+pathlen)='\0';
-
-
-    if ( typeaction==NOTIFYFS_INODE_ACTION_REMOVE ) {
-
-	if ( entry->inode ) {
-
-	    if ( entry->inode->effective_watch ) res=changestate_effective_watch(entry->inode, 0, WATCH_ACTION_REMOVE, path);
-
-	    if ( entry->parent && entry->parent->inode ) {
-
-        	    /* send invalidate entry */
-        	    /* use notify_delete or notify_inval_entry ?? */
-
-        	    res=fuse_lowlevel_notify_delete(notifyfs_chan, entry->parent->inode->ino, entry->inode->ino, entry->name, strlen(entry->name));
-
-	    }
-
-	    entry->inode->status=NOTIFYFS_INODE_STATUS_REMOVED;
-
-	}
-
-	if ( entry->parent ) {
-
-            /* remove from child list parent if not detached already */
-
-            if ( entry->parent->child==entry ) entry->parent->child=entry->dir_next;
-            if ( entry->dir_prev ) entry->dir_prev->dir_next=entry->dir_next;
-            if ( entry->dir_next ) entry->dir_next->dir_prev=entry->dir_prev;
-
-	}
-
-	remove_entry_from_name_hash(entry);
-	remove_entry(entry);
-
-    } else if ( typeaction==NOTIFYFS_INODE_ACTION_SLEEP ) {
-
-	if ( entry->inode ) {
-
-	    if ( entry->inode->effective_watch ) res=changestate_effective_watch(entry->inode, 0, WATCH_ACTION_SLEEP, path);
-
-	    entry->inode->status=NOTIFYFS_INODE_STATUS_SLEEP;
-
-	}
-
-    } else if ( typeaction==NOTIFYFS_INODE_ACTION_WAKEUP ) {
-
-	if ( entry->inode ) {
-
-	    if ( entry->inode->effective_watch ) res=changestate_effective_watch(entry->inode, 0, WATCH_ACTION_WAKEUP, path);
-
-	    entry->inode->status=NOTIFYFS_INODE_STATUS_OK;
-
-	}
-
-    } else if ( typeaction==NOTIFYFS_INODE_ACTION_CREATE ) {
-
-	/* this will never happen, cause an inode is never created this way */
-
-	if ( entry->inode ) entry->inode->status=NOTIFYFS_INODE_STATUS_OK;
-
-    }
-
-}
-
-/* function to test queueing a remove entry is necessary 
-
-   note the queue has to be locked 
-    TODO: the type of the action is required??
-   */
-
-unsigned char queue_changestate(struct notifyfs_entry_struct *entry, char *path1)
-{
-    unsigned char doqueue=0;
-
-    if ( ! changestate_call_info_first ) {
-
-        /* queue is empty: put it on queue */
-
-        doqueue=1;
-
-    } else {
-        struct call_info_struct *call_info_tmp=changestate_call_info_last;
-        char *path2;
-        int len1=strlen(path1), len2;
-
-        doqueue=1;
-
-        /* walk through queue to check there is a related call already there */
-
-        while(call_info_tmp) {
-
-            path2=call_info_tmp->path;
-            len2=strlen(path2);
-
-            if ( len2>len1 ) {
-
-                /* test path2 is a subdirectory of path1 */
-
-                if ( call_info_tmp!=changestate_call_info_first ) {
-
-                    if ( strncmp(path2+len1, "/", 1)==0 && strncmp(path1, path2, len1)==0 ) {
-
-                        /* here replace the already pending entry 2 remove by this one...
-                        do this only when it's not the first!!*/
-
-                        call_info_tmp->entry2remove=entry;
-                        strcpy(path2, (const char *) path1); /* this possible cause len(path2)>len(path1) HA !!!! */
-                        doqueue=0;
-
-                        break;
-
-                    }
-
-                }
-
-            } else {
-
-                /* len2<=len1, test path1 is a subdirectory of path2 */
-
-		if ( strcmp(path1, path2)==0 ) {
-
-		    /* already queued: the same */
-
-		    doqueue=0;
-
-		    break;
-
-		} else if ( strncmp(path1+len2, "/", 1)==0 && strncmp(path2, path1, len2)==0 ) {
-
-                    /* ready: already queued... */
-                    doqueue=0;
-
-                    break;
-
-                }
-
-            }
-
-            call_info_tmp=call_info_tmp->prev;
-
-        }
-
-    }
-
-    return doqueue;
-
-}
-
-/* wait for the call_info to be the first in remove entry queue, and process when it's the first 
-  the lock has to be set
-*/
-
-void wait_in_queue_and_process(struct call_info_struct *call_info, unsigned char typeaction)
-{
-    int res;
-    pathstring path;
-
-    if ( call_info != changestate_call_info_first ) {
-
-        /* wait till it's the first */
-
-        while ( call_info != changestate_call_info_first ) {
-
-            res=pthread_cond_wait(&changestate_condition, &changestate_mutex);
-
-        }
-
-    }
-
-    /* call_info is the first in the queue, release the queue for other queues and go to work */
-
-    res=pthread_mutex_unlock(&changestate_mutex);
-
-    memset(path, '\0', sizeof(pathstring));
-    strcpy(path, call_info->path);
-
-    changestate_recursive(call_info->entry2remove, path, strlen(path), typeaction);
-
-    /* remove from queue... */
-
-    res=pthread_mutex_lock(&changestate_mutex);
-
-    changestate_call_info_first=call_info->next;
-
-    if ( changestate_call_info_first ) changestate_call_info_first->prev=NULL;
-
-    call_info->next=NULL;
-    call_info->prev=NULL;
-
-    if ( changestate_call_info_last==call_info ) changestate_call_info_last=changestate_call_info_first;
-
-    /* signal other threads if the queue is not empty */
-
-    if ( changestate_call_info_first ) res=pthread_cond_broadcast(&changestate_condition);
-
-}
-
-/* important function to react on signals which imply that the state of entries and watches 
-   has changed
-
-   this is called by the fuse threads, but also from the mainloop, which reacts on inotify events,
-   and mountinfo when mounts are removed or added
-
-   to do so a queue is used
-   every call is added to the tail, and when it has become the first, it's processed
-   every time the first call is removed, and thus the next call has become the first, 
-   a broadcast is done to the other waiting threads
-   the one who has become first is taking action
-
-   very nice of this queue is the ability to check other pending calls
-   when there is a related request present in the queue, it's not necessary to queue this request again
-   when in a tree different watches are set, and the whole tree is removed this will result in a burst
-   of inotify events: this queue will filter out doubles
-   */
-
-void changestate(struct call_info_struct *call_info, unsigned char typeaction)
-{
-    int res;
-    unsigned char doqueue=1;
-
-    call_info->entry2remove=call_info->entry;
-    call_info->next=NULL;
-    call_info->prev=NULL;
-
-    if ( call_info->entry ) {
-
-        logoutput1("changestate: processing %s, entry %s", call_info->path, call_info->entry->name);
-
-    } else {
-
-        logoutput1("changestate: processing %s, entry not set", call_info->path);
-
-    }
-
-    /* lock the remove entry queue */
-
-    res=pthread_mutex_lock(&changestate_mutex);
-
-    doqueue=queue_changestate(call_info->entry, call_info->path);
-
-    if ( doqueue==1 ) {
-
-        if ( ! changestate_call_info_first ) {
-
-            /* queue is empty: put it on queue */
-
-            changestate_call_info_first=call_info;
-            changestate_call_info_last=call_info;
-
-        } else {
-
-            /* add at tail of queue */
-
-            changestate_call_info_last->next=call_info;
-            call_info->prev=changestate_call_info_last;
-            call_info->next=NULL;
-            changestate_call_info_last=call_info;
-
-        }
-
-	if ( typeaction==NOTIFYFS_TREE_UP ) {
-
-    	    wait_in_queue_and_process(call_info, NOTIFYFS_INODE_ACTION_WAKEUP);
-
-	} else if ( typeaction==NOTIFYFS_TREE_DOWN ) {
-
-	    if ( call_info->mount_entry ) {
-
-		if ( mounted_by_autofs(call_info->mount_entry)==1 ) {
-
-		    wait_in_queue_and_process(call_info, NOTIFYFS_INODE_ACTION_SLEEP);
-
-		} else {
-
-		    wait_in_queue_and_process(call_info, NOTIFYFS_INODE_ACTION_REMOVE);
+		    watch->next_per_watch->prev_per_watch=watch->prev_per_watch;
+		    watch->next_per_watch=NULL;
 
 		}
 
+		if ( watch->prev_per_watch ) {
+
+		    watch->prev_per_watch->next_per_watch=watch->next_per_watch;
+		    watch->prev_per_watch=NULL;
+
+		}
+
+		/* recalculate the effective mask */
+
+		oldmask=effective_watch->mask;
+		newmask=calculate_effmask(effective_watch, 1);
+
+		if ( effective_watch->nrwatches==0 ) {
+
+		    /* remove the effective watch */
+
+		    logoutput("remove_client_app: remove effective watch, no more watches...");
+
+		    del_watch_backend(effective_watch);
+
+		    if (effective_watch->inode) effective_watch->inode->effective_watch=NULL;
+		    effective_watch->inode=NULL;
+
+		    remove_effective_watch_from_list(effective_watch, 0);
+		    move_effective_watch_to_unused(effective_watch);
+
+		    /* big to do : correct the fs, is the inode still usefull?? */
+
+
+		} else {
+
+		    newmask|=(IN_DELETE_SELF | IN_MOVE_SELF);
+
+		    if ( newmask != oldmask ) {
+
+			effective_watch->mask=newmask;
+
+			/* here update the current backend watch */
+
+			set_watch_backend(effective_watch, newmask, 1);
+
+		    }
+
+		}
+
+		res=unlock_effective_watch(effective_watch);
+
+	    }
+
+	    client->watches=watch->next_per_client;
+	    watch->client=NULL;
+	    watch->prev_per_client=NULL;
+
+	    if ( watch->next_per_client ) {
+
+		watch=watch->next_per_client;
+		free(watch->prev_per_client);
+		watch->prev_per_client=NULL;
+
 	    } else {
 
-		logoutput1("changestate: cannot go futher, mount entry not set for %s", call_info->path);
+		free(watch);
+		watch=NULL;
 
 	    }
 
@@ -956,298 +197,232 @@ void changestate(struct call_info_struct *call_info, unsigned char typeaction)
 
     }
 
-    res=pthread_mutex_unlock(&changestate_mutex);
-
 }
 
-static int create_notifyfs_mount_path(struct mount_entry_struct *mount_entry)
+
+void remove_client_fs(struct client_struct *client)
 {
-    char *path, *slash, *name;
-    struct notifyfs_inode_struct *pinode; 
-    struct notifyfs_entry_struct *pentry, *entry;
-    unsigned char fullpath=0;
-    int nreturn=0, res;
-    pathstring tmppath;
-    struct stat st;
+    int res;
+    struct effective_watch_struct *effective_watch;
+    unsigned char dosleep=0;
 
-    pentry=root_entry;
-    pinode=pentry->inode;
-    strcpy(tmppath, mount_entry->mountpoint);
-    path=tmppath;
+    if ( client->mount_entry ) {
 
-    logoutput1("create_notifyfs_mount_path: creating %s", tmppath);
+	if ( client->mount_entry->isautofs==1 ) {
 
-    /*  translate path into entry 
-        suppose here safe that entry is a subdir of root entry...*/
+	    /* here: when dealing with a autofs mounted fs, set the watches to sleep mode, otherwise remove */
+	    /* possibly */
 
+	    dosleep=1;
 
-    while(1) {
-
-        /*  walk through path from begin to end and 
-            check every part */
-
-        slash=strchr(path, '/');
-
-        if ( slash==tmppath ) {
-
-            /* ignore the starting slash*/
-
-            path++;
-
-            /* if nothing more (==only a slash) stop here */
-
-            if (strlen(slash)==0) break;
-
-            continue;
-
-        }
-
-        if ( ! slash ) {
-
-            fullpath=1;
-
-        } else {
-
-            *slash='\0';
-
-        }
-
-        name=path;
-
-        if ( name ) {
-
-            /* check the stat */
-
-            res=lstat(tmppath, &st);
-
-            if ( res==-1 ) {
-
-                /* what to do here?? the mountpoint should exist.... ignore ?? */
-                mount_entry->status=MOUNT_STATUS_NOTSET;
-                goto out;
-
-            }
-
-            entry=find_entry(pinode->ino, name);
-
-            if ( ! entry ) {
-
-                entry=create_entry(pentry, name, NULL);
-
-                if (entry) {
-
-                    assign_inode(entry);
-
-                    /* here also a check the inode is assigned ..... */
-
-                    /*  is there a function to signal kernel an inode and entry are created 
-                        like fuse_lowlevel_notify_new_inode */
-
-                    add_to_inode_hash_table(entry->inode);
-                    add_to_name_hash_table(entry);
-
-                    if ( entry->parent ) {
-
-                        entry->dir_next=NULL;
-                        entry->dir_prev=NULL;
-
-                        if ( entry->parent->child ) {
-
-                            entry->parent->child->dir_prev=entry;
-                            entry->dir_next=entry->parent->child;
-
-                        }
-
-                        entry->parent->child=entry;
-
-                    }
-
-                    copy_stat(&(entry->inode->st), &st);
-
-
-                } else {
-
-                    nreturn=-ENOMEM;
-                    goto out;
-
-                }
-
-            }
-
-
-        }
-
-        if ( fullpath==1 ) {
-
-            break;
-
-        } else {
-
-            /* make slash a slash again (was a \0) */
-            *slash='/';
-            path=slash+1;
-            pentry=entry;
-            pinode=entry->inode;
-
-        }
+	}
 
     }
 
-    mount_entry->entry=(void *) entry;
-    entry->mount_entry=mount_entry;
+    res=lock_effective_watches();
 
-    mount_entry->status=MOUNT_STATUS_UP;
+    /* first remove any watch using this client fs as backend */
 
-    out:
+    effective_watch=get_next_effective_watch(NULL);
 
-    return nreturn;
+    while(effective_watch) {
 
-}
+	if ( effective_watch->typebackend != FSEVENT_BACKEND_METHOD_FORWARD ) {
 
-/* function to update notifyfs when mounts are added and/or removed 
-   some observations:
-   - not every mountpoint (added or removed) is used by this fs
-   - in case of an fs mounted by fs, it's possible that watches are already set on this fs has been
-   set to "sleep" mode after is has been umounted before
-   -   
-   - note::: added and removed mounts are already sorted in the same way the main sort module works 
-   in mountinfo.c:
-   (mountpoint, mountsource, fstype)
-   */
+	    /* watch not forwarding */
 
-int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_struct *removed_mounts, struct mount_list_struct *removed_mounts_keep)
-{
-    struct mount_entry_struct *mount_entry=NULL;
-    struct notifyfs_entry_struct *entry;
-    unsigned char doqueue=0;
-    int nreturn=0, res;
-
-    logoutput1("update_notifyfs");
-
-    /* walk through removed mounts to see it affects the fs */
-
-    res=lock_mountlist(MOUNTENTRY_REMOVED);
-
-    /* start with last: the list is sorted, bigger/longer (also submounts) mounts are first this way */
-
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_REMOVED);
-
-    while (mount_entry) {
-
-
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
-
-        /* if normal umount then remove the tree... 
-               if umounted by autofs then set tree to sleep */
-
-        if ( entry ) {
-            struct call_info_struct call_info;
-
-            call_info.path=mount_entry->mountpoint;
-            call_info.entry=entry;
-
-            /* normal umount: remove whole tree */
-
-            changestate(&call_info, NOTIFYFS_TREE_DOWN);
-
-        }
-
-        mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_REMOVED);
-
-    }
-
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_REMOVED_KEEP);
-
-    while (mount_entry) {
-
-
-	if ( mount_entry->processed==1 ) {
-
-	    mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_REMOVED_KEEP);
+	    effective_watch=effective_watch->next;
 	    continue;
 
 	}
 
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
+	if ( client != (struct client_struct *) effective_watch->backend ) {
 
-        /* if normal umount then remove the tree... 
-               if umounted by autofs then set tree to sleep */
+	    /* forwarding watch, but different client */
 
-        if ( entry ) {
-            struct call_info_struct call_info;
-
-            call_info.path=mount_entry->mountpoint;
-            call_info.entry=entry;
-
-            changestate(&call_info, NOTIFYFS_TREE_DOWN);
-
-        }
-
-	mount_entry->processed=1;
-
-        mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_REMOVED_KEEP);
-
-    }
-
-    res=unlock_mountlist(MOUNTENTRY_REMOVED);
-
-    /* in any case the watches set on an autofs managed fs, get out of "sleep" mode */
-
-    res=lock_mountlist(MOUNTENTRY_ADDED);
-
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_ADDED);
-
-    while (mount_entry) {
-        struct notifyfs_entry_struct *entry=NULL;
-
-	if ( !root_mount && strcmp(mount_entry->mountpoint, "/") == 0 ) {
-
-	    root_mount=mount_entry;
-	    root_mount->entry = (void *) root_entry;
-	    root_entry->mount_entry = root_mount;
+	    effective_watch=effective_watch->next;
+	    continue;
 
 	}
 
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
+    	/* lock the effective watch */
 
-        if ( entry ) {
-            struct call_info_struct call_info;
+	res=lock_effective_watch(effective_watch);
 
-            call_info.path=mount_entry->mountpoint;
-            call_info.entry=entry;
 
-            /* entry does exist already, there is a tree already related to this mount */
-            /* walk through tree and wake everything up */
+	/* every watch */
 
-            changestate(&call_info, NOTIFYFS_TREE_UP);
+	if ( effective_watch->watches ) {
+	    struct watch_struct *watch=effective_watch->watches;
 
-        } else {
+	    while(watch) {
 
-	    if ( strcmp(mount_entry->mountpoint, "/") == 0 ) {
+		if ( dosleep==0 ) {
 
-		/* skip the root... not necessary to create....*/
-		goto next;
+		    effective_watch->watches=watch->next_per_watch; /* shift */
+		    watch->prev_per_watch=NULL;
+		    watch->next_per_watch=NULL;
 
-	    } else if ( strcmp(notifyfs_options.mountpoint, mount_entry->mountpoint)==0 ) {
+		}
 
-		/* skip the mountpoint of this fs, caused deadlocks in the past... */
-		goto next;
+		if ( watch->client ) {
+		    struct client_struct *client_app=watch->client;
+
+		    /* send client a message */
+
+		    if ( dosleep==1 ) {
+
+			send_sleepwatch_message(client_app->fd, watch->id);
+
+		    } else {
+
+			send_delwatch_message(client_app->fd, watch->id);
+
+			/*remove watch from client app */
+
+			res=lock_client(client_app);
+
+			if ( client_app->watches==watch ) client_app->watches=watch->next_per_client;
+            		if ( watch->prev_per_client ) watch->prev_per_client->next_per_client=watch->next_per_client;
+            		if ( watch->next_per_client ) watch->next_per_client->prev_per_client=watch->prev_per_client;
+
+			res=unlock_client(client_app);
+
+            		watch->prev_per_client=NULL;
+            		watch->next_per_client=NULL;
+            		watch->client=NULL;
+
+            		free(watch);
+
+			effective_watch->nrwatches--;
+
+		    }
+
+		}
+
+		if ( dosleep==0 ) {
+
+		    watch=effective_watch->watches;
+
+		} else {
+
+		    watch=watch->next_per_watch;
+
+		}
 
 	    }
 
-            nreturn=create_notifyfs_mount_path(mount_entry);
+	}
 
-        }
+	if ( effective_watch->nrwatches==0 ) {
+	    struct effective_watch_struct *tmp_effective_watch=get_next_effective_watch(effective_watch);
 
-	next:
+	    /* detach from inode */
 
-        mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_ADDED);
+	    if ( effective_watch->inode ) effective_watch->inode->effective_watch=NULL;
+	    effective_watch->inode=NULL;
+
+	    /* remove the effective watch (lock set)*/
+
+	    remove_effective_watch_from_list(effective_watch, 1);
+
+	    /* move to unused */
+
+	    move_effective_watch_to_unused(effective_watch);
+
+	    unlock_effective_watch(effective_watch);
+
+	    effective_watch=tmp_effective_watch;
+
+	} else {
+
+	    unlock_effective_watch(effective_watch);
+
+	    effective_watch=get_next_effective_watch(effective_watch);
+
+	}
 
     }
 
-    unlock:
+    res=unlock_effective_watches();
 
-    res=unlock_mountlist(MOUNTENTRY_ADDED);
+    if ( client->path ) {
+
+	free(client->path);
+	client->path=NULL;
+
+    }
+
+}
+
+void remove_client(struct client_struct *client)
+{
+    int res;
+
+    /* lock client */
+
+    res=lock_client(client);
+
+    client->status_fs=NOTIFYFS_CLIENTSTATUS_DOWN;
+    client->status_app=NOTIFYFS_CLIENTSTATUS_DOWN;
+
+    if ( client->type & NOTIFYFS_CLIENTTYPE_FS ) {
+
+	remove_client_fs(client);
+
+    }
+
+    if ( client->type & NOTIFYFS_CLIENTTYPE_APP ) {
+
+	remove_client_app(client);
+
+    }
+
+    /* unlock client 
+       do not destroy it yet, this is done when the client really disconnects from socket */
+
+    res=unlock_client(client);
+
+}
+
+unsigned char test_access_fsuser(struct call_info_struct *call_info)
+{
+    unsigned char accessdeny=1;
+
+    /* check access */
+
+    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
+
+	/* when accessmode allows root, and user is root, allow */
+
+    	if ( call_info->ctx->uid==0 ) {
+
+    	    accessdeny=0;
+    	    goto out;
+
+	}
+
+    }
+
+
+    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
+	struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
+
+	if ( client ) {
+
+	    accessdeny=0;
+	    goto out;
+
+	}
+
+    }
+
+
+    logoutput("access denied for pid %i", (int) call_info->ctx->pid);
+
+    out:
+
+    return accessdeny;
 
 }
 
@@ -1260,36 +435,14 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
     unsigned char entryexists=0, dostat=0;
     struct call_info_struct call_info;
 
-    logoutput1("LOOKUP, name: %s", name);
+    logoutput("LOOKUP, name: %s", name);
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("LOOKUP, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -1372,14 +525,14 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     if ( nreturn==-ENOENT) {
 
-	logoutput2("lookup: entry does not exist (ENOENT)");
+	logoutput("lookup: entry does not exist (ENOENT)");
 
 	e.ino = 0;
 	e.entry_timeout = notifyfs_options.negative_timeout;
 
     } else if ( nreturn<0 ) {
 
-	logoutput1("do_lookup: error (%i)", nreturn);
+	logoutput("do_lookup: error (%i)", nreturn);
 
     } else {
 
@@ -1392,11 +545,11 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 	e.attr_timeout = notifyfs_options.attr_timeout;
 	e.entry_timeout = notifyfs_options.entry_timeout;
 
-	logoutput2("lookup return size: %zi", e.attr.st_size);
+	logoutput("lookup return size: %li", (long) e.attr.st_size);
 
     }
 
-    logoutput1("lookup: return %i", nreturn);
+    logoutput("lookup: return %i", nreturn);
 
     if ( nreturn<0 ) {
 
@@ -1421,7 +574,7 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     }
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -1434,11 +587,11 @@ static void notifyfs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlooku
 
     if ( ! inode ) goto out;
 
-    logoutput1("FORGET");
+    logoutput("FORGET");
 
     if ( inode->nlookup < nlookup ) {
 
-	logoutput0("internal error: forget ino=%llu %llu from %llu", (unsigned long long) ino, (unsigned long long) nlookup, (unsigned long long) inode->nlookup);
+	logoutput("internal error: forget ino=%llu %llu from %llu", (unsigned long long) ino, (unsigned long long) nlookup, (unsigned long long) inode->nlookup);
 	inode->nlookup=0;
 
     } else {
@@ -1447,7 +600,7 @@ static void notifyfs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlooku
 
     }
 
-    logoutput2("forget, current nlookup value %llu", (unsigned long long) inode->nlookup);
+    logoutput("forget, current nlookup value %llu", (unsigned long long) inode->nlookup);
 
     out:
 
@@ -1464,36 +617,14 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
     unsigned char entryexists=0, dostat;
     struct call_info_struct call_info;
 
-    logoutput1("GETATTR");
+    logoutput("GETATTR");
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("GETATTR, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -1580,7 +711,7 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     out:
 
-    logoutput1("getattr, return: %i", nreturn);
+    logoutput("getattr, return: %i", nreturn);
 
     if (nreturn < 0) {
 
@@ -1602,7 +733,7 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     }
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -1615,36 +746,14 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
     unsigned char entryexists=0, dostat;
     struct call_info_struct call_info;
 
-    logoutput1("ACCESS, mask: %i", mask);
+    logoutput("ACCESS, mask: %i", mask);
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("ACCESS, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -1652,8 +761,6 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
         }
 
     }
-
-
 
     // get the inode and the entry, they have to exist
 
@@ -1768,7 +875,7 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
 
     out:
 
-    logoutput1("access, return: %i", nreturn);
+    logoutput("access, return: %i", nreturn);
 
     fuse_reply_err(req, abs(nreturn));
 
@@ -1782,7 +889,7 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
 
     }
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -1798,7 +905,7 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
     unsigned char entrycreated=0;
     struct call_info_struct call_info;
 
-    logoutput1("MKDIR, name: %s", name);
+    logoutput("MKDIR, name: %s", name);
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
@@ -1806,30 +913,8 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
     /* check client access */
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("MKDIR, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -1837,7 +922,6 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
         }
 
     }
-
 
     entry=find_entry(parentino, name);
 
@@ -1984,7 +1068,7 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
         }
 
-        logoutput2("mkdir successfull");
+        logoutput("mkdir successfull");
 
         fuse_reply_entry(req, &e);
         if ( call_info.path ) free(call_info.path);
@@ -1996,7 +1080,7 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     error:
 
-    logoutput1("mkdir: error %i", nreturn);
+    logoutput("mkdir: error %i", nreturn);
 
     if ( entrycreated==1 ) remove_entry(entry);
 
@@ -2005,7 +1089,7 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     fuse_reply_err(req, abs(nreturn));
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -2020,7 +1104,7 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
     struct client_struct *client=NULL;
     struct call_info_struct call_info;
 
-    logoutput1("MKNOD, name: %s", name);
+    logoutput("MKNOD, name: %s", name);
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
@@ -2028,30 +1112,8 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
     /* check client access */
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("MKNOD, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -2200,7 +1262,7 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
         }
 
-        logoutput2("mknod succesfull");
+        logoutput("mknod succesfull");
 
         fuse_reply_entry(req, &e);
         if ( call_info.path ) free(call_info.path);
@@ -2211,7 +1273,7 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     error:
 
-    logoutput1("mknod: error %i", nreturn);
+    logoutput("mknod: error %i", nreturn);
 
     if ( entrycreated==1 ) remove_entry(entry);
 
@@ -2220,7 +1282,7 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     fuse_reply_err(req, abs(nreturn));
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -2257,36 +1319,13 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
     struct notifyfs_inode_struct *inode;
     struct call_info_struct *call_info=NULL;
 
-    logoutput1("OPENDIR");
+    logoutput("OPENDIR");
 
     /* check client access */
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
-        const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("OPENDIR, access denied for pid %i", (int) ctx->pid);
+        if ( test_access_fsuser(call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -2294,6 +1333,7 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
         }
 
     }
+
 
     inode=find_inode(ino);
 
@@ -2369,7 +1409,7 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     }
 
-    logoutput1("opendir, nreturn %i", nreturn);
+    logoutput("opendir, nreturn %i", nreturn);
 
 }
 
@@ -2382,7 +1422,7 @@ static int do_readdir_localhost(fuse_req_t req, char *buf, size_t size, off_t up
     char *entryname=NULL;
     unsigned char namecreated=0;
 
-    logoutput1("DO_READDIR, offset: %"PRId64, upperfs_offset);
+    logoutput("DO_READDIR, offset: %"PRId64, upperfs_offset);
 
     dirp->upperfs_offset=upperfs_offset;
     if ( dirp->upperfs_offset==0 ) dirp->upperfs_offset=1;
@@ -2417,7 +1457,7 @@ static int do_readdir_localhost(fuse_req_t req, char *buf, size_t size, off_t up
 
             /* the .. entry */
 
-	    if (rootinode(dirp->generic_fh.entry->inode) == 1 ) {
+	    if (isrootinode(dirp->generic_fh.entry->inode) == 1 ) {
 
 	        dirp->st.st_ino = FUSE_ROOT_ID;
 
@@ -2536,7 +1576,7 @@ static void notifyfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t 
     char *buf;
     int nreturn=0;
 
-    logoutput1("READDIR, size: %zi", size);
+    logoutput("READDIR, size: %zi", size);
 
     // look what readdir has to be called
 
@@ -2575,7 +1615,7 @@ static void notifyfs_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file
 
     (void) ino;
 
-    logoutput1("RELEASEDIR");
+    logoutput("RELEASEDIR");
 
     fuse_reply_err(req, 0);
 
@@ -2592,37 +1632,19 @@ static void notifyfs_statfs(fuse_req_t req, fuse_ino_t ino)
     int nreturn=0, res;
     struct notifyfs_entry_struct *entry; 
     struct notifyfs_inode_struct *inode;
+    struct call_info_struct call_info;
 
-    logoutput1("STATFS");
+
+    init_call_info(&call_info, NULL);
+    call_info.ctx=fuse_req_ctx(req);
+
+    logoutput("STATFS");
 
     /* check client access */
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
-        const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("STATFS, access denied for pid %i", (int) ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -2697,7 +1719,7 @@ static void notifyfs_statfs(fuse_req_t req, fuse_ino_t ino)
 
     }
 
-    logoutput1("statfs, B, nreturn: %i", nreturn);
+    logoutput("statfs,nreturn: %i", nreturn);
 
 }
 
@@ -2711,8 +1733,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     struct call_info_struct call_info;
     unsigned char entryexists=0, dostat;
 
-
-    logoutput1("SETXATTR");
+    logoutput("SETXATTR");
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
@@ -2720,30 +1741,8 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     /* check client access */
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("SETXATTR, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -2842,7 +1841,9 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
         nreturn=check_access(req, &st, R_OK);
 
-        if ( nreturn==1 ) {
+	logoutput("setxattr: got %i from check_access", nreturn);
+
+        if ( nreturn>=1 ) {
 
             nreturn=0; /* grant access */
 
@@ -2892,7 +1893,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    logoutput1("setxattr, nreturn %i", nreturn);
+    logoutput("setxattr, nreturn %i", nreturn);
 
     if ( basexattr ) free(basexattr);
 
@@ -2906,7 +1907,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -2923,7 +1924,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     struct call_info_struct call_info;
     unsigned char entryexists=0, dostat;
 
-    logoutput1("GETXATTR, name: %s, size: %i", name, size);
+    logoutput("GETXATTR, name: %s, size: %i", name, size);
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
@@ -2931,30 +1932,8 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     /* check client access */
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("GETXATTR, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -3052,7 +2031,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
         /* check read access */
 
-        nreturn=check_access(call_info.ctx, &st, R_OK);
+        nreturn=check_access(req, &st, R_OK);
 
         if ( nreturn==1 ) {
 
@@ -3150,13 +2129,13 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
 	    fuse_reply_xattr(req, nlen);
 
-            logoutput1("getxattr, fuse_reply_xattr %i", nlen);
+            logoutput("getxattr, fuse_reply_xattr %i", nlen);
 
 	} else if ( nlen > size ) {
 
 	    fuse_reply_err(req, ERANGE);
 
-            logoutput1("getxattr, fuse_reply_err ERANGE");
+            logoutput("getxattr, fuse_reply_err ERANGE");
 
 	} else {
 
@@ -3164,13 +2143,13 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
 	    fuse_reply_buf(req, value, strlen(value));
 
-            logoutput1("getxattr, fuse_reply_buf value %s", value);
+            logoutput("getxattr, fuse_reply_buf value %s", (char *) value);
 
 	}
 
     }
 
-    logoutput1("getxattr, nreturn: %i, nlen: %i", nreturn, nlen);
+    logoutput("getxattr, nreturn: %i, nlen: %i", nreturn, nlen);
 
     if ( value ) free(value);
     if ( basexattr ) free(basexattr);
@@ -3185,7 +2164,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -3199,12 +2178,11 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     char *list=NULL;
     struct notifyfs_entry_struct *entry;
     struct notifyfs_inode_struct *inode;
-    struct client_struct *client=NULL;
     struct stat st;
     struct call_info_struct call_info;
     unsigned char entryexists=0, dostat;
 
-    logoutput1("LISTXATTR, size: %li", (long) size);
+    logoutput("LISTXATTR, size: %li", (long) size);
 
     init_call_info(&call_info, NULL);
     call_info.ctx=fuse_req_ctx(req);
@@ -3212,30 +2190,8 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     /* check client access */
 
     if ( notifyfs_options.accessmode!=0 ) {
-        unsigned char accessdeny=1;
 
-        /* check access */
-
-        if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-    	    if ( call_info.ctx->uid==0 ) accessdeny=0;
-
-	}
-
-        if ( accessdeny==1 ) {
-
-	    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-		struct client_struct *client=lookup_client(call_info.ctx->pid, 0);
-
-		if ( client ) accessdeny=0;
-
-	    }
-
-	}
-
-        if ( accessdeny==1 ) {
-
-            logoutput1("GETXATTR, access denied for pid %i", (int) call_info.ctx->pid);
+        if ( test_access_fsuser(&call_info)==1 ) {
 
             nreturn=-EACCES;
             goto out;
@@ -3243,6 +2199,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
         }
 
     }
+
 
     /* find inode and entry */
 
@@ -3422,7 +2379,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     }
 
     // if ( list ) free(list);
-    logoutput1("listxattr, nreturn: %i, nlenlist: %i", nreturn, nlenlist);
+    logoutput("listxattr, nreturn: %i, nlenlist: %i", nreturn, nlenlist);
 
     /* post reply action */
 
@@ -3434,7 +2391,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     }
 
-    if ( call_info.path ) free(call_info.path);
+    if ( call_info.freepath==1 ) free(call_info.path);
 
 }
 
@@ -3471,7 +2428,6 @@ void create_pid_file()
 
 	    }
 
-
 	    if ( fd>0 ) {
 
 	        res=write(fd, buf, strlen(buf));
@@ -3483,6 +2439,10 @@ void create_pid_file()
 	    free(buf);
 
         }
+
+    } else {
+
+	logoutput1("RUNDIR not found, not creating a pidfile");
 
     }
 
@@ -3514,11 +2474,114 @@ void remove_pid_file()
 static void notifyfs_init (void *userdata, struct fuse_conn_info *conn)
 {
 
-    // create a pid file
+    logoutput("INIT");
+
+    /* create a pid file */
 
     create_pid_file();
 
-    // init_notifyfs_mount_paths();
+    /* log the capabilities */
+
+    if ( conn->capable & FUSE_CAP_ASYNC_READ ) {
+
+	logoutput("async read supported");
+
+    } else {
+
+	logoutput("async read not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_POSIX_LOCKS ) {
+
+	logoutput("posix locks supported");
+
+    } else {
+
+	logoutput("posix locks not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_ATOMIC_O_TRUNC ) {
+
+	logoutput("atomic_o_trunc supported");
+
+    } else {
+
+	logoutput("atomic_o_trunc not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_EXPORT_SUPPORT ) {
+
+	logoutput("export support supported");
+
+    } else {
+
+	logoutput("export support not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_BIG_WRITES ) {
+
+	logoutput("big writes supported");
+
+    } else {
+
+	logoutput("big writes not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_SPLICE_WRITE ) {
+
+	logoutput("splice write supported");
+
+    } else {
+
+	logoutput("splice write not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_SPLICE_MOVE ) {
+
+	logoutput("splice move supported");
+
+    } else {
+
+	logoutput("splice move not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_SPLICE_READ ) {
+
+	logoutput("splice read supported");
+
+    } else {
+
+	logoutput("splice read not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_FLOCK_LOCKS ) {
+
+	logoutput("flock locks supported");
+
+    } else {
+
+	logoutput("flock locks not supported");
+
+    }
+
+    if ( conn->capable & FUSE_CAP_IOCTL_DIR ) {
+
+	logoutput("ioctl on directory supported");
+
+    } else {
+
+	logoutput("ioctl on directory not supported");
+
+    }
+
 
 }
 
@@ -3532,58 +2595,6 @@ static void notifyfs_destroy (void *userdata)
 
 }
 
-/* function to inform waiting clients interested in a specific watch about an event
-*/
-
-void send_message_clients(struct notifyfs_inode_struct *inode, int mask, int len, char *name)
-{
-    struct effective_watch_struct *effective_watch;
-
-    /* walk through watches/clients attached to inode */
-
-    /* here lock the effective watch.... */
-
-    effective_watch=inode->effective_watch;
-
-    if ( effective_watch ) {
-        struct watch_struct *watch=effective_watch->watches;
-        int effmask, res;
-
-        while(watch) {
-
-            if (watch->client) {
-
-                /* what will be sent is the combination of what happened and the client is interested in */
-
-                effmask=(watch->mask & mask);
-
-                if ( effmask>0 ) {
-
-                    /* send client data */
-
-                    /* here something like send_inotify_message_client(client, reference of wd, effmask) 
-                    what is missing here is a reference of the wd which makes sense to the client
-                    obviously the client must have a reference back when reporting an event
-                    it's not that easy cause the watch has been initiated/set using xattr
-                    maybe just use the path, or use a unique id per client, also to be get
-                    via xattr (system.inotifyfs_watchid)
-                    */
-
-                    res=send_notify_message(watch->client->fd, NOTIFYFS_MESSAGE_TYPE_NOTIFYAPP, watch->id, mask, len, name);
-
-                    if (res<0) logoutput0("Error (%i) sending inotify event to client on fd %i.", abs(res), watch->client->fd);
-
-                }
-
-            }
-
-            watch=watch->next_per_watch;
-
-        }
-
-    }
-
-}
 
 /* INOTIFY BACKEND SPECIFIC CALLS */
 
@@ -3653,26 +2664,41 @@ static int print_mask(unsigned int mask, char *string, size_t size)
 
 }
 
+/* wrapper around signal_mountmonitor */
+
+int handle_data_on_mountinfo_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
+{
+
+    if ( ! epoll_xdata ) {
+
+	signal_mountmonitor(1);
+
+    } else {
+
+	signal_mountmonitor(0);
+
+    }
+
+
+    return 0;
+}
+
+
 
 /* read data from inotify fd */
 #define INOTIFY_EVENT_SIZE (sizeof(struct inotify_event))
 #define INOTIFY_BUFF_LEN (1024 * (INOTIFY_EVENT_SIZE + 16))
 
-void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
+void handle_data_on_inotify_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
 {
     int nreturn=0;
     char outputstring[256];
 
     logoutput1("handle_data_on_inotify_fd.");
 
-    if ( epoll_event->events & EPOLLIN ) {
-        struct epoll_extended_data_struct *epoll_xdata;
+    if ( events & EPOLLIN ) {
         int lenread=0;
         char buff[INOTIFY_BUFF_LEN];
-
-        /* get the epoll_xdata from event */
-
-        epoll_xdata=(struct epoll_extended_data_struct *) epoll_event->data.ptr;
 
         lenread=read(epoll_xdata->fd, buff, INOTIFY_BUFF_LEN);
 
@@ -3684,7 +2710,6 @@ void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
             int i=0, res;
             struct inotify_event *i_event;
             struct effective_watch_struct *effective_watch;
-
 
             while(i<lenread) {
 
@@ -3729,105 +2754,235 @@ void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
 
                 }
 
-                effective_watch=lookup_watch(BACKEND_METHOD_INOTIFY, i_event->wd);
+                effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_INOTIFY, i_event->wd);
 
                 if ( effective_watch ) {
-                    struct notifyfs_entry_struct *entry=NULL;
+
+		    /* test it's an event on a watch long gone 
+		       watches should be disabled and removed when entry/inodes are removed, 
+		       so receiving messages on them should 
+		       not happen, but to make sure */
+
+		    if ( ! effective_watch->inode ) {
+
+			goto next;
+
+		    } else if ( effective_watch->inode->status!=FSEVENT_INODE_STATUS_OK ) {
+
+			goto next;
+
+		    }
 
                     if ( i_event->name && i_event->len>0 ) {
 
                         /* something happens on an entry in the directory.. check it's in use
-                           by this fs, the find command will return NULL if it isn't */
+                           by this fs, the find command will return NULL if it isn't 
 
-                        entry=find_entry(effective_watch->inode->ino, i_event->name);
+                           do nothing with close, open and access*/
 
-                    } else {
+			if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_ATTRIB | IN_MODIFY | IN_CREATE | IN_MOVED_TO | IN_IGNORED | IN_UNMOUNT ) ) {
+			    struct notifyfs_entry_struct *entry=NULL;
 
-                        entry=effective_watch->inode->alias;
+			    entry=find_entry(effective_watch->inode->ino, i_event->name);
+
+			    if ( entry ) {
+                    		struct call_info_struct call_info;
+
+				/* entry is part of this fs */
+
+                    		init_call_info(&call_info, entry);
+
+                    		nreturn=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+                    		if (nreturn<0) continue;
+
+				if ( i_event->mask & IN_UNMOUNT ) {
+
+				    logoutput("handle_data_on_inotify_fd: entry %s unmounted, ignored, handled by the mountmonitor", entry->name);
+
+				} else if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
+				    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
+				    struct notifyfs_inode_struct *inode=entry->inode;
+
+				    logoutput("handle_data_on_inotify_fd: entry %s removed", entry->name);
+
+				    /* entry deleted (here) so adjust the filesystem */
+
+				    if ( inode ) prestatus=inode->status;
+
+				    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
+
+				    if ( prestatus!=FSEVENT_INODE_STATUS_REMOVED ) {
+
+					if ( inode && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
+
+					    /* send a message to server/client to inform */
+
+					    send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
+
+					}
+
+				    }
+
+				} else if ( i_event->mask & ( IN_CREATE | IN_MOVED_TO ) ) {
+				    unsigned char filechanged=0;
+
+				    logoutput("handle_data_on_inotify_fd: entry %s new", entry->name);
+
+				    /* entry created... and does exist already here... huhhh??? */
+
+				    /* here compare the new values (attributes) with the cached ones,
+			    		and only forward a message when there has something really changed..*/
+
+				    filechanged=determinechanges(&call_info, i_event->mask);
+
+				    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
+
+					send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
+
+				    }
+
+				} else if ( i_event->mask & ( IN_ATTRIB | IN_MODIFY ) ) {
+				    unsigned char filechanged=0;
+
+				    logoutput("handle_data_on_inotify_fd: entry %s changed", entry->name);
+
+				    /* here compare the new values (attributes) with the cached ones,
+			    		and only forward a message when there has something really changed..*/
+
+				    filechanged=determinechanges(&call_info, i_event->mask);
+
+				    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
+
+					send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
+
+				    }
+
+				}
+
+			    } else {
+
+				/* entry not part of fs, just send the message 
+				   maybe additional create the entry 
+				*/
+
+				if ( i_event->mask & ( IN_CREATE | IN_MOVED_TO | IN_ATTRIB | IN_MODIFY ) ) {
+				    struct notifyfs_entry_struct *parent_entry=NULL;
+
+				    logoutput("handle_data_on_inotify_fd: entry %s new, not found in notifyfs, creating it", i_event->name);
+
+				    /* here create the entry */
+
+				    parent_entry=effective_watch->inode->alias;
+
+				    entry=create_entry(parent_entry, i_event->name, NULL);
+
+				    if ( entry ) {
+
+					/* insert at begin */
+
+					entry->dir_prev=NULL;
+
+					if ( parent_entry->child ) parent_entry->child->dir_prev=entry;
+					entry->dir_next=parent_entry->child;
+					parent_entry->child=entry;
+
+					assign_inode(entry);
+					add_to_name_hash_table(entry);
+					add_to_inode_hash_table(entry->inode);
+
+				    }
+
+				} else if ( i_event->mask & IN_UNMOUNT ) {
+
+				    /* entry not found in notifyfs, which should not happen since
+				    every mount is managed here */
+
+				    logoutput("handle_data_on_inotify_fd: entry (not found in notifyfs) %s unmounted, ignored, handled by the mountmonitor", i_event->name);
+
+				} else if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
+
+				    logoutput("handle_data_on_inotify_fd: entry %s removed, not found in notifyfs", i_event->name);
+
+				}
+
+				send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
+
+			    }
+
+			}
+
+		    } else {
+
+			/* event on watch self
+
+                           do nothing with close, open and access*/
+
+			if ( i_event->mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB | IN_MODIFY | IN_IGNORED | IN_UNMOUNT ) ) {
+			    struct notifyfs_entry_struct *entry=NULL;
+
+			    entry=effective_watch->inode->alias;
+
+			    if ( entry ) {
+                    		struct call_info_struct call_info;
+
+				/* entry is part of this fs */
+
+                    		init_call_info(&call_info, entry);
+
+                    		nreturn=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+                    		if (nreturn<0) continue;
+
+				if ( i_event->mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_UNMOUNT ) ) {
+				    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
+				    struct notifyfs_inode_struct *inode=entry->inode;
+
+				    logoutput("handle_data_on_inotify_fd: entry %s removed", entry->name);
+
+				    /* entry deleted (here) so adjust the filesystem */
+
+				    if ( inode ) prestatus=inode->status;
+
+				    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
+
+				    if ( prestatus!=FSEVENT_INODE_STATUS_REMOVED ) {
+
+					if ( inode && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
+
+					    /* send a message to server/client to inform */
+
+					    send_notify_message_clients(effective_watch, i_event->mask, 0, NULL);
+
+					}
+
+				    }
+
+				} else if ( i_event->mask & ( IN_ATTRIB | IN_MODIFY ) ) {
+				    unsigned char filechanged=0;
+
+				    logoutput("handle_data_on_inotify_fd: entry %s changed", entry->name);
+
+				    /* here compare the new values (attributes) with the cached ones,
+			    		and only forward a message when there has something really changed..*/
+
+				    filechanged=determinechanges(&call_info, i_event->mask);
+
+				    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
+
+					send_notify_message_clients(effective_watch, i_event->mask, 0, NULL);
+
+				    }
+
+				}
+
+			    }
+
+			}
 
                     }
 
-                    if ( entry ) {
-                        struct call_info_struct call_info;
+		}
 
-                        init_call_info(&call_info, entry);
-
-                        /* translate entry to path.....(force) */
-
-                        nreturn=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-                        if (nreturn<0) continue;
-
-                        if ( notifyfs_options.testmode==0 ) {
-
-                            /* send the clients interested in this watch to required info */
-
-                            send_message_clients(effective_watch->inode, i_event->mask, i_event->len, i_event->name);
-
-                        }
-
-                        /* in case of delete, move or unmount: update fs */
-
-                        if ( i_event->mask & ( IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_FROM ) ) {
-
-                            /* something is deleted/moved from in the directory or the directory self */
-
-                            /* remove entry, and if directory and contents, do that recursive
-                               also remove any watch set there, notify clients about that 
-                               and invalidate the removed entries/inodes
-                            */
-
-                            /* explicitly deny unmount cause they are handled by the mountmonitor!!! */
-
-                            if ( ! (i_event->mask & IN_UNMOUNT) ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
-
-                        }
-
-			cachechanges(&call_info, i_event->mask);
-
-                    } else {
-
-                        /* entry not found... */
-
-                        if ( i_event->name && i_event->len>0 ) {
-
-                            if ( effective_watch->inode->alias ) {
-                                struct call_info_struct call_info;
-
-				call_info.entry=effective_watch->inode->alias;
-
-                                /* translate entry to path.....(force) */
-
-                                nreturn=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-                                if (nreturn<0) continue;
-
-                                memset(outputstring, '\0', 256);
-                                res=print_mask(i_event->mask, outputstring, 256);
-
-                                if ( res>0 ) {
-
-                                    logoutput1("Inotify event on entry not managed by this fs: %s/%s:%i/%s", call_info.path, i_event->name, i_event->mask, outputstring);
-
-                                } else {
-
-                                    logoutput1("Inotify event on entry not managed by this fs: %s/%s:%i", call_info.path, i_event->name, i_event->mask);
-
-                                }
-
-                            } else {
-
-                                logoutput0("Error....inotify event received but entry not found....");
-
-                            }
-
-                        } else {
-
-                            logoutput0("Error....inotify event received.. entry not found");
-
-                        }
-
-                    }
-
-                }
+		next:
 
                 i += INOTIFY_EVENT_SIZE + i_event->len;
 
@@ -3840,34 +2995,292 @@ void *handle_data_on_inotify_fd(struct epoll_event *epoll_event)
 }
 
 
-static struct fuse_lowlevel_ops notifyfs_oper = {
-	.init		= notifyfs_init,
-	.destroy	= notifyfs_destroy,
-	.lookup		= notifyfs_lookup,
-	.forget		= notifyfs_forget,
-	.getattr	= notifyfs_getattr,
-	.access         = notifyfs_access,
-	.mkdir          = notifyfs_mkdir,
-	.mknod          = notifyfs_mknod,
-	.opendir	= notifyfs_opendir,
-	.readdir	= notifyfs_readdir,
-	.releasedir	= notifyfs_releasedir,
-	.statfs		= notifyfs_statfs,
-	.setxattr	= notifyfs_setxattr,
-	.getxattr	= notifyfs_getxattr,
-	.listxattr	= notifyfs_listxattr,
-};
 
+
+void handle_client_message(struct client_struct *client,  struct notifyfs_client_message *client_message, void *data1, int len1)
+{
+    unsigned char type=client_message->type;
+    char *path=(char *) data1;
+
+    logoutput("handle client message, for message %i, client pid/type %i/%i", type, client->pid, client->type);
+
+    if ( type&(NOTIFYFS_MESSAGE_CLIENT_REGISTERAPP|NOTIFYFS_MESSAGE_CLIENT_REGISTERFS) ) {
+
+	/* received a register client fs message */
+
+	if ( type&NOTIFYFS_MESSAGE_CLIENT_REGISTERFS ) {
+	    unsigned char newclientfs=0;
+
+	    /* register client as fs */
+
+	    if ( ! (client->type&NOTIFYFS_CLIENTTYPE_FS) ) {
+
+		newclientfs=1;
+
+		client->type|=NOTIFYFS_CLIENTTYPE_FS;
+
+	    }
+
+	    if ( newclientfs==1 ) {
+
+		/* path should be an argument */
+
+		if ( client->path ) {
+
+		    if ( path ) {
+
+			logoutput("handle client message: client has already path set(%s) but replacing by %s", client->path, path);
+			free(client->path);
+			client->path=NULL;
+
+		    }
+
+		}
+
+		if ( ! client->path ) {
+
+		    if ( path ) {
+
+			/* use malloc here instead?? */
+
+			client->path=strdup(path);
+
+		    }
+
+		    if ( client->path ) {
+
+			logoutput("handle_client_message: read path (len: %i) %s", strlen(client->path), client->path);
+
+			client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
+			client->mount_entry=NULL;
+			assign_mountpoint_clientfs(client, NULL);
+
+		    }
+
+		}
+
+	    }
+
+	}
+
+	if ( type&NOTIFYFS_MESSAGE_CLIENT_REGISTERAPP ) {
+
+	    /* register client as app */
+
+	    client->type|=NOTIFYFS_CLIENTTYPE_APP;
+	    client->status_app=NOTIFYFS_CLIENTSTATUS_UP;
+
+	}
+
+	if ( client->type&NOTIFYFS_CLIENTTYPE_FS ) {
+
+	    logoutput("client %i is a client fs", client->pid);
+
+	}
+
+	if ( client->type&NOTIFYFS_CLIENTTYPE_APP ) {
+
+	    logoutput1("client %i is a client app", client->pid);
+
+	}
+
+	/* use the mask the client has send as messagemask */
+
+	client->messagemask=client_message->messagemask;
+
+
+    }
+
+    if ( type&NOTIFYFS_MESSAGE_CLIENT_SIGNOFF ) {
+
+	/* signoff client */
+
+	logoutput("handle client message, signoff client pid %i", client->pid);
+
+	remove_client(client);
+
+
+    }
+
+}
+
+void handle_fsevent_message(struct client_struct *client,  struct notifyfs_fsevent_message *fsevent_message, void *data1, int len1)
+{
+    unsigned char type=fsevent_message->type;
+
+    if ( type==NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYPATH ) {
+
+	logoutput("handle_fsevent_message: setwatch_bypath");
+
+	/* here read the data, it must be complete:
+	   - path and mask 
+	   then set the watch at backend
+	*/
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYINO ) {
+
+	logoutput("handle_fsevent_message: setwatch_byino");
+
+	/* here read the data, it must be complete:
+	   - ino and mask 
+	   then set the watch at backend
+	*/
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_NOTIFY ) {
+
+	logoutput("handle_fsevent_message: notify");
+
+	/* read the data from the client fs 
+	   and pass it through to client apps 
+	   but first filter it out as it maybe an event caused by this fs
+	   and because it comes through a message it's an event on the backend
+	   howto determine....
+	   it's a fact that inotify events have been realised on the VFS,
+	   with events on the backend this is not so
+	   but first filter out the events caused by this host....*/
+
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_DELWATCH ) {
+
+	logoutput("handle_fsevent_message: delwatch");
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_SLEEPWATCH ) {
+
+	logoutput("handle_fsevent_message: sleepwatch");
+
+    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_WAKEWATCH ) {
+
+	logoutput("handle_fsevent_message: wakewatch");
+
+    } else {
+
+	logoutput("handle_fsevent_message: unknown message");
+
+    }
+
+}
+
+void handle_reply_message(struct client_struct *client,  struct notifyfs_reply_message *reply_message, char *path)
+{
+    unsigned char type=reply_message->type;
+
+    if ( type==NOTIFYFS_MESSAGE_REPLY_OK ) {
+
+	logoutput("handle_reply_message: reply_ok");
+
+    } else if ( type==NOTIFYFS_MESSAGE_REPLY_ERROR ) {
+
+	logoutput("handle_reply_message: reply_error");
+
+    } else if ( type==NOTIFYFS_MESSAGE_REPLY_REPLACE ) {
+
+	logoutput("handle_reply_message: reply_error");
+
+    } else {
+
+	logoutput("handle_reply_message: unknown message");
+
+    }
+
+}
+
+void handle_mountinfo_request(struct client_struct *client,  struct notifyfs_mount_message *mount_message, void *data1, void *data2)
+{
+    int res=0;
+    struct mount_entry_struct *mount_entry;
+    char *path=(char *) data1;
+
+    if ( strlen(mount_message->fstype)>0 ) {
+
+	logoutput("handle_mountinfo_request, for fstype %s", mount_message->fstype);
+
+    } else {
+
+	logoutput("handle_mountinfo_request, no fs filter");
+
+    }
+
+    if ( path && strlen(path)>0 ) {
+
+	logoutput("handle_mountinfo_request, a subdirectory of %s", path);
+
+    } else {
+
+	logoutput("handle_mountinfo_request, no path filter");
+
+    }
+
+
+    res=lock_mountlist(MOUNTENTRY_CURRENT);
+
+    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_CURRENT);
+
+    while (mount_entry) {
+
+
+	if ( strlen(mount_message->fstype)>0 ) {
+
+	    /* filter on filesystem */
+
+	    if ( strcmp(mount_message->fstype, mount_entry->fstype)!=0 ) goto next;
+
+	}
+
+	if ( path && strlen(path)>0 ) {
+
+	    /* filter on directory */
+
+	    if ( issubdirectory(mount_entry->mountpoint, path, 1)==0 ) goto next;
+
+	}
+
+	res=send_mount_message(client->fd, mount_entry, mount_message->unique);
+
+	next:
+
+	mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_CURRENT);
+
+    }
+
+    res=unlock_mountlist(MOUNTENTRY_CURRENT);
+
+    /* a reply message to terminate */
+
+    res=reply_message(client->fd, mount_message->unique, 0);
+
+}
+
+
+
+static struct fuse_lowlevel_ops notifyfs_oper = {
+    .init	= notifyfs_init,
+    .destroy	= notifyfs_destroy,
+    .lookup	= notifyfs_lookup,
+    .forget	= notifyfs_forget,
+    .getattr	= notifyfs_getattr,
+    .access	= notifyfs_access,
+    .mkdir	= notifyfs_mkdir,
+    .mknod	= notifyfs_mknod,
+    .opendir	= notifyfs_opendir,
+    .readdir	= notifyfs_readdir,
+    .releasedir	= notifyfs_releasedir,
+    .statfs	= notifyfs_statfs,
+    .setxattr	= notifyfs_setxattr,
+    .getxattr	= notifyfs_getxattr,
+    .listxattr	= notifyfs_listxattr,
+};
 
 int main(int argc, char *argv[])
 {
-    struct fuse_args notifyfs_args = FUSE_ARGS_INIT(argc, argv);
+    struct fuse_args notifyfs_fuse_args = FUSE_ARGS_INIT(0, NULL);
     struct fuse_session *notifyfs_session;
-    char *notifyfs_mountpoint;
-    int foreground=0;
     int res, epoll_fd, socket_fd, inotify_fd, mountinfo_fd;
     struct stat st;
     pthread_t threadid_mountmonitor=0;
+    struct epoll_extended_data_struct *epoll_xdata=NULL;
+    struct epoll_extended_data_struct xdata_inotify={0, 0, NULL, NULL, NULL, NULL};
+    struct epoll_extended_data_struct xdata_socket={0, 0, NULL, NULL, NULL, NULL};
+    struct epoll_extended_data_struct xdata_mountinfo={0, 0, NULL, NULL, NULL, NULL};
 
 
     umask(0);
@@ -3876,71 +3289,17 @@ int main(int argc, char *argv[])
 
     openlog("fuse.notifyfs", 0,0); 
 
-    // clear commandline options
+    /* parse commandline options and initialize the fuse options */
 
-    notifyfs_commandline_options.socket=NULL;
-    notifyfs_commandline_options.logging=1;
-    notifyfs_commandline_options.accessmode=0;
-    notifyfs_commandline_options.testmode=0;
+    res=parse_arguments(argc, argv, &notifyfs_fuse_args);
 
+    if ( res<0 ) {
 
-    // set defaults
-
-    notifyfs_options.logging=0;
-    notifyfs_options.accessmode=0;
-    notifyfs_options.testmode=0;
-    notifyfs_options.logarea=0;
-    memset(notifyfs_options.socket, '\0', UNIX_PATH_MAX);
-    memset(notifyfs_options.pidfile, '\0', PATH_MAX);
-
-
-    // read commandline options
-
-    res = fuse_opt_parse(&notifyfs_args, &notifyfs_commandline_options, notifyfs_help_options, notifyfs_options_output_proc);
-
-    if (res == -1) {
-
-	fprintf(stderr, "Error parsing options.\n");
-	exit(1);
+	res=0;
+	goto skipeverything;
 
     }
 
-    res = fuse_opt_insert_arg(&notifyfs_args, 1, "-oallow_other,nodev,nosuid");
-
-
-    // socket
-
-    if ( notifyfs_commandline_options.socket ) {
-
-	res=stat(notifyfs_commandline_options.socket, &st);
-
-	if ( res!=-1 ) {
-
-	    fprintf(stdout, "Socket %s does exist, will remove it.\n", notifyfs_commandline_options.socket);
-
-	}
-
-        if ( strlen(notifyfs_commandline_options.socket) >= UNIX_PATH_MAX ) {
-
-	    fprintf(stderr, "Length of socket %s is too big.\n", notifyfs_commandline_options.socket);
-	    exit(1);
-
-	}
-
-	unslash(notifyfs_commandline_options.socket);
-	strcpy(notifyfs_options.socket, notifyfs_commandline_options.socket);
-
-	fprintf(stdout, "Taking socket %s.\n", notifyfs_options.socket);
-
-    } else {
-
-        /* default */
-
-        res=snprintf(notifyfs_options.socket, UNIX_PATH_MAX, "/var/run/notifyfs.sock");
-
-    }
-
-    res=unlink(notifyfs_options.socket); /* remove existing socket */
 
     //
     // init the name and inode hashtables
@@ -3957,39 +3316,24 @@ int main(int argc, char *argv[])
 
     //
     // create the root inode and entry
-    // (and the root directory data)
     //
 
-    root_entry=create_entry(NULL,".",NULL);
+    res=create_root();
 
-    if ( ! root_entry ) {
+    if ( res<0 ) {
 
-	fprintf(stderr, "Error, failed to create the root entry.\n");
+	fprintf(stderr, "Error, failed to create the root entry(error: %i).\n", res);
 	exit(1);
 
     }
-
-    assign_inode(root_entry);
-
-    if ( ! root_entry->inode ) {
-
-	fprintf(stderr, "Error, failed to create the root inode.\n");
-	exit(1);
-
-    }
-
-    add_to_inode_hash_table(root_entry->inode);
-
 
     //
     // set default options
     //
 
-    if ( notifyfs_commandline_options.logging>0 ) notifyfs_options.logging=notifyfs_commandline_options.logging;
-
-    if ( notifyfs_commandline_options.logarea>0 ) notifyfs_options.logarea=notifyfs_commandline_options.logarea;
-    notifyfs_options.accessmode=notifyfs_commandline_options.accessmode;
-    notifyfs_options.testmode=notifyfs_commandline_options.testmode;
+    logoutput("main: taking accessmode %i", notifyfs_options.accessmode);
+    logoutput("main: taking filesystems %i", notifyfs_options.filesystems);
+    logoutput("main: taking testmode %i", notifyfs_options.testmode);
 
     loglevel=notifyfs_options.logging;
     logarea=notifyfs_options.logarea;
@@ -3998,38 +3342,27 @@ int main(int argc, char *argv[])
     notifyfs_options.entry_timeout=1.0;
     notifyfs_options.negative_timeout=1.0;
 
-    res = -1;
+    if ( (notifyfs_chan = fuse_mount(notifyfs_options.mountpoint, &notifyfs_fuse_args)) == NULL) {
 
-    if (fuse_parse_cmdline(&notifyfs_args, &notifyfs_mountpoint, NULL, &foreground) == -1 ) {
-
-        logoutput0("Error parsing options.");
+        logoutput("Error mounting and setting up a channel.");
         goto out;
 
     }
 
-    notifyfs_options.mountpoint=notifyfs_mountpoint;
-
-    if ( (notifyfs_chan = fuse_mount(notifyfs_mountpoint, &notifyfs_args)) == NULL) {
-
-        logoutput0("Error mounting and setting up a channel.");
-        goto out;
-
-    }
-
-    notifyfs_session=fuse_lowlevel_new(&notifyfs_args, &notifyfs_oper, sizeof(notifyfs_oper), NULL);
+    notifyfs_session=fuse_lowlevel_new(&notifyfs_fuse_args, &notifyfs_oper, sizeof(notifyfs_oper), NULL);
 
     if ( notifyfs_session == NULL ) {
 
-        logoutput0("Error starting a new session.");
+        logoutput("Error starting a new session.");
         goto out;
 
     }
 
-    res = fuse_daemonize(foreground);
+    res = fuse_daemonize(0);
 
     if ( res!=0 ) {
 
-        logoutput0("Error daemonize.");
+        logoutput("Error daemonize.");
         goto out;
 
     }
@@ -4038,10 +3371,14 @@ int main(int argc, char *argv[])
 
     epoll_fd=init_mainloop();
 
-    if ( epoll_fd<0 ) {
+    if ( epoll_fd<=0 ) {
 
-        logoutput0("Error creating epoll fd: %i.", epoll_fd);
+        logoutput("Error creating epoll fd, error: %i.", epoll_fd);
         goto out;
+
+    } else {
+
+	logoutput("Init mainloop, epoll fd: %i", epoll_fd);
 
     }
 
@@ -4054,26 +3391,36 @@ int main(int argc, char *argv[])
 
     if ( socket_fd<=0 ) {
 
-        logoutput0("Error creating socket fd: %i.", socket_fd);
+        logoutput("Error creating socket fd: %i.", socket_fd);
         goto out;
 
     }
 
-    /* add socket to epoll */
+    /* add socket to epoll for reading */
 
-    res=add_to_epoll(socket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_socket_fd, NULL);
-    if ( res<0 ) {
+    epoll_xdata=add_to_epoll(socket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_socket_fd, NULL, &xdata_socket);
 
-        logoutput0("Error adding socket fd to epoll: %i.", res);
+    if ( ! epoll_xdata ) {
+
+        logoutput("Error adding socket fd to mainloop.");
         goto out;
 
     } else {
 
-        logoutput0("socket fd %i added to epoll", socket_fd);
+        logoutput("socket fd %i added to epoll", socket_fd);
+
+	add_xdata_to_list(epoll_xdata);
 
     }
 
     notifyfs_options.socket_fd=socket_fd;
+
+    /* assign the message callbacks */
+
+    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_CLIENT, &handle_client_message);
+    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_FSEVENT, &handle_fsevent_message);
+    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_REPLY, &handle_reply_message);
+    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_MOUNTINFO_REQ, &handle_mountinfo_request);
 
 
     /*
@@ -4087,22 +3434,25 @@ int main(int argc, char *argv[])
 
     if ( inotify_fd<=0 ) {
 
-        logoutput0("Error creating inotify fd: %i.", errno);
+        logoutput("Error creating inotify fd: %i.", errno);
         goto out;
 
     }
 
     /* add inotify to epoll */
 
-    res=add_to_epoll(inotify_fd, EPOLLIN, TYPE_FD_INOTIFY, &handle_data_on_inotify_fd, NULL);
-    if ( res<0 ) {
+    epoll_xdata=add_to_epoll(inotify_fd, EPOLLIN | EPOLLPRI, TYPE_FD_INOTIFY, &handle_data_on_inotify_fd, NULL, &xdata_inotify);
 
-        logoutput0("Error adding inotify fd to epoll: %i.", res);
+    if ( ! epoll_xdata ) {
+
+        logoutput("error adding inotify fd to mainloop.");
         goto out;
 
     } else {
 
-        logoutput0("inotify fd %i added to epoll", inotify_fd);
+        logoutput("inotify fd %i added to epoll", inotify_fd);
+
+	add_xdata_to_list(epoll_xdata);
 
     }
 
@@ -4117,33 +3467,25 @@ int main(int argc, char *argv[])
 
     if ( mountinfo_fd==-1 ) {
 
-        logoutput0("unable to open file %s", MOUNTINFO);
+        logoutput("unable to open file %s", MOUNTINFO);
         goto out;
 
     }
 
-    res=add_to_epoll(mountinfo_fd, EPOLLERR, TYPE_FD_MOUNTINFO, &signal_mountmonitor, NULL);
+    epoll_xdata=add_to_epoll(mountinfo_fd, EPOLLERR, TYPE_FD_INOTIFY, &handle_data_on_mountinfo_fd, NULL, &xdata_mountinfo);
 
-    if ( res<0 ) {
+    if ( ! epoll_xdata ) {
 
-        logoutput0("error adding mountinfo fd %i to epoll(error: %i)", mountinfo_fd, res);
+        logoutput("error adding mountinfo fd to mainloop");
         goto out;
 
     } else {
 
-        logoutput0("mountinfo fd %i added to epoll", mountinfo_fd);
+        logoutput("mountinfo fd %i added to epoll", mountinfo_fd);
+
+	add_xdata_to_list(epoll_xdata);
 
     }
-
-    // read the mounttable to start
-
-    // res=get_new_mount_list(NULL);
-    // set_parents_raw(NULL);
-    // init_notifyfs_mount_paths();
-
-    /* connect the root entry and the root mount */
-
-    // root_mount=get_root_mount();
 
     /* start the special mount monitor thread */
 
@@ -4151,35 +3493,76 @@ int main(int argc, char *argv[])
 
     if ( res<0 ) {
 
-        logoutput0("error (%i) starting mountmonitor thread", res);
+        logoutput("error (%i) starting mountmonitor thread", res);
 
     } else {
 
-        logoutput0("thread for mountmonitor started");
+        logoutput("thread for mountmonitor started");
 
     }
 
     /* signal the mountmonitor to do the initial reading of the mounttable */
 
-    signal_mountmonitor(NULL);
+    signal_mountmonitor(1);
+    // read_fstab();
 
-    read_fstab();
 
-    /* more backends ?? and how to connect */
+    /* add the fuse channel(=fd) to the mainloop */
 
-    res=fuse_session_loop_epoll_mt(notifyfs_session);
+    res=addfusechannelstomainloop(notifyfs_session, notifyfs_options.mountpoint);
 
-    fuse_session_remove_chan(notifyfs_chan);
+    /* handle error here */
 
-    fuse_session_destroy(notifyfs_session);
+    res=startfusethreads();
 
-    fuse_unmount(notifyfs_mountpoint, notifyfs_chan);
+    /* handle error again */
+
+    res=epoll_mainloop();
 
     out:
 
+    terminatefuse(NULL);
+
+    if ( xdata_inotify.fd>0 ) {
+
+	res=remove_xdata_from_epoll(&xdata_inotify, 0);
+	close(xdata_inotify.fd);
+	xdata_inotify.fd=0;
+	notifyfs_options.inotify_fd=0;
+	remove_xdata_from_list(&xdata_inotify);
+
+    }
+
+    if ( xdata_socket.fd>0 ) {
+
+	res=remove_xdata_from_epoll(&xdata_socket, 0);
+	close(xdata_socket.fd);
+	xdata_socket.fd=0;
+	notifyfs_options.socket_fd=0;
+	remove_xdata_from_list(&xdata_socket);
+
+    }
+
+    unlink(notifyfs_options.socket);
+
+    if ( xdata_mountinfo.fd>0 ) {
+
+	res=remove_xdata_from_epoll(&xdata_mountinfo, 0);
+	close(xdata_mountinfo.fd);
+	xdata_mountinfo.fd=0;
+	remove_xdata_from_list(&xdata_mountinfo);
+
+    }
+
+    /* remove any remaining xdata from mainloop */
+
+    destroy_mainloop();
+
     if ( threadid_mountmonitor ) pthread_cancel(threadid_mountmonitor);
 
-    fuse_opt_free_args(&notifyfs_args);
+    fuse_opt_free_args(&notifyfs_fuse_args);
+
+    skipeverything:
 
     closelog();
 

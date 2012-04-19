@@ -19,31 +19,20 @@
 
 */
 
-#ifndef FUSE_LOOP_EPOLL_MT_H
-#define FUSE_LOOP_EPOLL_MT_H
+#ifndef _EPOLL_UTILS_H
+#define _EPOLL_UTILS_H
 
 // epoll parameters
 #define MAX_EPOLL_NREVENTS 		32
 #define MAX_EPOLL_NRFDS			32
 
 // types of fd's
+#define TYPE_FD_NOTSET			0
 #define TYPE_FD_SIGNAL			1
-#define TYPE_FD_FUSE			2
-#define TYPE_FD_CUSTOMMIN		3
+
 #define TYPE_FD_SOCKET                  4
 #define TYPE_FD_CLIENT                  5
-#define TYPE_FD_INOTIFY                 6
-#define TYPE_FD_MOUNTINFO               7
-#define TYPE_FD_CUSTOMMAX               8
 
-// types of threads
-#define TYPE_WORKER_PERMANENT		1
-#define TYPE_WORKER_TEMPORARY		2
-
-// number of threads
-#ifndef NUM_WORKER_THREADS
-#define NUM_WORKER_THREADS		10
-#endif
 
 #include <sys/wait.h>
 #include <sys/epoll.h>
@@ -64,24 +53,8 @@ struct epoll_extended_data_struct {
     struct epoll_extended_data_struct *prev;
 };
 
-// struct for the threads (permanent and temporary)
-
-struct fuse_workerthread_struct {
-    pthread_t threadid;
-    pthread_mutex_t *read_mutex;
-    unsigned char busy;
-    int nr;
-    unsigned char typeworker;
-    struct fuse_buf fbuf;
-    struct fuse_chan *ch;
-    struct fuse_session *se;
-    struct fuse_workerthread_struct *next;
-    struct fuse_workerthread_struct *prev;
-};
-
 // Prototypes
 
-// manage fd's epoll listens to
 int add_to_epoll(int fd, uint32_t events, unsigned char typefd, void *callback, void *data);
 int remove_xdata_from_epoll(struct epoll_extended_data_struct *epoll_xdata, unsigned char lockset);
 int remove_fd_from_epoll(int fd);
@@ -89,6 +62,6 @@ unsigned char scan_epoll_list(int fd);
 
 // mainloop
 int init_mainloop();
-int fuse_session_loop_epoll_mt(struct fuse_session *se);
+int epoll_mainloop();
 
 #endif

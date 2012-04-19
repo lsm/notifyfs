@@ -19,24 +19,10 @@
 #ifndef NOTIFYFS_OPTIONS_H
 #define NOTIFYFS_OPTIONS_H
 
-#define NOTIFYFS_OPT(t, p, v) { t, offsetof(struct notifyfs_commandline_options_struct, p), v }
-
-enum {
-     KEY_HELP,
-     KEY_VERSION,
-};
-
-struct notifyfs_commandline_options_struct {
-     char *socket;
-     unsigned char logging;
-     unsigned char logarea;
-     unsigned char accessmode;
-     unsigned char testmode;
-};
 
 // Prototypes
 
-int notifyfs_options_output_proc(void *data, const char *arg, int key, struct fuse_args *outargs);
+int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args);
 
 #endif
 

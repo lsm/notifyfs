@@ -16,25 +16,13 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef TESTFS_OPTIONS_H
-#define TESTFS_OPTIONS_H
+#ifndef NOTIFYFS_OPTIONS_H
+#define NOTIFYFS_OPTIONS_H
 
-#define TESTFS_OPT(t, p, v) { t, offsetof(struct testfs_commandline_options_struct, p), v }
-
-enum {
-     KEY_HELP,
-     KEY_VERSION,
-};
-
-struct testfs_commandline_options_struct {
-     char *notifyfssocket;
-     unsigned char logging;
-     unsigned char logarea;
-};
 
 // Prototypes
 
-int testfs_options_output_proc(void *data, const char *arg, int key, struct fuse_args *outargs);
+int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args);
 
 #endif
 

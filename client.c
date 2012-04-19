@@ -41,13 +41,15 @@
 
 #include "entry-management.h"
 #include "logging.h"
-
+#include "mountinfo.h"
 #include "client.h"
+
+
+#define LOG_LOGAREA LOG_LOGAREA_SOCKET
+
 
 struct client_struct *clients_list=NULL;
 pthread_mutex_t clients_list_mutex=PTHREAD_MUTEX_INITIALIZER;
-
-
 
 
 /* function to register a client
@@ -99,13 +101,11 @@ struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid
 
     memset(client, 0, sizeof(struct client_struct));
 
-
     client->type=NOTIFYFS_CLIENTTYPE_UNKNOWN; /* has to be set later when client sends a register message */
     client->fd=fd;
     client->pid=pid;
     client->uid=uid;
     client->gid=gid;
-    client->idctr=0;
 
     client->next=NULL;
     client->prev=NULL;
@@ -114,19 +114,16 @@ struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid
     pthread_cond_init(&client->lock_condition, NULL);
 
     client->lock=0;
-    client->status=0;
-
-    client->mount_entry=NULL;
+    client->status_app=NOTIFYFS_CLIENTSTATUS_NOTSET;
+    client->status_fs=NOTIFYFS_CLIENTSTATUS_NOTSET;
+    client->messagemask=0;
 
     /* insert at begin of list */
 
     if ( clients_list ) clients_list->prev=client;
     client->next=clients_list;
     client->prev=NULL;
-
-    /* no watches yet */
-
-    client->watches=NULL;
+    clients_list=client;
 
     unlock:
 
@@ -182,4 +179,191 @@ struct client_struct *get_clientslist()
 {
     return clients_list;
 }
+
+
+int lock_client(struct client_struct *client)
+{
+    int res;
+
+    res=pthread_mutex_lock(&client->lock_mutex);
+
+    if ( client->lock==1 ) {
+
+        while (client->lock==1) {
+
+    	    res=pthread_cond_wait(&client->lock_condition, &client->lock_mutex);
+
+        }
+
+    }
+
+    client->lock=1;
+
+    res=pthread_mutex_unlock(&client->lock_mutex);
+
+    return res;
+
+}
+
+int unlock_client(struct client_struct *client)
+{
+    int res;
+
+    res=pthread_mutex_lock(&client->lock_mutex);
+    client->lock=0;
+    res=pthread_cond_broadcast(&client->lock_condition);
+    res=pthread_mutex_unlock(&client->lock_mutex);
+
+    return res;
+
+}
+
+unsigned char check_client_is_running(struct client_struct *client)
+{
+    unsigned char isrunning=0;
+    char testpath[32];
+    int res=0;
+    struct stat st;
+
+    res=snprintf(testpath, 32, "/proc/%i", client->pid);
+
+    res=stat(testpath, &st);
+
+    if ( res!=-1 && S_ISDIR(st.st_mode)) isrunning=1;
+
+    return isrunning;
+
+}
+
+/*  function which called to match a client fs and a mount entry
+
+    this is called when a client registers itself as client fs and
+    when a mount entry is added
+
+    it is called at both events because a client fs can send a 
+    registerfs message AFTER it's mounted
+
+*/
+
+void assign_mountpoint_clientfs(struct client_struct *client, struct mount_entry_struct *mount_entry)
+{
+    int res;
+
+    // logoutput("assign_mountpoint_clientfs: match clientfs and mount entry");
+
+    if ( client ) {
+
+	if ( ! (client->type&NOTIFYFS_CLIENTTYPE_FS) ) {
+
+	    logoutput("assign_mountpoint_clientfs: error, client set, but not a fs");
+	    return;
+
+	}
+
+	/* the thing here is to lookup the mount_entry matching the path the client fs is mounted at */
+
+	if ( mount_entry ) {
+
+	    logoutput("assign_mountpoint_clientfs: client and mount entry both defined: error");
+
+	} else {
+
+	    // logoutput("assign_mountpoint_clientfs: lookup mount entry matching %s", client->path);
+
+	    res=lock_mountlist(MOUNTENTRY_CURRENT);
+
+	    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_CURRENT);
+
+	    while (mount_entry) {
+
+		if ( strcmp(mount_entry->mountpoint, client->path)==0 ) break;
+
+    		mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_CURRENT);
+
+	    }
+
+	    res=unlock_mountlist(MOUNTENTRY_CURRENT);
+
+	    if ( ! mount_entry ) {
+
+		logoutput("assign_mountpoint_clientfs: mount entry not found");
+
+	    } else {
+
+		res=lock_client(client);
+
+		mount_entry->client=(void *) client;
+		client->mount_entry=mount_entry;
+
+		logoutput("assign_mountpoint_clientfs: mount entry found, client is up and complete");
+
+		client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
+
+		res=unlock_client(client);
+
+	    }
+
+	}
+
+    } else {
+
+	if ( ! mount_entry ) {
+
+	    logoutput("assign_mountpoint_clientfs: client and mount entry both not defined: error");
+
+	} else {
+
+	    // logoutput("assign_mountpoint_clientfs: lookup client fs matching %s", mount_entry->mountpoint);
+
+	    res=lock_clientslist();
+
+	    client=get_clientslist();
+
+	    while (client) {
+
+		if ( ! (client->type&NOTIFYFS_CLIENTTYPE_FS) ) {
+
+		    client=client->next;
+		    continue;
+
+		}
+
+		// if ( client->status==NOTIFYFS_CLIENTSTATUS_NOTSET ) {
+
+		    /* only look at clients not up */
+
+		    if ( strcmp(client->path, mount_entry->mountpoint)==0 ) break;
+
+		//}
+
+		client=client->next;
+
+	    }
+
+	    res=unlock_clientslist();
+
+	    if ( client ) {
+
+		res=lock_client(client);
+
+		logoutput("assign_mountpoint_clientfs: client found, client is up and complete");
+
+		mount_entry->client=(void *) client;
+		client->mount_entry=mount_entry;
+		client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
+
+		res=unlock_client(client);
+
+	    } else {
+
+		logoutput("assign_mountpoint_clientfs: client not found");
+
+	    }
+
+	}
+
+    }
+
+}
+
 

@@ -19,14 +19,17 @@
 
 */
 
-#ifndef FUSE_LOOP_EPOLL_MT_H
-#define FUSE_LOOP_EPOLL_MT_H
+#ifndef _EPOLL_UTILS_H
+#define _EPOLL_UTILS_H
 
 // epoll parameters
+
 #define MAX_EPOLL_NREVENTS 		32
 #define MAX_EPOLL_NRFDS			32
 
 // types of fd's
+
+#define TYPE_FD_NOTSET			0
 #define TYPE_FD_SIGNAL			1
 #define TYPE_FD_FUSE			2
 #define TYPE_FD_CUSTOMMIN		3
@@ -36,59 +39,36 @@
 #define TYPE_FD_MOUNTINFO               7
 #define TYPE_FD_CUSTOMMAX               8
 
-// types of threads
-#define TYPE_WORKER_PERMANENT		1
-#define TYPE_WORKER_TEMPORARY		2
 
-// number of threads
-#ifndef NUM_WORKER_THREADS
-#define NUM_WORKER_THREADS		10
-#endif
-
-#include <sys/wait.h>
-#include <sys/epoll.h>
-#include <sys/signalfd.h>
-#include <pthread.h>
-#include <semaphore.h>
-
-// struct to identify the fd when epoll singals activity on that fd
+/* struct to identify the fd when epoll singals activity on that fd */
 
 struct epoll_extended_data_struct {
     int type_fd;
     int fd;
     void *data;
-    int (*callback) (struct epoll_event *event);
-    pthread_mutex_t read_mutex;
-    struct epoll_event *event;
+    int (*callback) (struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo);
     struct epoll_extended_data_struct *next;
     struct epoll_extended_data_struct *prev;
 };
 
-// struct for the threads (permanent and temporary)
+/* Prototypes */
 
-struct fuse_workerthread_struct {
-    pthread_t threadid;
-    pthread_mutex_t *read_mutex;
-    unsigned char busy;
-    int nr;
-    unsigned char typeworker;
-    struct fuse_buf fbuf;
-    struct fuse_chan *ch;
-    struct fuse_session *se;
-    struct fuse_workerthread_struct *next;
-    struct fuse_workerthread_struct *prev;
-};
-
-// Prototypes
-
-// manage fd's epoll listens to
-int add_to_epoll(int fd, uint32_t events, unsigned char typefd, void *callback, void *data);
+struct epoll_extended_data_struct *add_to_epoll(int fd, uint32_t events, unsigned char typefd, void *callback, void *data, struct epoll_extended_data_struct *epoll_xdata);
 int remove_xdata_from_epoll(struct epoll_extended_data_struct *epoll_xdata, unsigned char lockset);
-int remove_fd_from_epoll(int fd);
+
+void add_xdata_to_list(struct epoll_extended_data_struct *epoll_xdata);
+void remove_xdata_from_list(struct epoll_extended_data_struct *epoll_xdata);
+
+struct epoll_extended_data_struct *get_next_epoll_xdata(struct epoll_extended_data_struct *epoll_xdata);
+
+int remove_fd_from_epoll(int fd, unsigned char lockset);
 unsigned char scan_epoll_list(int fd);
 
-// mainloop
+/* mainloop */
+
 int init_mainloop();
-int fuse_session_loop_epoll_mt(struct fuse_session *se);
+int epoll_mainloop();
+void setmainloop_exit(int nerror);
+void destroy_mainloop();
 
 #endif
