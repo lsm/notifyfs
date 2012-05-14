@@ -73,8 +73,10 @@
 #include "socket.h"
 #include "access.h"
 #include "mountinfo.h"
-#include "mountstatus.h"
+#include "mountinfo-monitor.h"
+
 #include "watches.h"
+#include "determinechanges.h"
 #include "changestate.h"
 
 #include "message.h"
@@ -149,6 +151,13 @@ void remove_client_app(struct client_struct *client)
 
 		    if (effective_watch->inode) effective_watch->inode->effective_watch=NULL;
 		    effective_watch->inode=NULL;
+
+		    if ( effective_watch->path ) {
+
+			free(effective_watch->path);
+			effective_watch->path=NULL;
+
+		    }
 
 		    remove_effective_watch_from_list(effective_watch, 0);
 		    move_effective_watch_to_unused(effective_watch);
@@ -227,15 +236,6 @@ void remove_client_fs(struct client_struct *client)
 
     while(effective_watch) {
 
-	if ( effective_watch->typebackend != FSEVENT_BACKEND_METHOD_FORWARD ) {
-
-	    /* watch not forwarding */
-
-	    effective_watch=effective_watch->next;
-	    continue;
-
-	}
-
 	if ( client != (struct client_struct *) effective_watch->backend ) {
 
 	    /* forwarding watch, but different client */
@@ -248,7 +248,6 @@ void remove_client_fs(struct client_struct *client)
     	/* lock the effective watch */
 
 	res=lock_effective_watch(effective_watch);
-
 
 	/* every watch */
 
@@ -321,6 +320,13 @@ void remove_client_fs(struct client_struct *client)
 
 	    if ( effective_watch->inode ) effective_watch->inode->effective_watch=NULL;
 	    effective_watch->inode=NULL;
+
+	    if ( effective_watch->path ) {
+
+		free(effective_watch->path);
+		effective_watch->path=NULL;
+
+	    }
 
 	    /* remove the effective watch (lock set)*/
 
@@ -409,6 +415,10 @@ unsigned char test_access_fsuser(struct call_info_struct *call_info)
 	struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
 
 	if ( client ) {
+
+	    /* keep for later use */
+
+	    call_info->client=client;
 
 	    accessdeny=0;
 	    goto out;
@@ -510,7 +520,18 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
         /* here copy e.attr to inode->st */
 
-        if (nreturn!=-1) copy_stat(&inode->st, &(e.attr));
+        if (nreturn!=-1) {
+
+	    update_timespec(&inode->laststat);
+	    copy_stat(&inode->st, &(e.attr));
+
+	    inode->lastaction=FSEVENT_STAT_STAT;
+
+	} else {
+
+	    logoutput("lookup: stat on %s gives error %i", call_info.path, errno);
+
+	}
 
     } else {
 
@@ -704,7 +725,9 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
         /* copy inode->st to st */
 
+	update_timespec(&inode->laststat);
         copy_stat(&st, &inode->st);
+	inode->lastaction=FSEVENT_STAT_STAT;
         nreturn=0;
 
     }
@@ -823,7 +846,13 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
 
         /* copy the st to inode->st */
 
-        if (res!=-1) copy_stat(&inode->st, &st);
+        if (res!=-1) {
+
+	    copy_stat(&inode->st, &st);
+	    update_timespec(&inode->laststat);
+	    inode->lastaction=FSEVENT_STAT_STAT;
+
+	}
 
     } else {
 
@@ -1040,6 +1069,8 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 	entry->inode->nlookup++;
 
 	copy_stat(&entry->inode->st, &(e.attr));
+	update_timespec(&entry->inode->laststat);
+	entry->inode->lastaction=FSEVENT_STAT_STAT;
 
 	e.ino = entry->inode->ino;
 	e.attr.st_ino = e.ino;
@@ -1234,6 +1265,8 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 	entry->inode->nlookup++;
 
 	copy_stat(&entry->inode->st, &(e.attr));
+	update_timespec(&entry->inode->laststat);
+	entry->inode->lastaction=FSEVENT_STAT_STAT;
 
 	e.ino = entry->inode->ino;
 	e.attr.st_ino = e.ino;
@@ -1321,20 +1354,6 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     logoutput("OPENDIR");
 
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
-
-
     inode=find_inode(ino);
 
     if ( ! inode ) {
@@ -1365,6 +1384,19 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
     }
 
     call_info->ctx=fuse_req_ctx(req);
+
+    /* check client access */
+
+    if ( notifyfs_options.accessmode!=0 ) {
+
+        if ( test_access_fsuser(call_info)==1 ) {
+
+            nreturn=-EACCES;
+            goto out;
+
+        }
+
+    }
 
     /* translate entry into path */
 
@@ -1815,7 +1847,13 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
         /* copy the st to inode->st */
 
-        if ( res!=-1 ) copy_stat(&inode->st, &st);
+        if ( res!=-1 ) {
+
+	    copy_stat(&inode->st, &st);
+	    update_timespec(&inode->laststat);
+	    inode->lastaction=FSEVENT_STAT_STAT;
+
+	}
 
     } else {
 
@@ -2006,7 +2044,13 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
         /* copy the st to inode->st */
 
-        if ( res!=-1) copy_stat(&inode->st, &st);
+        if ( res!=-1) {
+
+	    copy_stat(&inode->st, &st);
+	    update_timespec(&inode->laststat);
+	    inode->lastaction=FSEVENT_STAT_STAT;
+
+	}
 
     } else {
 
@@ -2264,7 +2308,13 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
         /* copy the st to inode->st */
 
-        if (res!=-1) copy_stat(&inode->st, &st);
+        if (res!=-1) {
+
+	    copy_stat(&inode->st, &st);
+	    update_timespec(&inode->laststat);
+	    inode->lastaction=FSEVENT_STAT_STAT;
+
+	}
 
     } else {
 
@@ -2482,6 +2532,8 @@ static void notifyfs_init (void *userdata, struct fuse_conn_info *conn)
 
     /* log the capabilities */
 
+    /*
+
     if ( conn->capable & FUSE_CAP_ASYNC_READ ) {
 
 	logoutput("async read supported");
@@ -2580,7 +2632,7 @@ static void notifyfs_init (void *userdata, struct fuse_conn_info *conn)
 
 	logoutput("ioctl on directory not supported");
 
-    }
+    } */
 
 
 }
@@ -2596,73 +2648,6 @@ static void notifyfs_destroy (void *userdata)
 }
 
 
-/* INOTIFY BACKEND SPECIFIC CALLS */
-
-typedef struct INTEXTMAP {
-                const char *name;
-                unsigned int mask;
-                } INTEXTMAP;
-
-static const INTEXTMAP inotify_textmap[] = {
-            { "IN_ACCESS", IN_ACCESS},
-            { "IN_MODIFY", IN_MODIFY},
-            { "IN_ATTRIB", IN_ATTRIB},
-            { "IN_CLOSE_WRITE", IN_CLOSE_WRITE},
-            { "IN_CLOSE_NOWRITE", IN_CLOSE_NOWRITE},
-            { "IN_OPEN", IN_OPEN},
-            { "IN_MOVED_FROM", IN_MOVED_FROM},
-            { "IN_MOVED_TO", IN_MOVED_TO},
-            { "IN_CREATE", IN_CREATE},
-            { "IN_DELETE", IN_DELETE},
-            { "IN_DELETE_SELF", IN_DELETE_SELF},
-            { "IN_MOVE_SELF", IN_MOVE_SELF},
-            { "IN_ONLYDIR", IN_ONLYDIR},
-            { "IN_DONT_FOLLOW", IN_DONT_FOLLOW},
-            { "IN_EXCL_UNLINK", IN_EXCL_UNLINK},
-            { "IN_MASK_ADD", IN_MASK_ADD},
-            { "IN_ISDIR", IN_ISDIR},
-            { "IN_Q_OVERFLOW", IN_Q_OVERFLOW},
-            { "IN_UNMOUNT", IN_UNMOUNT}};
-
-
-static int print_mask(unsigned int mask, char *string, size_t size)
-{
-    int i, pos=0, len;
-
-    for (i=0;i<(sizeof(inotify_textmap)/sizeof(inotify_textmap[0]));i++) {
-
-        if ( inotify_textmap[i].mask & mask ) {
-
-            len=strlen(inotify_textmap[i].name);
-
-            if ( pos + len + 1  > size ) {
-
-                pos=-1;
-                goto out;
-
-            } else {
-
-                if ( pos>0 ) {
-
-                    *(string+pos)=';';
-                    pos++;
-
-                }
-
-                strcpy(string+pos, inotify_textmap[i].name);
-                pos+=len;
-
-            }
-
-        }
-
-    }
-
-    out:
-
-    return pos;
-
-}
 
 /* wrapper around signal_mountmonitor */
 
@@ -2679,11 +2664,465 @@ int handle_data_on_mountinfo_fd(struct epoll_extended_data_struct *epoll_xdata, 
 
     }
 
-
     return 0;
+
 }
 
 
+/* function to process a fsevent reported by
+   inotify or send via socket by client fs
+   it's possible to use one function for both "backends" cause
+   here one method to describe events is used (inotify):
+   mask is in inotify format
+   name is the name of the entry
+   len is the len of name
+   (len is zero, name is NULL when event on watch self 
+    stat st - stat provided by the backend. can be NULL. by providing this an extra stat call is not required
+    a client fs will be able to provide this as part of the fsevent_message
+    method - an id of the backend method
+
+*/
+
+void evaluate_and_process_fsevent(struct effective_watch_struct *effective_watch, char *name, int len, int mask, struct stat *st, unsigned char method)
+{
+    int res;
+    unsigned char remote=(method==FSEVENT_BACKEND_METHOD_FORWARD) ? 1 : 0;
+
+    if (name) {
+
+	logoutput("evaluate_and_process_fsevent: name: %s, len: %i, mask: %i, method: %i", name, len, mask, method);
+
+    } else {
+
+	logoutput("evaluate_and_process_fsevent: NONAME, len: %i, mask: %i, method: %i", len, mask, method);
+
+    }
+
+    /* if no watch then ready */
+
+    if ( ! effective_watch ) return;
+
+    /* test it's an event on a watch long gone 
+       watches should be disabled when entry/inodes are removed,
+       so receiving messages on them should 
+       not happen, but to make sure */
+
+    if ( ! effective_watch->inode ) {
+
+	return;
+
+    } else if ( effective_watch->inode->status!=FSEVENT_INODE_STATUS_OK ) {
+
+	return;
+
+    }
+
+    if ( name && len>0 ) {
+
+        /* something happens on an entry in the directory.. check it's in use
+        by this fs, the find command will return NULL if it isn't 
+	    (do nothing with close, open and access) */
+
+	if ( mask & ( IN_DELETE | IN_MOVED_FROM | IN_ATTRIB | IN_MODIFY | IN_CREATE | IN_MOVED_TO | IN_IGNORED | IN_UNMOUNT ) ) {
+	    struct notifyfs_entry_struct *entry=NULL;
+
+	    entry=find_entry(effective_watch->inode->ino, name);
+
+	    if ( entry ) {
+
+		/* entry found : entry is part of this fs */
+
+		if ( mask & IN_UNMOUNT ) {
+
+		    logoutput("evaluate_and_process_fsevent: entry %s unmounted, ignored, handled by the mountmonitor", name);
+
+		    return;
+
+		}
+
+		/* process file- and attrib changes 
+                   note the create and moved_to operation are not likely to happen, since the entry already exists here...
+
+                   TODO: with inotify a mkdir or mknod results in IN_CREATE is followed by a IN_ATTRIB
+                   from inotify or VFS point of view these are different operations, but from the userspace these are related!
+                   notifyfs will after the first IN_CREATE do a stat call to get the attributes...
+                   when the IN_ATTRIB follows shortly after that, it again does a stat call.
+                   the question is now is there some way to make/see notifyfs the second IN_ATTRIB can be ignored
+
+                */
+
+		if ( mask & ( IN_ATTRIB | IN_MODIFY | IN_CREATE | IN_MOVED_TO ) ) {
+		    unsigned char filechanged=0, lastaction=0;
+		    struct notifyfs_inode_struct *inode=entry->inode;
+
+		    if ( mask & IN_ATTRIB ) {
+
+			logoutput("evaluate_and_process_fsevent: attributes %s changed", name);
+			lastaction=FSEVENT_STAT_IN_ATTRIB;
+
+		    }
+
+		    if ( mask & IN_MODIFY ) {
+
+			logoutput("evaluate_and_process_fsevent: %s modified", name);
+			lastaction=FSEVENT_STAT_IN_MODIFY;
+
+		    }
+
+		    if ( mask & ( IN_CREATE | IN_MOVED_TO ) ) {
+
+			logoutput("evaluate_and_process_fsevent: entry %s created", name);
+			lastaction=FSEVENT_STAT_IN_CREATE;
+
+		    }
+
+		    if ( ! inode ) return;
+
+		    if ( st ) {
+
+			/* a stat provided by the backend: use that (and trust it to be correct...) */
+
+			filechanged=determinechanges(&(inode->st), mask, st);
+
+		    } else {
+			struct stat test_st;
+			struct call_info_struct call_info;
+
+			/* a stat is not provided: get it here */
+
+            		init_call_info(&call_info, entry);
+
+            		res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+            		if (res<0) return;
+
+			res=lstat(call_info.path, &test_st);
+
+			if ( res==-1 ) {
+
+			    /* strange case: message that entry does exist, but stat gives error... */
+
+			    mask|=IN_DELETE;
+
+			    /* skip the futher actions, go direct to delete... */
+
+			    goto entrydelete1;
+
+			} else {
+
+			    filechanged=determinechanges(&(inode->st), mask, &test_st);
+			    update_timespec(&inode->laststat);
+			    inode->method=method;
+			    inode->lastaction=lastaction;
+
+			}
+
+		    }
+
+		    /* only send when there has really changed something */
+
+		    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
+
+			logoutput("evaluate_and_process_fsevent: a real change, sending message");
+
+			send_notify_message_clients(effective_watch, mask, len, name, &(inode->st), remote);
+
+		    } else {
+
+			logoutput("evaluate_and_process_fsevent: not a real change, not sending message");
+
+		    }
+
+		}
+
+		entrydelete1:
+
+		if ( mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
+		    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
+		    struct call_info_struct call_info;
+		    struct notifyfs_inode_struct *inode=entry->inode;
+
+		    logoutput("evaluate_and_process_fsevent: entry %s removed, checking to send a message", name);
+
+		    /* there must be an inode.... */
+
+		    if ( ! inode ) return;
+
+		    prestatus=inode->status;
+
+            	    init_call_info(&call_info, entry);
+
+            	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+            	    if (res<0) return;
+
+		    /* entry deleted (here) so adjust the filesystem */
+
+		    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
+
+		    /* forward message only when something really changed */
+
+		    if ( prestatus!=inode->status && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
+
+			logoutput("evaluate_and_process_fsevent: a real remove, sending message");
+
+			send_notify_message_clients(effective_watch, mask, len, name, NULL, remote);
+
+		    } else {
+
+			logoutput("evaluate_and_process_fsevent: not a real remove, not sending message");
+
+		    }
+
+		    return;
+
+		}
+
+	    } else {
+
+		/* entry not part of fs, just send the message 
+		maybe additional create the entry 
+		*/
+
+		if ( mask & ( IN_CREATE | IN_MOVED_TO | IN_ATTRIB | IN_MODIFY ) ) {
+		    struct notifyfs_entry_struct *parent_entry=NULL;
+		    unsigned char lastaction;
+
+
+		    logoutput("evaluate_and_process_fsevent: entry %s new, not found in notifyfs, creating it", name);
+
+		    if ( mask & IN_ATTRIB ) {
+
+			logoutput("evaluate_and_process_fsevent: attributes %s changed", name);
+			lastaction=FSEVENT_STAT_IN_ATTRIB;
+
+		    }
+
+		    if ( mask & IN_MODIFY ) {
+
+			logoutput("evaluate_and_process_fsevent: %s modified", name);
+			lastaction=FSEVENT_STAT_IN_MODIFY;
+
+		    }
+
+		    if ( mask & ( IN_CREATE | IN_MOVED_TO ) ) {
+
+			logoutput("evaluate_and_process_fsevent: entry %s created", name);
+			lastaction=FSEVENT_STAT_IN_CREATE;
+
+		    }
+
+		    /* here create the entry */
+
+		    parent_entry=effective_watch->inode->alias;
+		    entry=create_entry(parent_entry, name, NULL);
+
+		    if ( entry ) {
+			struct stat test_st;
+
+			res=0;
+
+			if ( ! st ) {
+			    struct call_info_struct call_info;
+
+			    /* stat not defined: get it here */
+
+                    	    init_call_info(&call_info, entry);
+
+                    	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+                    	    if (res<0) return;
+
+			    st=&test_st;
+
+			    res=lstat(call_info.path, st);
+
+			}
+
+			if ( res==0 ) {
+
+			    /* insert at begin */
+
+			    entry->dir_prev=NULL;
+
+			    if ( parent_entry->child ) parent_entry->child->dir_prev=entry;
+			    entry->dir_next=parent_entry->child;
+			    parent_entry->child=entry;
+
+			    assign_inode(entry);
+			    add_to_name_hash_table(entry);
+			    add_to_inode_hash_table(entry->inode);
+
+			    copy_stat(&(entry->inode->st), st);
+			    update_timespec(&entry->inode->laststat);
+			    entry->inode->method=method;
+			    entry->inode->lastaction=lastaction;
+
+			    send_notify_message_clients(effective_watch, mask, len, name, st, remote);
+
+			} else {
+
+			    /* huh?? should not happen.. received a message the entry does exist
+                               ignore the event futher */
+
+			    remove_entry(entry);
+
+			}
+
+		    }
+
+		} else if ( mask & IN_UNMOUNT ) {
+
+		    /* entry not found in notifyfs, which should not happen since
+		       every mount is managed here */
+
+		    /* a config switch here to send a message or not ? */
+
+		    logoutput("evaluate_and_process_fsevent: entry (not found in notifyfs) %s unmounted, ignored, handled by the mountmonitor", name);
+
+		} else if ( mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
+
+		    logoutput("evaluate_and_process_fsevent: entry %s removed, not found in notifyfs", name);
+
+		    /* received a message an entry is deleted, what was not part of this fs, so do nothing just forward */
+
+		    send_notify_message_clients(effective_watch, mask, len, name, st, remote);
+
+		}
+
+	    }
+
+	}
+
+    } else {
+
+	/*  event on watch self
+	    do nothing with close, open and access*/
+
+	if ( mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB | IN_MODIFY | IN_IGNORED | IN_UNMOUNT ) ) {
+	    struct notifyfs_entry_struct *entry=NULL;
+	    struct notifyfs_inode_struct *inode=NULL;
+
+	    inode=effective_watch->inode;
+	    entry=inode->alias;
+
+	    if ( entry ) {
+
+		/* entry found which is logical, event is on watch, which exists */
+
+		if ( mask & ( IN_ATTRIB | IN_MODIFY ) ) {
+		    unsigned char filechanged=0, lastaction=0;
+
+
+		    if ( mask & IN_ATTRIB ) {
+
+			logoutput("evaluate_and_process_fsevent: watch attributes changed");
+			lastaction=FSEVENT_STAT_IN_ATTRIB;
+
+		    }
+
+		    if ( mask & IN_MODIFY ) {
+
+			logoutput("evaluate_and_process_fsevent: watch modified");
+			lastaction=FSEVENT_STAT_IN_MODIFY;
+
+		    }
+
+		    if ( st ) {
+
+			/* a stat provided by the backend: use that (and trust it to be correct...) */
+
+			filechanged=determinechanges(&(inode->st), mask, st);
+
+		    } else {
+			struct stat test_st;
+			struct call_info_struct call_info;
+
+			/* a stat is not provided: get it here */
+
+            		init_call_info(&call_info, entry);
+
+            		res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+            		if (res<0) return;
+
+			res=lstat(call_info.path, &test_st);
+
+			if ( res==-1 ) {
+
+			    /* strange case: message that entry does exist, but stat gives error... */
+
+			    mask|=IN_DELETE;
+			    goto entrydelete2;
+
+			} else {
+
+			    filechanged=determinechanges(&(inode->st), mask, &test_st);
+			    update_timespec(&inode->laststat);
+			    inode->method=method;
+			    inode->lastaction=lastaction;
+
+			}
+
+		    }
+
+		    /* only send when there has really changed something */
+
+		    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
+
+			logoutput("evaluate_and_process_fsevent: changes detected, sending message");
+
+			send_notify_message_clients(effective_watch, mask, 0, NULL, &(inode->st), remote);
+
+		    } else {
+
+			logoutput("evaluate_and_process_fsevent: no changes detected");
+
+		    }
+
+		}
+
+		entrydelete2:
+
+		if ( mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_UNMOUNT ) ) {
+		    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
+            	    struct call_info_struct call_info;
+
+		    logoutput("evaluate_and_process_fsevent: (watch) entry %s removed", entry->name);
+
+		    /* entry deleted (here) so adjust the filesystem */
+
+		    prestatus=inode->status;
+
+            	    init_call_info(&call_info, entry);
+
+            	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+            	    if (res<0) return;
+
+		    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
+
+		    /* forward message only when something really changed */
+
+		    if ( prestatus!=inode->status && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
+
+			send_notify_message_clients(effective_watch, mask, 0, NULL, NULL, remote);
+
+		    }
+
+		}
+
+	    } else {
+
+		/* received an event on watch, but entry is not found.. */
+
+		logoutput("evaluate_and_process_fsevent: (watch) entry not found for watch id %li", effective_watch->id);
+
+	    }
+
+	}
+
+    }
+
+}
+
+
+/* INOTIFY BACKEND SPECIFIC CALLS */
 
 /* read data from inotify fd */
 #define INOTIFY_EVENT_SIZE (sizeof(struct inotify_event))
@@ -2722,20 +3161,9 @@ void handle_data_on_inotify_fd(struct epoll_extended_data_struct *epoll_xdata, u
                     /* what to do here: read again?? go back ??*/
 
                     logoutput0("Error reading inotify events: buffer overflow.");
-                    continue;
+                    goto next;
 
                 }
-
-                /* here: activity on a certain wd */
-
-                /* lookup watch wd in table
-                   lookup inode
-                   lookup watches->clients
-                   send message to clients
-
-                    eventually take right action when something is deleted
-
-                 */
 
                 /* lookup watch using this wd */
 
@@ -2756,231 +3184,9 @@ void handle_data_on_inotify_fd(struct epoll_extended_data_struct *epoll_xdata, u
 
                 effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_INOTIFY, i_event->wd);
 
-                if ( effective_watch ) {
+		/* process the event.... is from inotify, so no stat and it's local*/
 
-		    /* test it's an event on a watch long gone 
-		       watches should be disabled and removed when entry/inodes are removed, 
-		       so receiving messages on them should 
-		       not happen, but to make sure */
-
-		    if ( ! effective_watch->inode ) {
-
-			goto next;
-
-		    } else if ( effective_watch->inode->status!=FSEVENT_INODE_STATUS_OK ) {
-
-			goto next;
-
-		    }
-
-                    if ( i_event->name && i_event->len>0 ) {
-
-                        /* something happens on an entry in the directory.. check it's in use
-                           by this fs, the find command will return NULL if it isn't 
-
-                           do nothing with close, open and access*/
-
-			if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_ATTRIB | IN_MODIFY | IN_CREATE | IN_MOVED_TO | IN_IGNORED | IN_UNMOUNT ) ) {
-			    struct notifyfs_entry_struct *entry=NULL;
-
-			    entry=find_entry(effective_watch->inode->ino, i_event->name);
-
-			    if ( entry ) {
-                    		struct call_info_struct call_info;
-
-				/* entry is part of this fs */
-
-                    		init_call_info(&call_info, entry);
-
-                    		nreturn=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-                    		if (nreturn<0) continue;
-
-				if ( i_event->mask & IN_UNMOUNT ) {
-
-				    logoutput("handle_data_on_inotify_fd: entry %s unmounted, ignored, handled by the mountmonitor", entry->name);
-
-				} else if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
-				    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
-				    struct notifyfs_inode_struct *inode=entry->inode;
-
-				    logoutput("handle_data_on_inotify_fd: entry %s removed", entry->name);
-
-				    /* entry deleted (here) so adjust the filesystem */
-
-				    if ( inode ) prestatus=inode->status;
-
-				    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
-
-				    if ( prestatus!=FSEVENT_INODE_STATUS_REMOVED ) {
-
-					if ( inode && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
-
-					    /* send a message to server/client to inform */
-
-					    send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
-
-					}
-
-				    }
-
-				} else if ( i_event->mask & ( IN_CREATE | IN_MOVED_TO ) ) {
-				    unsigned char filechanged=0;
-
-				    logoutput("handle_data_on_inotify_fd: entry %s new", entry->name);
-
-				    /* entry created... and does exist already here... huhhh??? */
-
-				    /* here compare the new values (attributes) with the cached ones,
-			    		and only forward a message when there has something really changed..*/
-
-				    filechanged=determinechanges(&call_info, i_event->mask);
-
-				    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
-
-					send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
-
-				    }
-
-				} else if ( i_event->mask & ( IN_ATTRIB | IN_MODIFY ) ) {
-				    unsigned char filechanged=0;
-
-				    logoutput("handle_data_on_inotify_fd: entry %s changed", entry->name);
-
-				    /* here compare the new values (attributes) with the cached ones,
-			    		and only forward a message when there has something really changed..*/
-
-				    filechanged=determinechanges(&call_info, i_event->mask);
-
-				    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
-
-					send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
-
-				    }
-
-				}
-
-			    } else {
-
-				/* entry not part of fs, just send the message 
-				   maybe additional create the entry 
-				*/
-
-				if ( i_event->mask & ( IN_CREATE | IN_MOVED_TO | IN_ATTRIB | IN_MODIFY ) ) {
-				    struct notifyfs_entry_struct *parent_entry=NULL;
-
-				    logoutput("handle_data_on_inotify_fd: entry %s new, not found in notifyfs, creating it", i_event->name);
-
-				    /* here create the entry */
-
-				    parent_entry=effective_watch->inode->alias;
-
-				    entry=create_entry(parent_entry, i_event->name, NULL);
-
-				    if ( entry ) {
-
-					/* insert at begin */
-
-					entry->dir_prev=NULL;
-
-					if ( parent_entry->child ) parent_entry->child->dir_prev=entry;
-					entry->dir_next=parent_entry->child;
-					parent_entry->child=entry;
-
-					assign_inode(entry);
-					add_to_name_hash_table(entry);
-					add_to_inode_hash_table(entry->inode);
-
-				    }
-
-				} else if ( i_event->mask & IN_UNMOUNT ) {
-
-				    /* entry not found in notifyfs, which should not happen since
-				    every mount is managed here */
-
-				    logoutput("handle_data_on_inotify_fd: entry (not found in notifyfs) %s unmounted, ignored, handled by the mountmonitor", i_event->name);
-
-				} else if ( i_event->mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
-
-				    logoutput("handle_data_on_inotify_fd: entry %s removed, not found in notifyfs", i_event->name);
-
-				}
-
-				send_notify_message_clients(effective_watch, i_event->mask, i_event->len, i_event->name);
-
-			    }
-
-			}
-
-		    } else {
-
-			/* event on watch self
-
-                           do nothing with close, open and access*/
-
-			if ( i_event->mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB | IN_MODIFY | IN_IGNORED | IN_UNMOUNT ) ) {
-			    struct notifyfs_entry_struct *entry=NULL;
-
-			    entry=effective_watch->inode->alias;
-
-			    if ( entry ) {
-                    		struct call_info_struct call_info;
-
-				/* entry is part of this fs */
-
-                    		init_call_info(&call_info, entry);
-
-                    		nreturn=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-                    		if (nreturn<0) continue;
-
-				if ( i_event->mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_UNMOUNT ) ) {
-				    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
-				    struct notifyfs_inode_struct *inode=entry->inode;
-
-				    logoutput("handle_data_on_inotify_fd: entry %s removed", entry->name);
-
-				    /* entry deleted (here) so adjust the filesystem */
-
-				    if ( inode ) prestatus=inode->status;
-
-				    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
-
-				    if ( prestatus!=FSEVENT_INODE_STATUS_REMOVED ) {
-
-					if ( inode && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
-
-					    /* send a message to server/client to inform */
-
-					    send_notify_message_clients(effective_watch, i_event->mask, 0, NULL);
-
-					}
-
-				    }
-
-				} else if ( i_event->mask & ( IN_ATTRIB | IN_MODIFY ) ) {
-				    unsigned char filechanged=0;
-
-				    logoutput("handle_data_on_inotify_fd: entry %s changed", entry->name);
-
-				    /* here compare the new values (attributes) with the cached ones,
-			    		and only forward a message when there has something really changed..*/
-
-				    filechanged=determinechanges(&call_info, i_event->mask);
-
-				    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
-
-					send_notify_message_clients(effective_watch, i_event->mask, 0, NULL);
-
-				    }
-
-				}
-
-			    }
-
-			}
-
-                    }
-
-		}
+		evaluate_and_process_fsevent(effective_watch, i_event->name, i_event->len, i_event->mask, NULL, FSEVENT_BACKEND_METHOD_INOTIFY);
 
 		next:
 
@@ -3003,6 +3209,30 @@ void handle_client_message(struct client_struct *client,  struct notifyfs_client
     char *path=(char *) data1;
 
     logoutput("handle client message, for message %i, client pid/type %i/%i", type, client->pid, client->type);
+
+    /* check the pid and the tid the client has send, and the tid earlier detected is a task of the mainpid */
+
+    if ( belongtosameprocess(client_message->pid, client_message->tid)==0 ) {
+
+	logoutput("handle client message: pid %i and tid %i send by client (%i) are not part of same process", client_message->pid, client_message->tid, client->tid);
+
+	/* ignore message.. */
+
+	return;
+
+    }
+
+    if ( belongtosameprocess(client_message->pid, client->tid)==0 ) {
+
+	logoutput("handle client message: pid %i send by client and tid %i are not part of same process", client_message->pid, client->tid);
+
+	/* ignore message.. */
+
+	return;
+
+    }
+
+    client->pid=client_message->pid;
 
     if ( type&(NOTIFYFS_MESSAGE_CLIENT_REGISTERAPP|NOTIFYFS_MESSAGE_CLIENT_REGISTERFS) ) {
 
@@ -3104,7 +3334,7 @@ void handle_client_message(struct client_struct *client,  struct notifyfs_client
 
 }
 
-void handle_fsevent_message(struct client_struct *client,  struct notifyfs_fsevent_message *fsevent_message, void *data1, int len1)
+void handle_fsevent_message(struct client_struct *client, struct notifyfs_fsevent_message *fsevent_message, void *data1, int len1)
 {
     unsigned char type=fsevent_message->type;
 
@@ -3117,6 +3347,7 @@ void handle_fsevent_message(struct client_struct *client,  struct notifyfs_fseve
 	   then set the watch at backend
 	*/
 
+
     } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYINO ) {
 
 	logoutput("handle_fsevent_message: setwatch_byino");
@@ -3127,6 +3358,7 @@ void handle_fsevent_message(struct client_struct *client,  struct notifyfs_fseve
 	*/
 
     } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_NOTIFY ) {
+	struct effective_watch_struct *effective_watch;
 
 	logoutput("handle_fsevent_message: notify");
 
@@ -3138,6 +3370,32 @@ void handle_fsevent_message(struct client_struct *client,  struct notifyfs_fseve
 	   it's a fact that inotify events have been realised on the VFS,
 	   with events on the backend this is not so
 	   but first filter out the events caused by this host....*/
+
+	/* lookup the watch the event is about using the backend_id */
+
+	/* there must be a client interested */
+
+	effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_FORWARD, fsevent_message->id);
+
+	if ( effective_watch ) {
+
+	    logoutput("handle_fsevent_message: watch found.");
+
+	    if ( fsevent_message->statset==1 ) {
+
+		evaluate_and_process_fsevent(effective_watch, (char *) data1, len1, fsevent_message->mask, &(fsevent_message->st), FSEVENT_BACKEND_METHOD_FORWARD);
+
+	    } else {
+
+		evaluate_and_process_fsevent(effective_watch, (char *) data1, len1, fsevent_message->mask, NULL, FSEVENT_BACKEND_METHOD_FORWARD);
+
+	    }
+
+	} else {
+
+	    logoutput("handle_fsevent_message: watch not found for id %li.", fsevent_message->id);
+
+	}
 
 
     } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_DELWATCH ) {
@@ -3211,14 +3469,16 @@ void handle_mountinfo_request(struct client_struct *client,  struct notifyfs_mou
     }
 
 
-    res=lock_mountlist(MOUNTENTRY_CURRENT);
+    res=lock_mountlist();
 
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_CURRENT);
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_CURRENT);
 
     while (mount_entry) {
 
 
 	if ( strlen(mount_message->fstype)>0 ) {
+
+	    logoutput("handle_mountinfo_request, compare %s with %s", mount_entry->fstype, mount_message->fstype);
 
 	    /* filter on filesystem */
 
@@ -3227,6 +3487,8 @@ void handle_mountinfo_request(struct client_struct *client,  struct notifyfs_mou
 	}
 
 	if ( path && strlen(path)>0 ) {
+
+	    logoutput("handle_mountinfo_request, compare %s with %s", mount_entry->mountpoint, path);
 
 	    /* filter on directory */
 
@@ -3238,11 +3500,11 @@ void handle_mountinfo_request(struct client_struct *client,  struct notifyfs_mou
 
 	next:
 
-	mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_CURRENT);
+	mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_CURRENT);
 
     }
 
-    res=unlock_mountlist(MOUNTENTRY_CURRENT);
+    res=unlock_mountlist();
 
     /* a reply message to terminate */
 
@@ -3317,7 +3579,6 @@ int main(int argc, char *argv[])
     //
     // create the root inode and entry
     //
-
     res=create_root();
 
     if ( res<0 ) {
@@ -3463,11 +3724,11 @@ int main(int argc, char *argv[])
     *     add mount info 
     */
 
-    mountinfo_fd=open(MOUNTINFO, O_RDONLY);
+    mountinfo_fd=open(MOUNTINFO_FILE, O_RDONLY);
 
     if ( mountinfo_fd==-1 ) {
 
-        logoutput("unable to open file %s", MOUNTINFO);
+        logoutput("unable to open file %s", MOUNTINFO_FILE);
         goto out;
 
     }
@@ -3487,9 +3748,7 @@ int main(int argc, char *argv[])
 
     }
 
-    /* start the special mount monitor thread */
-
-    res=start_mountmonitor_thread(&threadid_mountmonitor);
+    res=start_mountmonitor(&threadid_mountmonitor, &update_notifyfs);
 
     if ( res<0 ) {
 
@@ -3501,10 +3760,10 @@ int main(int argc, char *argv[])
 
     }
 
+
     /* signal the mountmonitor to do the initial reading of the mounttable */
 
     signal_mountmonitor(1);
-
 
     /* add the fuse channel(=fd) to the mainloop */
 

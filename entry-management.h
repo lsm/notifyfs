@@ -33,13 +33,29 @@
 #define FSEVENT_INODE_ACTION_SLEEP	3
 #define FSEVENT_INODE_ACTION_WAKEUP	4
 
-#define FSEVENT_FILECHANGED_NONE	0
-#define FSEVENT_FILECHANGED_FILE	1
-#define FSEVENT_FILECHANGED_METADATA	2
-
 #define FSEVENT_ACTION_TREE_NOTSET	0
 #define FSEVENT_ACTION_TREE_UP		1
 #define FSEVENT_ACTION_TREE_REMOVE	2
+
+/* defines to distinguish the moments a stat call is done here:
+
+   - when a user browses the notifyfs filesystem, calls like lookup and getattr do a stat on the underlying fs
+   - when notifyfs receives an inotify create (IN_CREATE) it does a stat to check the entry 
+   - when notifyfs receives an inotify attrib or modify (IN_ATTRIB or IN_MODIFY) it does a stat to get the latest stat 
+
+   simular defines for the filesystem 
+
+*/
+
+#define FSEVENT_STAT_STAT		1
+#define FSEVENT_STAT_IN_CREATE		2
+#define FSEVENT_STAT_IN_ATTRIB		3
+#define FSEVENT_STAT_IN_MODIFY		4
+
+#define FSEVENT_STAT_FS_CREATE		5
+#define FSEVENT_STAT_FS_ATTRIB		6
+#define FSEVENT_STAT_FS_MODIFY		7
+
 
 struct notifyfs_inode_struct {
     fuse_ino_t ino;
@@ -49,6 +65,9 @@ struct notifyfs_inode_struct {
     struct stat st;
     struct effective_watch_struct *effective_watch;
     unsigned char status;
+    struct timespec laststat;
+    int lastaction;
+    unsigned char method;
 };
 
 struct notifyfs_entry_struct {
@@ -81,6 +100,7 @@ struct notifyfs_entry_struct *new_entry(fuse_ino_t parent, const char *name);
 
 int create_root();
 unsigned char isrootinode(struct notifyfs_inode_struct *inode);
+unsigned char isrootentry(struct notifyfs_entry_struct *entry);
 unsigned long long get_inoctr();
 struct notifyfs_inode_struct *get_rootinode();
 struct notifyfs_entry_struct *get_rootentry();

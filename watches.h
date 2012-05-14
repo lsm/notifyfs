@@ -23,7 +23,7 @@
 #define FSEVENT_BACKEND_METHOD_NOTSET   0
 #define FSEVENT_BACKEND_METHOD_INOTIFY  1
 #define FSEVENT_BACKEND_METHOD_POLLING  2
-#define FSEVENT_BACKEND_METHOD_FORWARD  3
+#define FSEVENT_BACKEND_METHOD_FORWARD  4
 
 #define WATCH_ACTION_NOTSET     0
 #define WATCH_ACTION_REMOVE     1
@@ -40,6 +40,8 @@ struct effective_watch_struct {
     unsigned char lock;
     struct effective_watch_struct *next;
     struct effective_watch_struct *prev;
+    struct effective_watch_struct *next_hash1;
+    struct effective_watch_struct *prev_hash1;
     unsigned char typebackend;
     void *backend;
     unsigned long id;
@@ -47,6 +49,9 @@ struct effective_watch_struct {
     unsigned long inotify_id;
     unsigned char backendset;
     char *path;
+    int hash1;
+    struct mount_entry_struct *mount_entry;
+    time_t laststat;
 };
 
 // struct to describe the watch which has been set
@@ -60,6 +65,7 @@ struct watch_struct {
     struct effective_watch_struct *effective_watch;
     struct client_struct *client;
     unsigned long id;
+    int client_watch_id;
     struct watch_struct *next_per_watch;
     struct watch_struct *prev_per_watch;
     struct watch_struct *next_per_client;
@@ -67,6 +73,11 @@ struct watch_struct {
 };
 
 // Prototypes
+
+int init_watch_hashtables();
+void add_watch_to_hashtable1(struct effective_watch_struct *eff_watch, unsigned long long id);
+void remove_watch_from_hashtable1(struct effective_watch_struct *eff_watch, unsigned long long id);
+struct effective_watch_struct *get_next_eff_watch_hash1(struct effective_watch_struct *effective_watch, unsigned long long id);
 
 int lock_effective_watches();
 int unlock_effective_watches();
@@ -86,7 +97,7 @@ int lock_effective_watch(struct effective_watch_struct *effective_watch);
 int unlock_effective_watch(struct effective_watch_struct *effective_watch);
 
 struct watch_struct *get_watch();
-int add_new_client_watch(struct effective_watch_struct *effective_watch, int mask, struct client_struct *client);
+int add_new_client_watch(struct effective_watch_struct *effective_watch, int mask, int client_watch_id, struct client_struct *client);
 void remove_client_watch_from_inode(struct watch_struct *watch);
 void remove_client_watch_from_client(struct watch_struct *watch);
 
@@ -97,5 +108,6 @@ unsigned long get_clientid(struct effective_watch_struct *effective_watch, pid_t
 
 void set_backend(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch);
 void init_effective_watches();
+int set_mount_entry_effective_watch(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch);
 
 #endif

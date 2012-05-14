@@ -17,19 +17,21 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef GENERAL_UTILS_H
-#define GENERAL_UTILS_H
+#ifndef _DETERMINECHANGES_H
+#define _DETERMINECHANGES_H
 
+#define FSEVENT_FILECHANGED_NONE	0
+#define FSEVENT_FILECHANGED_FILE	1
+#define FSEVENT_FILECHANGED_METADATA	2
+#define FSEVENT_FILECHANGED_XATTR	4
+#define FSEVENT_FILECHANGED_REMOVED	8
 
 // Prototypes
 
-void unslash(char *p);
-int compare_stat_time(struct stat *ast, struct stat *bst, unsigned char ntype);
-void copy_stat(struct stat *st_to, struct stat *st_from);
-unsigned char issubdirectory(const char *path1, const char *path2, unsigned char maybethesame);
-unsigned char belongtosameprocess(pid_t process_id, pid_t thread_id);
-pid_t getprocess_id(pid_t thread_id);
-int print_mask(unsigned int mask, char *string, size_t size);
+unsigned char compare_file_simple(struct stat *st1, struct stat *st2);
+unsigned char compare_metadata_simple(struct stat *st1, struct stat *st2);
+unsigned char determinechanges(struct stat *cached_st, int mask, struct stat *st);
+void update_timespec(struct timespec *laststat);
 
 #endif
 

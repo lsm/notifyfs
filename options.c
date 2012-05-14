@@ -246,7 +246,7 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
     /* testmode for now default (in future not) */
 
-    notifyfs_options.testmode=1;
+    notifyfs_options.testmode=0;
 
     /* everyone access */
 
@@ -442,6 +442,22 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 			fprintf(stderr, "Error: option --socket requires an argument. Abort.\n");
 			nreturn=-1;
 			goto out;
+
+		    }
+
+		} else if ( strcmp(long_options[long_options_index].name, "filesystems")==0 ) {
+
+		    if ( optarg ) {
+
+			notifyfs_options.filesystems=atoi(optarg);
+
+			if ( notifyfs_options.filesystems!=0) notifyfs_options.filesystems=1;
+
+		    } else {
+
+			fprintf(stderr, "Warning: option --filesystems requires an argument. Enable.\n");
+
+			notifyfs_options.filesystems=1;
 
 		    }
 

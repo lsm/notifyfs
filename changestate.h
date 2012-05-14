@@ -22,8 +22,7 @@
 
 // Prototypes
 
-unsigned char determinechanges(struct call_info_struct *call_info, int mask);
-void send_notify_message_clients(struct effective_watch_struct *effective_watch, int mask, int len, char *name);
+void send_notify_message_clients(struct effective_watch_struct *effective_watch, int mask, int len, char *name, struct stat *st, unsigned char remote);
 void send_status_message_clients(struct effective_watch_struct *effective_watch, unsigned char typemessage);
 
 void del_watch_backend(struct effective_watch_struct *effective_watch);
@@ -31,7 +30,7 @@ void set_watch_backend(struct effective_watch_struct *effective_watch, int newma
 
 void changestate(struct call_info_struct *call_info, unsigned char typeaction);
 
-int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_struct *removed_mounts, struct mount_list_struct *removed_mounts_keep, unsigned char doinit);
+void update_notifyfs(unsigned char firstrun);
 
 #endif
 

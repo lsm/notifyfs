@@ -25,7 +25,6 @@
 typedef char pathstring[PATH_MAX+1];
 typedef char smallpathstring[SMALL_PATH_MAX+1];
 
-
 struct notifyfs_options_struct {
      char socket[UNIX_PATH_MAX];
      pathstring mountpoint;
@@ -41,7 +40,6 @@ struct notifyfs_options_struct {
      double entry_timeout;
      double negative_timeout;
 };
-
 
 struct notifyfs_generic_fh_struct {
     struct notifyfs_entry_struct *entry;

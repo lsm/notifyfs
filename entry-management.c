@@ -248,6 +248,8 @@ static struct notifyfs_inode_struct *create_inode()
 	inode->ino = inoctr;
 	inode->nlookup = 0;
 	inode->status=FSEVENT_INODE_STATUS_OK;
+	inode->lastaction=0;
+	inode->method=0;
 
 	inoctr++;
 
@@ -366,13 +368,6 @@ struct notifyfs_entry_struct *new_entry(fuse_ino_t parent, const char *name)
     return entry;
 }
 
-unsigned char isrootinode(struct notifyfs_inode_struct *inode)
-{
-
-    return (inode->ino==FUSE_ROOT_ID) ? 1 : 0;
-
-}
-
 unsigned long long get_inoctr()
 {
     return inoctr;
@@ -436,4 +431,18 @@ struct notifyfs_inode_struct *get_rootinode()
 struct notifyfs_entry_struct *get_rootentry()
 {
     return &rootentry;
+}
+
+unsigned char isrootinode(struct notifyfs_inode_struct *inode)
+{
+
+    return (inode->ino==FUSE_ROOT_ID) ? 1 : 0;
+
+}
+
+unsigned char isrootentry(struct notifyfs_entry_struct *entry)
+{
+
+    return (entry==&rootentry) ? 1 : 0;
+
 }

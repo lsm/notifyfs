@@ -34,6 +34,7 @@
 
 #include <sys/stat.h>
 #include <sys/param.h>
+#include <sys/inotify.h>
 #include <fcntl.h>
 
 
@@ -202,7 +203,13 @@ unsigned char issubdirectory(const char *path1, const char *path2, unsigned char
 
 	if ( lenpath1>lenpath2 ) {
 
-	    if ( strncmp(path1+lenpath2, "/", 1)==0 ) {
+	    if ( strcmp(path2, "/")==0 ) {
+
+		/* path2 is / */
+
+		issubdir=2;
+
+	    } else if ( strncmp(path1+lenpath2, "/", 1)==0 ) {
 
 		/* is a real subdirectory */
 		issubdir=2;
@@ -224,5 +231,167 @@ unsigned char issubdirectory(const char *path1, const char *path2, unsigned char
     out:
 
     return issubdir;
+
+}
+
+/* a way to check two pids belong to the same process 
+    to make this work process_id has to be the main thread of a process
+    and thread_id is a process id of some thread of a process
+    under linux then the directory
+    /proc/<process_id>/task/<thread_id> 
+    has to exist
+
+    this does not work when both processes are not mainthreads
+    20120426: looking for a better way to do this
+*/
+
+unsigned char belongtosameprocess(pid_t process_id, pid_t thread_id)
+{
+    char tmppath[40];
+    int res;
+    unsigned char sameprocess=0;
+    struct stat st;
+
+    snprintf(tmppath, 40, "/proc/%i/task/%i", process_id, thread_id);
+    res=lstat(tmppath, &st);
+    if (res!=-1) sameprocess=1;
+
+    return sameprocess;
+}
+
+/* function to get the process id (PID) where the TID is given
+   this is done by first looking /proc/tid exist
+   if this is the case, then the tid is the process id
+   if not, check any pid when walking back if this is
+   the process id*/
+
+pid_t getprocess_id(pid_t thread_id)
+{
+    pid_t process_id=0;
+    char tmppath[40];
+    int res;
+    unsigned char sameprocess=0;
+    struct stat st;
+
+    process_id=thread_id;
+
+    snprintf(tmppath, 40, "/proc/%i", process_id);
+    res=stat(tmppath, &st);
+
+    if ( res==0 ) goto out;
+
+
+    checkpid:
+
+    process_id--;
+
+    if ( process_id==1 ) {
+
+	/* prevent going too far */
+
+	process_id=0;
+	goto out;
+
+    }
+
+    snprintf(tmppath, 40, "/proc/%i", process_id);
+    res=stat(tmppath, &st);
+
+    if ( res==0 ) {
+
+	/* directory does exist, check the thread is part of this process */
+
+	snprintf(tmppath, 40, "/proc/%i/task/%i", process_id, thread_id);
+	res=stat(tmppath, &st);
+
+	if ( res==0 ) {
+
+	    /* it does exist: found! */
+
+	    goto out;
+
+	} else {
+
+	    /* another process, do stop here, since the process_id is the first pid bigger
+               than thread_id which appears in /proc/ */
+
+	    process_id=0;
+	    goto out;
+
+	}
+
+    }
+
+    goto checkpid;
+
+    out:
+
+    return process_id;
+
+}
+
+typedef struct INTEXTMAP {
+                const char *name;
+                unsigned int mask;
+                } INTEXTMAP;
+
+static const INTEXTMAP inotify_textmap[] = {
+            { "IN_ACCESS", IN_ACCESS},
+            { "IN_MODIFY", IN_MODIFY},
+            { "IN_ATTRIB", IN_ATTRIB},
+            { "IN_CLOSE_WRITE", IN_CLOSE_WRITE},
+            { "IN_CLOSE_NOWRITE", IN_CLOSE_NOWRITE},
+            { "IN_OPEN", IN_OPEN},
+            { "IN_MOVED_FROM", IN_MOVED_FROM},
+            { "IN_MOVED_TO", IN_MOVED_TO},
+            { "IN_CREATE", IN_CREATE},
+            { "IN_DELETE", IN_DELETE},
+            { "IN_DELETE_SELF", IN_DELETE_SELF},
+            { "IN_MOVE_SELF", IN_MOVE_SELF},
+            { "IN_ONLYDIR", IN_ONLYDIR},
+            { "IN_DONT_FOLLOW", IN_DONT_FOLLOW},
+            { "IN_EXCL_UNLINK", IN_EXCL_UNLINK},
+            { "IN_MASK_ADD", IN_MASK_ADD},
+            { "IN_ISDIR", IN_ISDIR},
+            { "IN_Q_OVERFLOW", IN_Q_OVERFLOW},
+            { "IN_UNMOUNT", IN_UNMOUNT}};
+
+
+int print_mask(unsigned int mask, char *string, size_t size)
+{
+    int i, pos=0, len;
+
+    for (i=0;i<(sizeof(inotify_textmap)/sizeof(inotify_textmap[0]));i++) {
+
+        if ( inotify_textmap[i].mask & mask ) {
+
+            len=strlen(inotify_textmap[i].name);
+
+            if ( pos + len + 1  > size ) {
+
+                pos=-1;
+                goto out;
+
+            } else {
+
+                if ( pos>0 ) {
+
+                    *(string+pos)='|';
+                    pos++;
+
+                }
+
+                strcpy(string+pos, inotify_textmap[i].name);
+                pos+=len;
+
+            }
+
+        }
+
+    }
+
+    out:
+
+    return pos;
 
 }

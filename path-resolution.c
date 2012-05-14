@@ -63,44 +63,62 @@ pthread_mutex_t call_info_unused_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 struct pathinfo_struct {
 	char *path;
-	size_t size;
+	size_t maxsize;
 	char *pathstart;
+	size_t len;
+	struct mount_entry_struct *mount_entry;
 };
 
 
-static int addtopath(struct pathinfo_struct *pathinfo, char *path, unsigned char addslash)
+
+/* function which adds a part of a path BEFORE another part of path 
+   the part to be added may be a single name or a subpath
+   return:
+   <0 : error
+   >0 : number of bytes added
+*/
+
+
+static int addtopath(struct pathinfo_struct *pathinfo, char *path)
 {
     int len=strlen(path), nreturn=0;
+    unsigned char addslash=0;
 
     logoutput("addtopath: add path %s", path);
 
     /* see it fits */
 
-    if ( addslash==1 ) {
+    if ( pathinfo->len>0 && *(path+len-1) != '/' ) {
 
-	if ( pathinfo->pathstart - pathinfo->path < 1 + (long) len ) {
-
-	    nreturn=-ENAMETOOLONG;
-	    goto out;
-
-	}
-
-	pathinfo->pathstart--;
-	*(pathinfo->pathstart)='/';
+	pathinfo->len+=len+1;
+	addslash=1;
 
     } else {
 
-	if ( pathinfo->pathstart - pathinfo->path < (long) len ) {
+	pathinfo->len+=len;
 
-	    nreturn=-ENAMETOOLONG;
-	    goto out;
+    }
 
-	}
+    if ( pathinfo->len>pathinfo->maxsize ) {
+
+	nreturn=-ENAMETOOLONG;
+	goto out;
+
+    }
+
+    if ( addslash ) {
+
+	pathinfo->pathstart--;
+	*(pathinfo->pathstart)='/';
+	pathinfo->len++;
+	nreturn=1;
 
     }
 
     pathinfo->pathstart-=len;
+    pathinfo->len+=len;
     memcpy(pathinfo->pathstart, path, len);
+    nreturn+=len;
 
     out:
 
@@ -108,155 +126,178 @@ static int addtopath(struct pathinfo_struct *pathinfo, char *path, unsigned char
 
 }
 
+/* function to add extra pathinfo, from effective_watch and mount_entry 
+   it checks this extra pathinfo is available 
+   return:
+   <0: error
+   0 : no data available
+   1 : ready */
+
+static int processextrapathinfo(struct notifyfs_entry_struct *entry, struct pathinfo_struct *pathinfo)
+{
+    int nreturn=0;
+    /* check for an effective watch attached, this will speed things up */
+
+    if ( entry->inode ) {
+
+	/* first: look for an effective watch, is has a path set relative to the mount entry, and 
+           this mount entry has a mountpoint  */
+
+	if (entry->inode->effective_watch ) {
+	    struct effective_watch_struct *effective_watch=entry->inode->effective_watch;
+
+	    if ( effective_watch->mount_entry) {
+		struct mount_entry_struct *mount_entry=effective_watch->mount_entry;
+
+		pathinfo->mount_entry=mount_entry;
+
+		if ( entry==(struct notifyfs_entry_struct *) mount_entry->data0 ) {
+
+		    /* watch is on mountpoint */
+
+		    logoutput("determine_path: mount_entry found, add path %s", mount_entry->mountpoint);
+
+		    nreturn=addtopath(pathinfo, mount_entry->mountpoint);
+		    goto out;
+
+		} else {
+
+		    logoutput("determine_path: effective_watch and mount_entry found, add path %s/%s", mount_entry->mountpoint, effective_watch->path);
+
+		    nreturn=addtopath(pathinfo, effective_watch->path);
+		    if ( nreturn<0 ) goto out;
+
+		    nreturn=addtopath(pathinfo, mount_entry->mountpoint);
+		    goto out;
+
+
+		}
+
+	    }
+
+	}
+
+    }
+
+    /* second: check there is a mount entry */
+
+    if ( entry->mount_entry ) {
+	struct mount_entry_struct *mount_entry=entry->mount_entry;
+
+	pathinfo->mount_entry=mount_entry;
+
+	logoutput("determine_path: mount_entry found, add path %s", mount_entry->mountpoint);
+
+	nreturn=addtopath(pathinfo, mount_entry->mountpoint);
+	goto out;
+
+    }
+
+    /* third: check it's root */
+
+    if ( isrootentry(entry) ) {
+
+        pathinfo->pathstart--;
+        *(pathinfo->pathstart)='/';
+	pathinfo->len++;
+	nreturn=1;
+
+    }
+
+    out:
+
+    return nreturn;
+
+}
+
+
+
 int determine_path(struct call_info_struct *call_info, unsigned char flags)
 {
     char *pathstart=NULL;
     int nreturn=0;
-    struct notifyfs_entry_struct *tmpentry=call_info->entry;
-    pathstring tmppath;
-    size_t maxpathsize=sizeof(pathstring);
+    struct notifyfs_entry_struct *entry=call_info->entry;
+    pathstring path;
     struct pathinfo_struct pathinfo;
 
-    logoutput("determine_path, name: %s", tmpentry->name);
+    logoutput("determine_path, name: %s", entry->name);
 
-    pathinfo.path=tmppath;
-    pathinfo.size=sizeof(pathstring);
-
-    /* start of path */
-
-    pathinfo.pathstart = pathinfo.path + pathinfo.size - 1;
+    pathinfo.path=path;
+    pathinfo.maxsize=sizeof(pathstring);
+    pathinfo.len=0;
+    pathinfo.pathstart = pathinfo.path + pathinfo.maxsize - 1;
     *(pathinfo.pathstart) = '\0';
+    pathinfo.mount_entry=NULL;
 
-    if ( tmpentry->status==ENTRY_STATUS_REMOVED && ! (flags & NOTIFYFS_PATH_FORCE) ) {
+    if ( entry->status==ENTRY_STATUS_REMOVED && ! (flags & NOTIFYFS_PATH_FORCE) ) {
 
         nreturn=-ENOENT;
         goto error;
 
     }
 
-    if ( ! call_info->mount_entry ) call_info->mount_entry=tmpentry->mount_entry;
+    /* check for extra pathinfo available */
 
-    if ( tmpentry->inode ) {
+    nreturn=processextrapathinfo(entry, &pathinfo);
+    if ( nreturn!=0 ) goto out;
 
-	if ( ! call_info->effective_watch ) call_info->effective_watch=tmpentry->inode->effective_watch;
+    nreturn=addtopath(&pathinfo, entry->name);
 
-	if ( call_info->effective_watch ) {
+    while (entry->parent) {
 
-	    if ( call_info->effective_watch->path ) {
+	entry=entry->parent;
 
-		logoutput("determine_path: add effective_watch path %s", call_info->effective_watch->path);
-		nreturn=addtopath(&pathinfo, call_info->effective_watch->path, 0);
-		goto out;
-
-	    }
-
-	}
-
-        if ( isrootinode(tmpentry->inode)==1 ) {
-
-            pathinfo.pathstart--;
-            *(pathinfo.pathstart)='.';
-	    goto out;
-
-        }
-
-    }
-
-    if ( call_info->mount_entry ) {
-
-	if ( call_info->mount_entry->mountpoint ) {
-
-	    logoutput("determine_path: mountpoint %s found", call_info->mount_entry->mountpoint);
-
-	    nreturn=addtopath(&pathinfo, call_info->mount_entry->mountpoint, 0);
-	    goto out;
-
-	}
-
-    }
-
-    nreturn=addtopath(&pathinfo, tmpentry->name, 0);
-
-    while (tmpentry->parent) {
-
-	tmpentry=tmpentry->parent;
-
-        if ( tmpentry->status==ENTRY_STATUS_REMOVED && ! (flags & NOTIFYFS_PATH_FORCE) ) {
+        if ( entry->status==ENTRY_STATUS_REMOVED && ! (flags & NOTIFYFS_PATH_FORCE) ) {
 
             nreturn=-ENOENT;
             goto error;
 
         }
 
-        if ( ! call_info->mount_entry ) call_info->mount_entry=tmpentry->mount_entry;
+	/* check for extra pathinfo available */
 
-	if ( tmpentry->inode ) {
+	nreturn=processextrapathinfo(entry, &pathinfo);
+	if ( nreturn!=0 ) goto out;
 
-	    /* get the first upstream effective watch */
-
-	    if ( ! call_info->effective_watch ) call_info->effective_watch=tmpentry->inode->effective_watch;
-
-	    if ( call_info->effective_watch ) {
-
-		if ( call_info->effective_watch->path ) {
-
-		    logoutput("determine_path: add effective_watch path %s", call_info->effective_watch->path);
-
-		    nreturn=addtopath(&pathinfo, call_info->effective_watch->path, 1);
-		    goto out;
-
-		}
-
-	    }
-
-	    if ( isrootinode(tmpentry->inode)==1 ) break;
-
-	} else {
-
-	    nreturn=-EIO;
-	    goto error;
-
-	}
-
-	if ( call_info->mount_entry ) {
-
-	    if ( call_info->mount_entry->mountpoint ) {
-
-		logoutput("determine_path: mountpoint %s found", call_info->mount_entry->mountpoint);
-
-		nreturn=addtopath(&pathinfo, call_info->mount_entry->mountpoint, 1);
-		goto out;
-
-	    }
-
-	}
-
-	nreturn=addtopath(&pathinfo, tmpentry->name, 1);
+	nreturn=addtopath(&pathinfo, entry->name);
+	if ( nreturn<0 ) goto error;
 
     }
 
+    nreturn=1;
+
     out:
 
-    if (nreturn==0) {
-	size_t pathsize=0;
+    if (nreturn>=0) {
 
-	if ( strncmp(pathinfo.pathstart, "/", 1)!=0 ) {
+	if ( *(pathinfo.pathstart)!='/' ) {
+
+	    logoutput("determine_path, slash missing at start %s, adding it", pathinfo.pathstart);
 
 	    pathinfo.pathstart--;
     	    *(pathinfo.pathstart)='/';
+	    pathinfo.len++;
 
 	}
 
-	pathsize=pathinfo.path+pathinfo.size-pathinfo.pathstart+1;
+	if ( pathinfo.mount_entry ) {
+
+	    call_info->mount_entry=pathinfo.mount_entry;
+
+	} else {
+
+	    call_info->mount_entry=get_rootmount();
+
+	}
 
 	/* create a path just big enough */
 
-	call_info->path=malloc(pathsize);
+	call_info->path=malloc(pathinfo.len+1);
 
 	if ( call_info->path ) {
 
-    	    memset(call_info->path, '\0', pathsize);
-    	    memcpy(call_info->path, pathinfo.pathstart, pathsize-1);
+    	    memset(call_info->path, '\0', pathinfo.len+1);
+    	    memcpy(call_info->path, pathinfo.pathstart, pathinfo.len);
 
 	    call_info->freepath=1;
 
@@ -322,6 +363,7 @@ void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_st
     call_info->prev=NULL;
     call_info->mount_entry=NULL;
     call_info->ctx=NULL;
+    call_info->client=NULL;
 
 }
 

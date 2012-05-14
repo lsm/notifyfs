@@ -1,4 +1,4 @@
-OBJS = utils.o options.o xattr.o client.o socket.o epoll-utils.o handlefuseevent.o entry-management.o access.o notifyfs.o mountinfo.o message.o message-server.o path-resolution.o watches.o changestate.o
+OBJS = utils.o options.o xattr.o client.o socket.o epoll-utils.o handlefuseevent.o entry-management.o access.o notifyfs.o mountinfo.o mountinfo-monitor.o message.o message-server.o path-resolution.o watches.o changestate.o determinechanges.o
 EXECUTABLE = notifyfs
 
 CC=gcc
@@ -18,17 +18,17 @@ epoll-utils.o: epoll-utils.h logging.h
 entry-management.o: entry-management.h logging.h global-defines.h mountinfo.h watches.h
 handlefuseevent.o: handlefuseevent.h epoll-utils.h logging.h global-defines.h
 
-
 utils.o: utils.h logging.h
+notifyfs.o: utils.h options.h xattr.h epoll-utils.h entry-management.h logging.h notifyfs.h global-defines.h mountinfo.h mountinfo-monitor.h socket.h message.h message-server.h path-resolution.h watches.h handlefuseevent.h changestate.h
 
-notifyfs.o: utils.h options.h xattr.h epoll-utils.h entry-management.h logging.h notifyfs.h global-defines.h mountinfo.h socket.h message.h message-server.h path-resolution.h watches.h handlefuseevent.h changestate.h
-
+determinechanges.o: determinechanges.h notifyfs.h logging.h
 changestate.o: changestate.h logging.h global-defines.h message.h client.h entry-management.h path-resolution.h 
 options.o: options.h logging.h global-defines.h notifyfs.h
 xattr.o: xattr.h logging.h notifyfs.h global-defines.h entry-management.h path-resolution.h 
 client.o: client.h logging.h entry-management.h notifyfs.h
 access.o: access.h logging.h entry-management.h notifyfs.h path-resolution.h 
 mountinfo.o: mountinfo.h logging.h global-defines.h
+mountinfo-monitor.o: mountinfo.h mountinfo-monitor.h logging.h global-defines.h
 socket.o: socket.h message.h logging.h global-defines.h notifyfs.h
 
 message.o: message.h logging.h global-defines.h

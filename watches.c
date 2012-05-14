@@ -44,6 +44,8 @@
 
 #define LOG_LOGAREA LOG_LOGAREA_WATCHES
 
+#define WATCHES_HASHTABLE1_SIZE          1024
+
 #include <fuse/fuse_lowlevel.h>
 
 #include "logging.h"
@@ -59,15 +61,83 @@ struct eff_watch_list_struct {
     struct effective_watch_struct *last;
 };
 
+struct effective_watch_struct **eff_watch_hashtable1;
+
 unsigned long long watchctr = 1;
 pthread_mutex_t watchctr_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 struct eff_watch_list_struct eff_watches_list;
-pthread_mutex_t effective_watches_mutex=PTHREAD_MUTEX_INITIALIZER;;
+pthread_mutex_t effective_watches_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 struct effective_watch_struct *effective_watches_unused=NULL;
-pthread_mutex_t effective_watches_unused_mutex=PTHREAD_MUTEX_INITIALIZER;;
+pthread_mutex_t effective_watches_unused_mutex=PTHREAD_MUTEX_INITIALIZER;
 
+int init_watch_hashtables()
+{
+    int nreturn=0;
+    int i;
+
+    eff_watch_hashtable1=calloc(WATCHES_HASHTABLE1_SIZE, sizeof(struct effective_watch_struct *));
+
+    if ( ! eff_watch_hashtable1 ) {
+
+	nreturn=-ENOMEM;
+
+    } else {
+
+	for (i=0;i<WATCHES_HASHTABLE1_SIZE;i++) {
+
+	    eff_watch_hashtable1[i]=NULL;
+
+	}
+
+    }
+
+}
+
+/* here some function to lookup the eff watch, given the mount entry */
+
+void add_watch_to_hashtable1(struct effective_watch_struct *eff_watch, unsigned long long id)
+{
+    int hash=id%WATCHES_HASHTABLE1_SIZE;
+
+    if ( eff_watch_hashtable1[hash] ) eff_watch_hashtable1[hash]->prev_hash1=eff_watch;
+    eff_watch->next_hash1=eff_watch_hashtable1[hash];
+    eff_watch_hashtable1[hash]=eff_watch;
+
+}
+
+void remove_watch_from_hashtable1(struct effective_watch_struct *eff_watch, unsigned long long id)
+{
+    int hash=id%WATCHES_HASHTABLE1_SIZE;
+
+    if ( eff_watch_hashtable1[hash]==eff_watch ) {
+
+	eff_watch_hashtable1[hash]=eff_watch->next_hash1;
+
+    }
+
+    if ( eff_watch->next_hash1 ) eff_watch->next_hash1->prev_hash1=eff_watch->prev_hash1;
+    if ( eff_watch->prev_hash1 ) eff_watch->prev_hash1->next_hash1=eff_watch->next_hash1;
+
+}
+
+struct effective_watch_struct *get_next_eff_watch_hash1(struct effective_watch_struct *effective_watch, unsigned long long id)
+{
+    if ( effective_watch ) {
+	int hash=id%WATCHES_HASHTABLE1_SIZE;
+
+	effective_watch=eff_watch_hashtable1[hash];
+
+    } else {
+
+	effective_watch=effective_watch->next_hash1;
+
+    }
+
+    return effective_watch;
+
+}
 
 struct effective_watch_struct *get_next_effective_watch(struct effective_watch_struct *effective_watch)
 {
@@ -95,16 +165,107 @@ void set_backend(struct call_info_struct *call_info, struct effective_watch_stru
     if ( call_info->mount_entry ) {
 	struct mount_entry_struct *mount_entry=call_info->mount_entry;
 
-	if ( mount_entry->client ) {
+	if ( mount_entry->data1 ) {
 
 	    effective_watch->typebackend=FSEVENT_BACKEND_METHOD_FORWARD;
-	    effective_watch->backend=mount_entry->client;
+	    effective_watch->backend=mount_entry->data1;
 
 	}
 
     }
 
 }
+
+/* function to set the path for the effective watch 
+   this is the path relative to the mount point of the 
+   fs it's on
+*/
+
+int set_mount_entry_effective_watch(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch)
+{
+    struct mount_entry_struct *mount_entry=NULL;
+    char *path;
+    int len, nreturn=0;
+
+    if ( call_info->mount_entry ) {
+	int len, res;
+
+	mount_entry=call_info->mount_entry;
+
+    } else {
+
+	if ( call_info->path ) {
+	    struct notifyfs_entry_struct *entry=call_info->entry;
+
+	    /* walk back to root */
+
+	    checkentry:
+
+	    if ( isrootentry(entry) ) {
+
+		mount_entry=get_rootmount();
+
+	    } else {
+
+		if ( entry->mount_entry ) {
+
+		    mount_entry=entry->mount_entry;
+
+		} else {
+
+		    entry=entry->parent;
+		    goto checkentry;
+
+		}
+
+	    }
+
+	} else {
+	    int res=determine_path(call_info, NOTIFYFS_PATH_FORCE);
+
+	    if (res<0) {
+
+		nreturn=res;
+		goto out;
+
+	    }
+
+	    mount_entry=call_info->mount_entry;
+
+	}
+
+    }
+
+    effective_watch->mount_entry=mount_entry;
+    len=strlen(mount_entry->mountpoint);
+
+    if ( strlen(call_info->path)>len ) {
+
+	/* here call_info->path is a real subdirectory of mount_entry->mountpoint */
+
+	if ( *(call_info->path+len)=='/' ) len++;
+
+	effective_watch->path=strdup(call_info->path+len);
+
+	if ( ! effective_watch->path ) {
+
+	    nreturn=-ENOMEM;
+
+	}
+
+    }
+
+    out:
+
+    return nreturn;
+
+}
+
+
+
+
+
+
 
 /* function to get a new (global) watch id 
    by just increasing the global watch counter 
@@ -124,9 +285,6 @@ unsigned long new_watchid()
 
     return watchctr;
 }
-
-
-
 
 struct effective_watch_struct *get_effective_watch()
 {
@@ -185,6 +343,7 @@ struct effective_watch_struct *get_effective_watch()
         effective_watch->inotify_id=0;
         effective_watch->backendset=0;
         effective_watch->path=NULL;
+	effective_watch->laststat=0;
 
 	if ( fromunused==1 ) res=pthread_mutex_unlock(&effective_watch->lock_mutex);
 
@@ -205,6 +364,8 @@ int unlock_effective_watches()
     return pthread_mutex_unlock(&effective_watches_mutex);
 
 }
+
+#ifdef NONEXIST_OPTION
 
 /* add effective watch to list
    important is to keep the list sorted (by path) */
@@ -280,6 +441,55 @@ void add_effective_watch_to_list(struct effective_watch_struct *effective_watch)
     res=pthread_mutex_unlock(&effective_watches_mutex);
 
 }
+
+#endif
+
+/* add effective watch to list
+   */
+
+void add_effective_watch_to_list(struct effective_watch_struct *effective_watch)
+{
+    int res;
+    struct effective_watch_struct *tmp_effective_watch;
+
+    if ( effective_watch->path ) {
+
+	logoutput("add_effective_watch_to_list: %s", effective_watch->path);
+
+    } else {
+
+	logoutput("add_effective_watch_to_list: unknown path");
+
+    }
+
+    res=pthread_mutex_lock(&effective_watches_mutex);
+
+    if ( ! eff_watches_list.first ) {
+
+	eff_watches_list.first=effective_watch;
+	effective_watch->prev=NULL;
+
+    }
+
+    if ( ! eff_watches_list.last ) {
+
+	eff_watches_list.last=effective_watch;
+	effective_watch->next=NULL;
+
+    } else {
+
+	/* add it at tail */
+
+	eff_watches_list.last->next=effective_watch;
+	effective_watch->prev=eff_watches_list.last;
+	eff_watches_list.last=effective_watch;
+
+    }
+
+    res=pthread_mutex_unlock(&effective_watches_mutex);
+
+}
+
 
 void remove_effective_watch_from_list(struct effective_watch_struct *effective_watch, unsigned char lockset)
 {
@@ -484,7 +694,7 @@ int calculate_effmask(struct effective_watch_struct *effective_watch, unsigned c
 
 int get_clientmask(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset)
 {
-    int mask=0;
+    int client_watch_mask=0;
 
     if ( effective_watch ) {
         struct watch_struct *watch=NULL;
@@ -497,7 +707,16 @@ int get_clientmask(struct effective_watch_struct *effective_watch, pid_t pid, un
 
             if ( watch->client->pid==pid ) {
 
-                mask=watch->mask;
+                client_watch_mask=watch->mask;
+                break;
+
+            }
+
+	    /* check also the tid */
+
+	    if ( belongtosameprocess(watch->client->pid, pid)==1 ) {
+
+                client_watch_mask=watch->mask;
                 break;
 
             }
@@ -510,7 +729,7 @@ int get_clientmask(struct effective_watch_struct *effective_watch, pid_t pid, un
 
     }
 
-    return mask;
+    return client_watch_mask;
 
 }
 
@@ -518,7 +737,7 @@ int get_clientmask(struct effective_watch_struct *effective_watch, pid_t pid, un
 
 unsigned long get_clientid(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset)
 {
-    unsigned long id=0;
+    unsigned long client_watch_id=0;
 
     if ( effective_watch ) {
         struct watch_struct *watch=NULL;
@@ -531,10 +750,20 @@ unsigned long get_clientid(struct effective_watch_struct *effective_watch, pid_t
 
             if ( watch->client->pid==pid ) {
 
-                id=watch->id;
+                client_watch_id=watch->client_watch_id;
                 break;
 
             }
+
+	    /* check also the tid */
+
+	    if ( belongtosameprocess(watch->client->pid, pid)==1 ) {
+
+                client_watch_id=watch->client_watch_id;
+                break;
+
+            }
+
 
             watch=watch->next_per_watch;
 
@@ -544,7 +773,7 @@ unsigned long get_clientid(struct effective_watch_struct *effective_watch, pid_t
 
     }
 
-    return id;
+    return client_watch_id;
 
 }
 
@@ -588,7 +817,7 @@ int check_for_effective_watch(char *path)
 
 /* add a new client watch to the effective watch */
 
-int add_new_client_watch(struct effective_watch_struct *effective_watch, int mask, struct client_struct *client)
+int add_new_client_watch(struct effective_watch_struct *effective_watch, int mask, int client_watch_id, struct client_struct *client)
 {
     int nreturn=0;
     struct watch_struct *watch;
@@ -616,9 +845,8 @@ int add_new_client_watch(struct effective_watch_struct *effective_watch, int mas
     watch->next_per_client=client->watches;
     client->watches=watch;
 
-    /* set the mask */
-
     watch->mask=mask;
+    watch->client_watch_id=client_watch_id;
 
     out:
 

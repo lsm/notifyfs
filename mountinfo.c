@@ -37,59 +37,117 @@
 #include <pthread.h>
 
 #include <glib.h>
-#include <mntent.h>
 
 #define LOG_LOGAREA LOG_LOGAREA_MOUNTMONITOR
 
 #include "logging.h"
 #include "epoll-utils.h"
 #include "mountinfo.h"
-#include "mountstatus.h"
+#include "utils.h"
 
-/* external function which is called after every change in mountinfo is processed 
-   possible to make this a configurable callback */
+/* internal lists to keep unused entries */
 
-extern int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_struct *removed_mounts, struct mount_list_struct *removed_mounts_keep, unsigned char doinit);
-
-
-struct mountinfo_list_struct new_mountinfo_list;
-struct mountinfo_list_struct current_mountinfo_list;
-
-struct mountinfo_entry_struct *mountinfo_list_unused=NULL;
 struct mount_entry_struct *mount_list_unused=NULL;
 
-struct mount_list_struct added_mounts;
-struct mount_list_struct removed_mounts;
-struct mount_list_struct removed_mounts_keep;
+/* added, removed and removed but to keep mount entries */
 
-pthread_mutex_t current_mounts_mutex=PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t changed_mounts_mutex=PTHREAD_MUTEX_INITIALIZER;
+struct mount_list_struct added_mounts={NULL, NULL};
+struct mount_list_struct removed_mounts={NULL, NULL};
+struct mount_list_struct removed_mounts_keep={NULL, NULL};
 
-pthread_mutex_t mountinfo_changed_mutex=PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t mountinfo_changed_cond=PTHREAD_COND_INITIALIZER;
-unsigned char mountinfo_changed=0;
+/* one global lock */
 
-pthread_mutex_t fstab_changed_mutex=PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t fstab_changed_cond=PTHREAD_COND_INITIALIZER;
-unsigned char fstab_changed=0;
+pthread_mutex_t mounts_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-struct fstab_list_struct *fstab_list_first=NULL;
-struct fstab_list_struct *fstab_list_last=NULL;
+/* callbacks */
 
-struct fstab_list_struct *fstab_list_unused=NULL;
+struct mountinfo_cb_struct mountinfo_cb={
+                                         .onupdate=NULL,
+                                         .next_in_current=NULL,
+                                         .next_in_changed=&next_mount_entry_changed, 
+                                         .lock=&lock_mountlist,
+                                         .unlock=&unlock_mountlist};
 
 struct mount_entry_struct *rootmount=NULL;
-extern struct notifyfs_entry_struct *root_entry; /*used??*/
-unsigned char firstrun=1;
 
-/*
-* compare entries 
+static unsigned char firstrun=1;
+static unsigned long long uniquectr=0; /* no need to lock, there is one thread handling this */
+static unsigned long long generation=0;
+
+void register_mountinfo_callback(unsigned char type, void *callback)
+{
+
+    if ( type==MOUNTINFO_CB_ONUPDATE ) {
+
+	mountinfo_cb.onupdate=callback;
+
+    } else if ( type==MOUNTINFO_CB_NEXT_IN_CURRENT ) {
+
+	mountinfo_cb.next_in_current=callback;
+
+    } else if ( type==MOUNTINFO_CB_NEXT_IN_CHANGED ) {
+
+	mountinfo_cb.next_in_changed=callback;
+
+    } else if ( type==MOUNTINFO_CB_LOCK ) {
+
+	mountinfo_cb.lock=callback;
+
+    } else if ( type==MOUNTINFO_CB_UNLOCK ) {
+
+	mountinfo_cb.unlock=callback;
+
+    }
+
+}
+
+void run_callback_onupdate(unsigned char firstrun)
+{
+
+    if ( mountinfo_cb.onupdate ) {
+
+	logoutput("run_callback_onupdate: callback defined");
+
+	(*mountinfo_cb.onupdate) (firstrun);
+
+    } else {
+
+	logoutput("run_callback_onupdate: callback not defined");
+
+    }
+
+    logoutput("run_callback_onupdate: ready");
+
+}
+
+
+unsigned long long get_uniquectr()
+{
+    return uniquectr++;
+}
+
+unsigned long long generation_id()
+{
+    return generation;
+}
+
+void increase_generation_id()
+{
+    generation++;
+}
+
+
+/* compare entries 
 * if b is "bigger" then a this function returns a positive value (+1)
 * if a is "bigger" then it returns -1
 * if equal: 0
+
+  the first item to compare: mountpoint
+  the second               : mountsource
+  the third                : filesystem
 */
 
-static int compare_entries(struct mount_entry_struct *a, struct mount_entry_struct *b)
+int compare_mount_entries(struct mount_entry_struct *a, struct mount_entry_struct *b)
 {
     int nreturn=0;
 
@@ -107,71 +165,7 @@ static int compare_entries(struct mount_entry_struct *a, struct mount_entry_stru
 
 }
 
-static void init_mountinfo_entry(struct mountinfo_entry_struct *mountinfo_entry)
-{
-
-    mountinfo_entry->mount_entry=NULL;
-
-    mountinfo_entry->mountid=0;
-    mountinfo_entry->parentid=0;
-
-    mountinfo_entry->next=NULL;
-    mountinfo_entry->prev=NULL;
-    mountinfo_entry->s_next=NULL;
-    mountinfo_entry->s_prev=NULL;
-
-
-}
-
-static struct mountinfo_entry_struct *create_mountinfo_entry()
-{
-    struct mountinfo_entry_struct *mountinfo_entry;
-
-    mountinfo_entry=malloc(sizeof(struct mountinfo_entry_struct));
-
-    return mountinfo_entry;
-
-}
-
-/* note no lock required, there is one thread (main) calling this..*/
-
-static struct mountinfo_entry_struct *get_mountinfo_entry()
-{
-    struct mountinfo_entry_struct *mountinfo_entry;
-
-    if ( mountinfo_list_unused ) {
-
-        // get from list
-
-        mountinfo_entry=mountinfo_list_unused;
-        mountinfo_list_unused=mountinfo_entry->next;
-
-    } else {
-
-        mountinfo_entry=create_mountinfo_entry();
-
-    }
-
-    if ( mountinfo_entry ) init_mountinfo_entry(mountinfo_entry);
-
-    return mountinfo_entry;
-}
-
-
-static void move_to_unused_list_mountinfo(struct mountinfo_entry_struct *mountinfo_entry)
-{
-
-    mountinfo_entry->next=NULL;
-    mountinfo_entry->prev=NULL;
-    mountinfo_entry->s_prev=NULL;
-    mountinfo_entry->s_next=NULL;
-
-    mountinfo_entry->next=mountinfo_list_unused;
-    mountinfo_list_unused=mountinfo_entry;
-
-}
-
-static void init_mount_entry(struct mount_entry_struct *mount_entry)
+void init_mount_entry(struct mount_entry_struct *mount_entry)
 {
     mount_entry->mountpoint=NULL;
     memset(mount_entry->fstype, '\0', 64);
@@ -179,7 +173,7 @@ static void init_mount_entry(struct mount_entry_struct *mount_entry)
     memset(mount_entry->superoptions, '\0', 256);
     mount_entry->rootpath=NULL;
 
-    mount_entry->mountinfo_entry=NULL;
+    mount_entry->index=NULL;
 
     mount_entry->isroot=0;
     mount_entry->isbind=0;
@@ -192,15 +186,19 @@ static void init_mount_entry(struct mount_entry_struct *mount_entry)
     mount_entry->remount=0;
     mount_entry->processed=0;
 
+    mount_entry->unique=0;
+    mount_entry->generation=0;
+
     mount_entry->next=NULL;
     mount_entry->prev=NULL;
     mount_entry->parent=NULL;
 
-    mount_entry->entry=NULL;
-    mount_entry->client=NULL;
+    mount_entry->data0=NULL;
+    mount_entry->data1=NULL;
+
 }
 
-static struct mount_entry_struct *create_mount_entry()
+struct mount_entry_struct *create_mount_entry()
 {
     struct mount_entry_struct *mount_entry;
 
@@ -212,7 +210,7 @@ static struct mount_entry_struct *create_mount_entry()
 
 /* note no lock required, there is one thread calling this..*/
 
-static struct mount_entry_struct *get_mount_entry()
+struct mount_entry_struct *get_mount_entry()
 {
     struct mount_entry_struct *mount_entry;
 
@@ -234,7 +232,7 @@ static struct mount_entry_struct *get_mount_entry()
     return mount_entry;
 }
 
-static void move_to_unused_list_mount(struct mount_entry_struct *mount_entry)
+void move_to_unused_list_mount(struct mount_entry_struct *mount_entry)
 {
 
     if (mount_entry->mountpoint) {
@@ -259,66 +257,63 @@ static void move_to_unused_list_mount(struct mount_entry_struct *mount_entry)
 
 /* various utilities to get mount_entries from various lists */
 
-struct mount_entry_struct *get_next_mount_entry(struct mount_entry_struct *mount_entry, unsigned char type)
+struct mount_entry_struct *next_mount_entry_changed(struct mount_entry_struct *mount_entry, int direction, unsigned char type)
 {
     struct mount_entry_struct *mount_entry_next=NULL;
 
     if ( ! mount_entry ) {
 
-        if ( type==MOUNTENTRY_CURRENT ) {
-            struct mountinfo_entry_struct *mountinfo_entry=current_mountinfo_list.first;
+        if ( type==MOUNTENTRY_ADDED ) {
 
-            if ( mountinfo_entry ) mount_entry_next=mountinfo_entry->mount_entry;
+	    if ( direction==1 ) {
 
-        } else if ( type==MOUNTENTRY_NEW ) {
-            struct mountinfo_entry_struct *mountinfo_entry=new_mountinfo_list.first;
+        	mount_entry_next=added_mounts.first;
 
-            if ( mountinfo_entry ) mount_entry_next=mountinfo_entry->mount_entry;
+	    } else {
 
-        } else if ( type==MOUNTENTRY_ADDED ) {
+		mount_entry_next=added_mounts.last;
 
-            mount_entry_next=added_mounts.first;
+	    }
 
         } else if ( type==MOUNTENTRY_REMOVED ) {
 
-            mount_entry_next=removed_mounts.first;
+	    if ( direction==1 ) {
+
+        	mount_entry_next=removed_mounts.first;
+
+	    } else {
+
+		mount_entry_next=removed_mounts.last;
+
+	    }
 
         } else if ( type==MOUNTENTRY_REMOVED_KEEP ) {
 
-            mount_entry_next=removed_mounts_keep.first;
+	    if ( direction==1 ) {
 
-        } else if ( type==MOUNTENTRY_CURRENT_SORTED ) {
-            struct mountinfo_entry_struct *mountinfo_entry=current_mountinfo_list.s_first;
+        	mount_entry_next=removed_mounts_keep.first;
 
-            if ( mountinfo_entry ) mount_entry_next=mountinfo_entry->mount_entry;
+	    } else {
 
-        } else if ( type==MOUNTENTRY_NEW_SORTED ) {
-            struct mountinfo_entry_struct *mountinfo_entry=new_mountinfo_list.s_first;
+        	mount_entry_next=removed_mounts_keep.last;
 
-            if ( mountinfo_entry ) mount_entry_next=mountinfo_entry->mount_entry;
+	    }
 
-        } 
-
+        }
 
     } else {
 
-        if ( type==MOUNTENTRY_CURRENT || type==MOUNTENTRY_NEW ) {
-            struct mountinfo_entry_struct *mountinfo_entry=NULL;
+        if ( type==MOUNTENTRY_ADDED || type==MOUNTENTRY_REMOVED || type==MOUNTENTRY_REMOVED_KEEP ) {
 
-            mountinfo_entry=mount_entry->mountinfo_entry->next;
+	    if ( direction==1 ) {
 
-            if ( mountinfo_entry ) mount_entry_next=mountinfo_entry->mount_entry;
+        	mount_entry_next=mount_entry->next;
 
-        } else if ( type==MOUNTENTRY_CURRENT_SORTED || type==MOUNTENTRY_NEW_SORTED ) {
-            struct mountinfo_entry_struct *mountinfo_entry=NULL;
+	    } else {
 
-            mountinfo_entry=mount_entry->mountinfo_entry->s_next;
+		mount_entry_next=mount_entry->prev;
 
-            if ( mountinfo_entry ) mount_entry_next=mountinfo_entry->mount_entry;
-
-        } else if ( type==MOUNTENTRY_ADDED || type==MOUNTENTRY_REMOVED || type==MOUNTENTRY_REMOVED_KEEP ) {
-
-            mount_entry_next=mount_entry->next;
+	    }
 
         }
 
@@ -328,39 +323,235 @@ struct mount_entry_struct *get_next_mount_entry(struct mount_entry_struct *mount
 
 }
 
-
-int lock_mountlist(unsigned char type)
+struct mount_entry_struct *get_next_mount_entry(struct mount_entry_struct *mount_entry, int direction, unsigned char type)
 {
-    int res=0;
 
-    if ( type==MOUNTENTRY_REMOVED || type==MOUNTENTRY_ADDED || type==MOUNTENTRY_REMOVED_KEEP ) {
+    if ( type==MOUNTENTRY_ADDED || type==MOUNTENTRY_REMOVED || type==MOUNTENTRY_REMOVED_KEEP ) {
 
-        res=pthread_mutex_lock(&changed_mounts_mutex);
+	mount_entry=next_mount_entry_changed(mount_entry, direction, type);
 
-    } else if ( type==MOUNTENTRY_CURRENT || type==MOUNTENTRY_NEW || type==MOUNTENTRY_CURRENT_SORTED || type==MOUNTENTRY_NEW_SORTED ) {
+    } else if ( type==MOUNTENTRY_CURRENT || type==MOUNTENTRY_CURRENT_SORTED ) {
 
-        res=pthread_mutex_lock(&current_mounts_mutex);
+	if ( mountinfo_cb.next_in_current ) {
+
+	    mount_entry=(* mountinfo_cb.next_in_current) (mount_entry, direction, type);
+
+	} else {
+
+	    mount_entry=NULL;
+
+	}
 
     }
 
-    return res;
+    return mount_entry;
+
 }
 
-int unlock_mountlist(unsigned char type)
+
+int lock_mountlist()
 {
-    int res=0;
 
-    if ( type==MOUNTENTRY_REMOVED || type==MOUNTENTRY_ADDED || type==MOUNTENTRY_REMOVED_KEEP ) {
+    return pthread_mutex_lock(&mounts_mutex);
 
-        res=pthread_mutex_unlock(&changed_mounts_mutex);
+}
 
-    } else if ( type==MOUNTENTRY_CURRENT || type==MOUNTENTRY_NEW || type==MOUNTENTRY_CURRENT_SORTED || type==MOUNTENTRY_NEW_SORTED) {
+int unlock_mountlist()
+{
 
-        res=pthread_mutex_unlock(&current_mounts_mutex);
+    return pthread_mutex_unlock(&mounts_mutex);
+
+}
+
+/* adding and removing to/from a list */
+
+void add_mount_to_list(struct mount_list_struct *mount_list, struct mount_entry_struct *mount_entry)
+{
+
+    if ( ! mount_list->first ) mount_list->first=mount_entry;
+
+    if ( ! mount_list->last ) {
+
+        mount_list->last=mount_entry;
+
+    } else {
+
+        mount_list->last->next=mount_entry;
+        mount_entry->prev=mount_list->last;
+        mount_list->last=mount_entry;
 
     }
 
-    return res;
+}
+
+void remove_mount_from_list(struct mount_list_struct *mount_list, struct mount_entry_struct *mount_entry)
+{
+    if ( mount_entry->prev ) mount_entry->prev->next=mount_entry->next;
+    if ( mount_entry->next ) mount_entry->next->prev=mount_entry->prev;
+
+    if ( mount_entry==mount_list->last ) mount_list->last=mount_entry->prev;
+    if ( mount_entry==mount_list->first ) mount_list->first=NULL;
+
+}
+
+
+/* */
+
+void test_mounted_by_autofs(struct mount_entry_struct *mount_entry)
+{
+
+    logoutput(" path %s", mount_entry->mountpoint);
+
+    /* direct or indirect ??*/
+
+    if ( mount_entry->parent->autofs_indirect==1 ) {
+
+        /* indirect */
+
+        /* only mounted by autofs if the mountpath's do not differ too much: only one subdir */
+
+	if ( issubdirectory(mount_entry->mountpoint, mount_entry->parent->mountpoint, 0)>0 ) {
+	    char *slashfound=strrchr(mount_entry->mountpoint, '/');
+
+            if ( slashfound ) {
+
+                if ( slashfound==mount_entry->mountpoint+strlen(mount_entry->parent->mountpoint) ) {
+
+                    /* only if this mountdirectory is a subdirectory (and not deeper!) of the autofs managed mountpoint */
+
+                    logoutput("test_mounted_by_autofs: parent is autofs/indirect");
+
+                    mount_entry->autofs_mounted=1;
+
+                }
+
+            }
+
+        }
+
+    } else {
+
+        /* direct */
+
+        if ( issubdirectory(mount_entry->mountpoint, mount_entry->parent->mountpoint, 1)==1 ) {
+
+	    logoutput("test_mounted_by_autofs: parent is autofs/direct");
+
+            mount_entry->autofs_mounted=1;
+
+        }
+
+    }
+
+}
+
+unsigned char mount_is_up(struct mount_entry_struct *mount_entry)
+{
+    return ( mount_entry->status==MOUNT_STATUS_UP ) ? 1 : 0;
+}
+
+unsigned char mounted_by_autofs(struct mount_entry_struct *mount_entry)
+{
+    return ( mount_entry->autofs_mounted==1 ) ? 1 : 0;
+}
+
+void set_rootmount(struct mount_entry_struct *mount_entry)
+{
+    rootmount=mount_entry;
+}
+
+unsigned char is_rootmount(struct mount_entry_struct *mount_entry)
+{
+    if (rootmount) return (rootmount==mount_entry) ? 1 : 0;
+
+    return 0;
+}
+
+struct mount_entry_struct *get_rootmount()
+{
+    return rootmount;
+}
+
+unsigned char rootmount_isset()
+{
+    return (rootmount) ? 1 : 0;
+}
+
+/* function which returns the mount entry where the entry pointed to by path
+   is part of */
+
+struct mount_entry_struct *get_mount(char *path)
+{
+    int res=0;
+    struct mount_entry_struct *mount_entry=NULL, *me_loop;
+
+    res=lock_mountlist();
+
+    mount_entry=get_rootmount();
+
+    /* check trivial case */
+
+    if ( strcmp(path, "/")==0 ) goto unlock;
+
+    /* the callback to walk through current mounts sorted should be set */
+
+    if ( ! mountinfo_cb.next_in_current ) goto unlock;
+
+    me_loop=(* mountinfo_cb.next_in_current) (NULL, 1, MOUNTENTRY_CURRENT_SORTED);
+
+    while (me_loop) {
+
+	if ( strcmp(me_loop->mountpoint, "/")==0 ) {
+
+	    /* everything is a subdirectory of root... it will mess things up
+               ignore it */
+
+	    goto next;
+
+	}
+
+	if ( g_strcmp0(me_loop->mountpoint, path)>0 ) {
+
+	    /* mountpoint is bigger: no chance path is a subdirectory AND
+               the rest of the list - since it's sorted this way - also,
+               so it's safe to stop here..*/
+
+	    break;
+
+	}
+
+	/* test path is a subdirectory of mountpoint (and the maybe the same) */
+
+	res=issubdirectory(path, me_loop->mountpoint, 1);
+
+	if ( res==1 ) {
+
+	    /* paths are the same, take that one */
+
+	    mount_entry=me_loop;
+	    break;
+
+	} else if ( res==2 ) {
+
+	    /* subdirectory, the best match so far, so take that one, but not stop
+               there maybe better still  */
+
+	    mount_entry=me_loop;
+
+	}
+
+	next:
+
+	me_loop=(* mountinfo_cb.next_in_current) (me_loop, 1, MOUNTENTRY_CURRENT_SORTED);;
+
+    }
+
+    unlock:
+
+    res=unlock_mountlist();
+
+    return mount_entry;
+
 }
 
 void logoutput_list(unsigned char type, unsigned char lockset)
@@ -368,21 +559,17 @@ void logoutput_list(unsigned char type, unsigned char lockset)
     int res=0;
     struct mount_entry_struct *mount_entry=NULL;
 
-    if (lockset==0) res=lock_mountlist(type);
+    if (lockset==0) res=lock_mountlist();
 
     if ( res==0 ) {
 
-        mount_entry=get_next_mount_entry(NULL, type);
+        mount_entry=get_next_mount_entry(NULL, 1, type);
 
         if ( mount_entry ) {
 
             if ( type==MOUNTENTRY_CURRENT ) {
 
                 logoutput("Current mounts:");
-
-            } else if ( type==MOUNTENTRY_NEW ) {
-
-                logoutput("New mounts:");
 
             } else if ( type==MOUNTENTRY_ADDED ) {
 
@@ -400,10 +587,6 @@ void logoutput_list(unsigned char type, unsigned char lockset)
 
                 logoutput("Current mounts sorted:");
 
-            } else if ( type==MOUNTENTRY_NEW_SORTED ) {
-
-                logoutput("New mounts sorted:");
-
             }
 
 
@@ -412,10 +595,6 @@ void logoutput_list(unsigned char type, unsigned char lockset)
             if ( type==MOUNTENTRY_CURRENT ) {
 
                 logoutput("No current mounts.");
-
-            } else if ( type==MOUNTENTRY_NEW ) {
-
-                logoutput("No new mounts.");
 
             } else if ( type==MOUNTENTRY_ADDED ) {
 
@@ -432,10 +611,6 @@ void logoutput_list(unsigned char type, unsigned char lockset)
             } else if ( type==MOUNTENTRY_CURRENT_SORTED ) {
 
                 logoutput("No current mounts sorted.");
-
-            } else if ( type==MOUNTENTRY_NEW_SORTED ) {
-
-                logoutput("No new mounts sorted.");
 
             } 
 
@@ -457,7 +632,7 @@ void logoutput_list(unsigned char type, unsigned char lockset)
 
             }
 
-            mount_entry=get_next_mount_entry(mount_entry, type);
+            mount_entry=get_next_mount_entry(mount_entry, 1, type);
 
         }
 
@@ -466,852 +641,3 @@ void logoutput_list(unsigned char type, unsigned char lockset)
     if (lockset==0) res=unlock_mountlist(type);
 
 }
-
-/* adding and removing to/from a list */
-
-static void add_mount_to_list(struct mount_list_struct *mount_list, struct mount_entry_struct *mount_entry)
-{
-
-    if ( ! mount_list->first ) mount_list->first=mount_entry;
-
-    if ( ! mount_list->last ) {
-
-        mount_list->last=mount_entry;
-
-    } else {
-
-        mount_list->last->next=mount_entry;
-        mount_entry->prev=mount_list->last;
-        mount_list->last=mount_entry;
-
-    }
-
-}
-
-static void remove_mount_from_list(struct mount_list_struct *mount_list, struct mount_entry_struct *mount_entry)
-{
-    if ( mount_entry->prev ) mount_entry->prev->next=mount_entry->next;
-    if ( mount_entry->next ) mount_entry->next->prev=mount_entry->prev;
-
-    if ( mount_entry==mount_list->last ) mount_list->last=mount_entry->prev;
-    if ( mount_entry==mount_list->first ) mount_list->first=NULL;
-
-}
-
-
-
-int get_new_mount_list(struct mountinfo_list_struct *mi_list)
-{
-    char line[PATH_MAX];
-    FILE *fp;
-    int mountid, parentid, major, minor;
-    char encoded_rootpath[PATH_MAX], encoded_mountpoint[PATH_MAX];
-    char fstype[64], mountsource[64], superoptions[256];
-    char *mountpoint, *sep, *rootpath;
-    struct mount_entry_struct *mount_entry;
-    struct mountinfo_entry_struct *mi_entry, *mi_entry_prev;
-    int nreturn=0, difference;
-
-    logoutput("get_new_mount_list");
-
-    fp=fopen(MOUNTINFO, "r");
-
-    if ( fp ) {
-
-	while ( ! feof(fp) ) {
-
-            memset(line, '\0', PATH_MAX);
-
-	    if ( fgets(line, PATH_MAX, fp)==NULL ) continue;
-
-            if ( strlen(line)==0 ) continue;
-
-	    if ( sscanf(line, "%i %i %i:%i %s %s", &mountid, &parentid, &major, &minor, encoded_rootpath, encoded_mountpoint) != 6 ) {
-
-                printf("error sscanf\n");
-		continue;
-
-	    }
-
-            mountpoint=g_strcompress(encoded_mountpoint);
-            rootpath=g_strcompress(encoded_rootpath);
-
-            sep=strstr(line, " - ");
-
-            if ( ! sep ) continue;
-
-            if ( sscanf(sep+3, "%s %s %s", fstype, mountsource, superoptions) != 3 ) continue;
-
-
-            /* get a new mountinfo_entry */
-
-            mi_entry=get_mountinfo_entry();
-
-            if ( ! mi_entry ) continue;
-
-            mi_entry->mountid=mountid;
-            mi_entry->parentid=parentid;
-
-            /* add mountinfo_entry to list */
-
-            mi_entry->next=NULL;
-            mi_entry->prev=NULL;
-
-            if ( ! mi_list->first ) mi_list->first=mi_entry;
-
-            if ( ! mi_list->last ) {
-
-                mi_list->last=mi_entry;
-
-            } else {
-
-                mi_list->last->next=mi_entry;
-                mi_entry->prev=mi_list->last;
-                mi_list->last=mi_entry;
-
-            }
-
-            /* get a new mount_entry */
-
-            mount_entry=get_mount_entry();
-
-            if ( ! mount_entry ) continue;
-
-            mi_entry->mount_entry=mount_entry;
-            mount_entry->mountinfo_entry=mi_entry;
-
-            mount_entry->mountpoint=mountpoint;
-            mount_entry->rootpath=rootpath;
-            strcpy(mount_entry->fstype, fstype);
-            strcpy(mount_entry->mountsource, mountsource);
-            strcpy(mount_entry->superoptions, superoptions);
-            mount_entry->major=major;
-            mount_entry->minor=minor;
-
-            /* when not / this is the source of the bind mount */
-
-            if ( strcmp(rootpath, "/") != 0 ) mount_entry->isbind=1;
-
-            if ( strcmp(fstype, "autofs")==0 ) {
-
-                mount_entry->isautofs=1;
-                mount_entry->autofs_indirect=0;
-
-                if ( strstr(superoptions, "indirect") ) mount_entry->autofs_indirect=1;
-
-            }
-
-            if ( parentid==1 ) {
-
-                /* this mount_entry is always the first in mountinfo file
-                   so there are other ways possible, but it works */
-
-		if ( ! rootmount ) rootmount=mount_entry;
-
-                mount_entry->isroot=1;
-
-            }
-
-            /* insert in sorted by using bubblesort (=walking back, compare and move if necessary) */
-
-            if ( ! mi_list->s_first ) mi_list->s_first=mi_entry;
-
-            if ( ! mi_list->s_last ) {
-
-                mi_list->s_last=mi_entry;
-
-            } else {
-
-                /* walk back starting at the last and compare */
-
-                mi_entry_prev=mi_list->s_last;
-
-                while(1) {
-
-                    difference=compare_entries(mi_entry_prev->mount_entry, mi_entry->mount_entry);
-
-                    if ( difference>0 ) {
-
-                        if ( mi_entry_prev->s_prev ) {
-
-                            mi_entry_prev=mi_entry_prev->s_prev;
-
-                        } else {
-
-                            /* there is no prev: at the first */
-
-                            break;
-
-                        }
-
-                    } else {
-
-                        /* not bigger */
-
-                        break;
-
-                    }
-
-                }
-
-                if ( difference>0 ) {
-
-                    /* at the first (and still bigger): insert at begin */
-
-                    mi_entry->s_next=mi_entry_prev;
-                    mi_entry_prev->s_prev=mi_entry;
-
-                    mi_entry->s_prev=NULL;
-                    mi_list->s_first=mi_entry;
-
-                } else {
-
-                    if ( mi_entry_prev!=mi_list->s_last) {
-
-                        /* insert mount_entry AFTER mi_entry_prev */
-
-                        mi_entry->s_prev=mi_entry_prev;
-                        mi_entry->s_next=mi_entry_prev->s_next;
-
-                        mi_entry_prev->s_next->s_prev=mi_entry;
-                        mi_entry_prev->s_next=mi_entry;
-
-                    } else {
-
-                        /* no bigger: just add */
-
-                        mi_entry->s_prev=mi_list->s_last;
-                        mi_list->s_last->s_next=mi_entry;
-
-                        mi_entry->s_next=NULL;
-                        mi_list->s_last=mi_entry;
-
-                    }
-
-                }
-
-            }
-
-        }
-
-        fclose(fp);
-
-    }
-
-    logoutput("get_new_mount_list return: %i", nreturn);
-
-    return nreturn;
-
-}
-/* */
-
-void test_mounted_by_autofs(struct mount_entry_struct *mount_entry)
-{
-
-    logoutput(" path %s", mount_entry->mountpoint);
-
-    /* direct or indirect */
-
-    if ( mount_entry->parent->autofs_indirect==1 ) {
-        int nlen1=0, nlen2=0;
-        const char *mountpoint1, *mountpoint2;
-
-        /* indirect */
-
-        /* only mounted by autofs if the mountpath's do not differ too much: only one subdir */
-
-        mountpoint1=(const char *)mount_entry->parent->mountpoint;
-        mountpoint2=(const char *)mount_entry->mountpoint;
-
-        nlen1=strlen(mountpoint1);
-        nlen2=strlen(mountpoint2);
-
-        if ( nlen2>nlen1 ) {
-
-            if ( strncmp(mountpoint2, mountpoint1, nlen1)==0 ) {
-
-                if ( strncmp(mountpoint2+nlen1, "/", 1)==0 ) {
-
-                    char *slashfound=strrchr(mountpoint2, '/');
-
-                    if ( slashfound ) {
-
-                        if ( slashfound==mountpoint2+nlen1 ) {
-
-                            /* only if this mountdirectory is a subdirectory (and not deeper!) of the autofs managed mountpoint */
-
-                            logoutput("test_mounted_by_autofs: parent is autofs/indirect");
-
-                            mount_entry->autofs_mounted=1;
-
-                        }
-
-                    }
-
-                }
-
-            }
-
-        }
-
-    } else {
-        const char *mountpoint1, *mountpoint2;
-
-        /* direct */
-
-        mountpoint1=(const char *)mount_entry->parent->mountpoint;
-        mountpoint2=(const char *)mount_entry->mountpoint;
-
-        if ( strcmp(mountpoint1, mountpoint2)==0 ) {
-
-	    logoutput("test_mounted_by_autofs: parent is autofs/direct");
-
-            mount_entry->autofs_mounted=1;
-
-        }
-
-    }
-
-}
-
-void set_parents_raw(struct mountinfo_list_struct *mi_list)
-{
-    struct mountinfo_entry_struct *mi_entry, *mi_entry_tmp;
-    struct mount_entry_struct *mount_entry;
-
-    if ( ! mi_list ) mi_list=&current_mountinfo_list;
-
-    mi_entry=mi_list->first;
-
-    if ( mi_entry ) {
-
-        mi_entry=mi_entry->next;
-
-        while (mi_entry) {
-
-            mount_entry=mi_entry->mount_entry;
-            mount_entry->parent=NULL;
-            mi_entry_tmp=mi_entry->prev;
-
-            while (mi_entry_tmp) {
-
-                if ( mi_entry_tmp->mountid==mi_entry->parentid ) {
-
-                    mount_entry->parent=mi_entry_tmp->mount_entry;
-
-                    break;
-
-                } else if ( mi_entry_tmp->parentid==mi_entry->parentid ) {
-
-                    mount_entry->parent=mi_entry_tmp->mount_entry->parent;
-
-                    break;
-
-                }
-
-                mi_entry_tmp=mi_entry_tmp->prev;
-
-            }
-
-            if ( mount_entry->parent ) {
-
-                /* test it's mounted by the autofs */
-
-                mount_entry->autofs_mounted=0;
-
-                if ( mount_entry->parent->isautofs==1 && mount_entry->isautofs==0 ) test_mounted_by_autofs(mount_entry);
-
-            }
-
-            mi_entry=mi_entry->next;
-
-        }
-
-    }
-
-}
-
-void set_parents_added(struct mount_list_struct *mount_list)
-{
-    struct mountinfo_entry_struct *mi_entry, *mi_entry_tmp;
-    struct mount_entry_struct *mount_entry;
-
-    if ( ! mount_list ) mount_list=&added_mounts;
-
-    mount_entry=mount_list->first;
-
-    while(mount_entry) {
-
-        mi_entry=mount_entry->mountinfo_entry;
-        mount_entry->parent=NULL;
-
-        if ( mi_entry ) {
-
-            mi_entry_tmp=mi_entry->prev;
-
-            while(mi_entry_tmp) {
-
-                if (mi_entry_tmp->mountid==mi_entry->parentid) {
-
-                    mount_entry->parent=mi_entry_tmp->mount_entry;
-
-                    break;
-
-                } else if (mi_entry_tmp->parentid==mi_entry->parentid) {
-
-                    mount_entry->parent=mi_entry_tmp->mount_entry->parent;
-
-                    break;
-
-                }
-
-                mi_entry_tmp=mi_entry_tmp->prev;
-
-            }
-
-        }
-
-	mount_entry->autofs_mounted=0;
-
-        if ( mount_entry->parent ) {
-
-            /* test it's mounted by the autofs */
-
-            if ( mount_entry->parent->isautofs==1 && mount_entry->isautofs==0 ) test_mounted_by_autofs(mount_entry);
-
-        }
-
-	if ( mount_entry->autofs_mounted==1 ) {
-
-	    logoutput("mount_entry %s is mounted by autofs", mount_entry->mountpoint);
-
-	}
-
-        mount_entry=mount_entry->next;
-
-    }
-
-}
-
-
-/* function which is called after a change is notified on the mountinfo "file"
-  the purpose is to find out what has changed
-
-  the output is returned via the parameters *mounts, *added_mounts and *removed_mounts:
-. *mounts point to the current mount entries, where the next is pointed to by the next/prev fields
-. *added_mounts point to the added mount entries, which is a subset of the current mount entries list
-  the next in this list is pointed to by the changed_next/changed_prev fields
-. *removed_mounts point to the removed mount entries, which is a subset of the previes mount entries list
-  also here the next and prev in this group are pointed to by the changed_next/changed_prev fields
-
-*/
-
-static void handle_change_mounttable()
-{
-    struct mount_entry_struct *mount_entry;
-    struct mountinfo_entry_struct *mi_entry, *mi_entry_2remove, *mi_entry_new, *mi_entry_tmp1, *mi_entry_tmp2;
-    int nreturn=0, res;
-    unsigned char doinit=0;
-
-    /* start loop to wait for a change */
-
-    while(1) {
-
-        res=pthread_mutex_lock(&mountinfo_changed_mutex);
-
-        while(mountinfo_changed==0) {
-
-            res=pthread_cond_wait(&mountinfo_changed_cond, &mountinfo_changed_mutex);
-
-	    if ( mountinfo_changed==2 ) doinit=1;
-
-        }
-
-        mountinfo_changed=0;
-
-        res=pthread_mutex_unlock(&mountinfo_changed_mutex);
-
-        logoutput("handle_change_mounttable");
-
-        /* set locks to protect the mount list and changed and removed */
-
-        res=pthread_mutex_lock(&current_mounts_mutex);
-        res=pthread_mutex_lock(&changed_mounts_mutex);
-
-        /* clean old list removed mounts: move to unused */
-
-        mount_entry=removed_mounts.first;
-
-        if ( mount_entry ) {
-
-            while ( mount_entry ) {
-
-                removed_mounts.first=mount_entry->next;
-                move_to_unused_list_mount(mount_entry);
-                mount_entry=removed_mounts.first;
-
-            }
-
-        }
-
-        removed_mounts.first=NULL;
-        removed_mounts.last=NULL;
-
-        /* clean current changes, like added */
-
-        mi_entry=current_mountinfo_list.first;
-
-        while ( mi_entry ) {
-
-            mount_entry=mi_entry->mount_entry;
-
-            if ( mount_entry ) {
-
-                mount_entry->next=NULL;
-                mount_entry->prev=NULL;
-
-		mount_entry->status=MOUNT_STATUS_UP;
-
-            }
-
-            mi_entry=mi_entry->next;
-
-        }
-
-        added_mounts.first=NULL;
-        added_mounts.last=NULL;
-
-        /* from here the current list should be in current_mountinfo_list and 
-           new_mountinfo_list should be empty */
-
-        // logoutput_list(MOUNTENTRY_CURRENT, 1);
-        // logoutput_list(MOUNTENTRY_CURRENT_SORTED, 1);
-
-        /* get a new list and compare that with the old one */
-
-        nreturn=get_new_mount_list(&new_mountinfo_list);
-
-        // logoutput_list(MOUNTENTRY_NEW, 1);
-        // logoutput_list(MOUNTENTRY_NEW_SORTED, 1);
-
-
-        if ( nreturn==0 ) {
-
-            /* walk through both lists and notice the differences */
-
-            mi_entry=current_mountinfo_list.s_first;
-            mi_entry_new=new_mountinfo_list.s_first;
-
-            while (1) {
-
-                mi_entry_2remove=NULL;
-
-                if ( mi_entry_new && mi_entry ) {
-
-                    res=compare_entries(mi_entry->mount_entry, mi_entry_new->mount_entry);
-
-                    // logoutput("comparing (res:%i)mount %s and %s", res, mi_entry->mount_entry->mountpoint, mi_entry_new->mount_entry->mountpoint);
-
-                } else if ( mi_entry_new && ! mi_entry ) {
-
-                    // logoutput("found new mount %s", mi_entry_new->mount_entry->mountpoint);
-
-                    res=1; 
-
-                } else if ( ! mi_entry_new && mi_entry ) {
-
-                    // logoutput("found current mount %s", mi_entry->mount_entry->mountpoint);
-
-                    res=-1;
-
-                } else {
-
-                    // logoutput("no mounts anymore to compare");
-
-                    break;
-
-                }
-
-                if ( res==0 ) {
-
-                    /* the same:
-                       - move mount_entry from current list to new list */
-
-                    mi_entry_tmp1=mi_entry_new->s_next;
-                    mi_entry_tmp2=mi_entry->s_next;
-
-                    mount_entry=mi_entry_new->mount_entry;
-                    mount_entry->mountinfo_entry=NULL;
-                    move_to_unused_list_mount(mount_entry);
-
-                    mount_entry=mi_entry->mount_entry;
-                    mount_entry->mountinfo_entry=mi_entry_new;
-                    mi_entry_new->mount_entry=mount_entry;
-                    mi_entry->mount_entry=NULL;
-
-                    /* step in both lists */
-
-                    mi_entry_2remove=mi_entry;
-
-                    mi_entry_new=mi_entry_tmp1;
-                    mi_entry=mi_entry_tmp2;
-
-                } else if ( res<0 ) {
-
-                    /* current is "smaller" then new : means removed :
-                       - insert in circular list of removed (at tail!) */
-
-                    mi_entry_tmp2=mi_entry->s_next;
-
-                    mount_entry=mi_entry->mount_entry;
-
-                    if ( mount_entry->autofs_mounted==0 ) {
-
-                        add_mount_to_list(&removed_mounts, mount_entry);
-                        mount_entry->status=MOUNT_STATUS_REMOVE;
-
-                    } else {
-
-                        add_mount_to_list(&removed_mounts_keep, mount_entry);
-                        mount_entry->status=MOUNT_STATUS_SLEEP;
-
-                    }
-
-                    mi_entry->mount_entry=NULL;
-                    mount_entry->mountinfo_entry=NULL;
-                    mount_entry->remount=0;
-                    mount_entry->processed=0;
-
-                    mi_entry_2remove=mi_entry;
-
-                    /* step in current list */
-
-                    mi_entry=mi_entry_tmp2;
-
-
-                } else if (res>0 ) {
-
-                    /* new is "smaller" then current : means added
-                       - insert in circular list of added (at tail!) */
-
-                    mi_entry_tmp1=mi_entry_new->s_next;
-
-                    mount_entry=mi_entry_new->mount_entry;
-
-                    add_mount_to_list(&added_mounts, mount_entry);
-                    mount_entry->status=MOUNT_STATUS_UP;
-
-                    /* step in new list */
-
-                    mi_entry_new=mi_entry_tmp1;
-
-                }
-
-                /* move mountinfo_entry to unused */
-
-                if ( mi_entry_2remove ) move_to_unused_list_mountinfo(mi_entry_2remove);
-
-            }
-
-
-
-            /* here: current_mountinfo_list should be empty */
-
-            current_mountinfo_list.first=new_mountinfo_list.first;
-            current_mountinfo_list.last=new_mountinfo_list.last;
-            current_mountinfo_list.s_first=new_mountinfo_list.s_first;
-            current_mountinfo_list.s_last=new_mountinfo_list.s_last;
-
-            new_mountinfo_list.first=NULL;
-            new_mountinfo_list.last=NULL;
-            new_mountinfo_list.s_first=NULL;
-            new_mountinfo_list.s_last=NULL;
-
-        }
-
-        /* set the parents: only required for the new ones */
-
-        set_parents_added(&added_mounts);
-
-        /* here replace the added mounts by those found in removed_mounts_keep */
-
-        if ( added_mounts.first && removed_mounts_keep.first ) {
-            struct mount_entry_struct *mount_entry_new, *me_tmp1, *me_tmp2;
-
-            mount_entry_new=added_mounts.first;
-            mount_entry=removed_mounts_keep.first;
-
-            while(mount_entry_new && mount_entry) {
-
-                if ( mount_entry_new->autofs_mounted==0 ) {
-
-                    /* not an fs mounted by autofs */
-
-                    mount_entry_new=mount_entry_new->next;
-                    continue;
-
-                }
-
-                res=compare_entries(mount_entry, mount_entry_new);
-
-                if ( res==0 ) {
-
-                    /* the same:
-                       move from removed_mounts_keep to added_mounts */
-
-                    me_tmp1=mount_entry->next;
-                    me_tmp2=mount_entry_new->next;
-
-                    remove_mount_from_list(&removed_mounts_keep, mount_entry);
-
-                    mount_entry->prev=mount_entry_new->prev;
-                    mount_entry->next=mount_entry_new->next;
-
-                    mount_entry->mountinfo_entry=mount_entry_new->mountinfo_entry;
-                    mount_entry->mountinfo_entry->mount_entry=mount_entry;
-                    mount_entry->remount=1;			/* dealing with a remount */
-                    mount_entry->processed=0;
-                    mount_entry->status=MOUNT_STATUS_UP; 	/* mount is up again */
-
-                    if ( added_mounts.first==mount_entry_new ) added_mounts.first=mount_entry;
-                    if ( added_mounts.last==mount_entry_new ) added_mounts.last=mount_entry;
-
-                    move_to_unused_list_mount(mount_entry_new);
-
-                    /* increase both */
-
-                    mount_entry_new=me_tmp2;
-                    mount_entry=me_tmp1;
-
-
-                } else if ( res<0 ) {
-
-                    /* increase in removed_mounts_keep */
-
-                    mount_entry=mount_entry->next;
-
-                } else if ( res>0 ) {
-
-                    /* increase in added_mounts */
-
-                    mount_entry_new=mount_entry_new->next;
-
-                }
-
-            }
-
-        }
-
-        res=pthread_mutex_unlock(&changed_mounts_mutex);
-        res=pthread_mutex_unlock(&current_mounts_mutex);
-
-        /* log based on condition */
-
-        logoutput_list(MOUNTENTRY_ADDED, 0);
-        logoutput_list(MOUNTENTRY_REMOVED, 0);
-        logoutput_list(MOUNTENTRY_REMOVED_KEEP, 0);
-
-        /* do something with the changed and the removed:
-           update the fs */
-
-        res=update_notifyfs(&added_mounts, &removed_mounts, &removed_mounts_keep, firstrun);
-
-	firstrun=0;
-
-    }
-
-}
-
-unsigned char mount_is_up(struct mount_entry_struct *mount_entry)
-{
-    unsigned char nreturn=0;
-
-    if ( mount_entry->status==MOUNT_STATUS_UP ) nreturn=1;
-
-    return nreturn;
-
-}
-
-
-unsigned char mounted_by_autofs(struct mount_entry_struct *mount_entry)
-{
-    unsigned char nreturn=0;
-
-    if ( mount_entry->autofs_mounted==1 ) nreturn=1;
-
-    return nreturn;
-
-}
-
-struct mount_entry_struct *get_rootmount()
-{
-    return rootmount;
-}
-
-int start_mountmonitor_thread(pthread_t *pthreadid)
-{
-    int nreturn=0;
-
-    nreturn=pthread_create(pthreadid, NULL, (void *) &handle_change_mounttable, NULL);
-
-    if ( nreturn==-1 ) {
-
-        nreturn=-errno;
-
-	logoutput("Error creating a thread to monitor mounts (error: %i).", abs(nreturn));
-
-
-    }
-
-    return nreturn;
-
-}
-
-void signal_mountmonitor(unsigned char doinit)
-{
-    int res;
-
-    if ( doinit==1 ) {
-
-        /* called from main: init */
-
-        current_mountinfo_list.first=NULL;
-        current_mountinfo_list.last=NULL;
-        current_mountinfo_list.s_first=NULL;
-        current_mountinfo_list.s_last=NULL;
-
-        new_mountinfo_list.first=NULL;
-        new_mountinfo_list.last=NULL;
-        new_mountinfo_list.s_first=NULL;
-        new_mountinfo_list.s_last=NULL;
-
-        added_mounts.first=NULL;
-        added_mounts.last=NULL;
-
-        removed_mounts.first=NULL;
-        removed_mounts.last=NULL;
-
-        removed_mounts_keep.first=NULL;
-        removed_mounts_keep.last=NULL;
-
-    }
-
-    res=pthread_mutex_lock(&mountinfo_changed_mutex);
-
-    if ( doinit==1 ) {
-
-	mountinfo_changed=2;
-
-    } else {
-
-	mountinfo_changed=1;
-
-    }
-
-    /* pthread_cond_signal is also possible here */
-
-    res=pthread_cond_broadcast(&mountinfo_changed_cond);
-    res=pthread_mutex_unlock(&mountinfo_changed_mutex);
-
-}
-

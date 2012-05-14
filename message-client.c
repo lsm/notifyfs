@@ -45,9 +45,9 @@
 
 #include "message.h"
 #include "message-client.h"
-#include "mountstatus.h"
+#include "mountinfo.h"
 
-static struct notifyfs_message_callbacks message_cb={NULL, NULL, NULL, NULL};
+static struct notifyfs_message_callbacks message_cb=NOTIFYFS_INIT_CB;
 
 void assign_message_callback_client(unsigned char type, void *callback)
 {

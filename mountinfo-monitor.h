@@ -1,5 +1,4 @@
 /*
-
   2010, 2011 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
@@ -17,21 +16,13 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef GENERAL_UTILS_H
-#define GENERAL_UTILS_H
 
+#ifndef MOUNTINFO_MONITOR_H
+#define MOUNTINFO_MONITOR_H
 
-// Prototypes
+#define MOUNTINFO_FILE "/proc/self/mountinfo"
 
-void unslash(char *p);
-int compare_stat_time(struct stat *ast, struct stat *bst, unsigned char ntype);
-void copy_stat(struct stat *st_to, struct stat *st_from);
-unsigned char issubdirectory(const char *path1, const char *path2, unsigned char maybethesame);
-unsigned char belongtosameprocess(pid_t process_id, pid_t thread_id);
-pid_t getprocess_id(pid_t thread_id);
-int print_mask(unsigned int mask, char *string, size_t size);
+void signal_mountmonitor();
+int start_mountmonitor(pthread_t *pthreadid, void *callback_onupdate);
 
 #endif
-
-
-

@@ -37,6 +37,7 @@ struct call_info_struct {
     struct call_info_struct *prev;
     struct mount_entry_struct *mount_entry;
     const struct fuse_ctx *ctx;
+    struct client_struct *client;
 };
 
 // Prototypes

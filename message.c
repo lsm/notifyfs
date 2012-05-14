@@ -44,7 +44,8 @@
 #include "logging.h"
 #include "client.h"
 #include "message.h"
-#include "mountstatus.h"
+#include "mountinfo.h"
+#include "utils.h"
 
 
 uint64_t uniquemessagectr=0;
@@ -116,6 +117,9 @@ int send_message(int fd, struct notifyfs_message_body *message, void *data1, int
     struct iovec io_vector[3];
     int nreturn=0;
 
+    message->lendata1=len1;
+    message->lendata2=len2;
+
     msg.msg_controllen=0;
     msg.msg_control=NULL;
 
@@ -136,7 +140,7 @@ int send_message(int fd, struct notifyfs_message_body *message, void *data1, int
 
     /* the actual sending */
 
-    nreturn=sendmsg(fd, &msg, 0);
+    nreturn=sendmsg(fd, &msg, MSG_EOR);
 
     if ( nreturn==-1 ) {
 
@@ -144,7 +148,7 @@ int send_message(int fd, struct notifyfs_message_body *message, void *data1, int
 
     }
 
-    logoutput("send_message: return %i, message size computed: %i", nreturn, test_message_size(&msg));
+    logoutput("send_message: return %i", nreturn);
 
     // free(controlbuffer);
 
@@ -160,7 +164,7 @@ int send_message(int fd, struct notifyfs_message_body *message, void *data1, int
    - remove, wake or sleep a watch
 */
 
-int send_fsevent_message(int fd, unsigned char typemessage, unsigned long id, int mask, char *path, int size)
+int send_fsevent_message(int fd, unsigned char typemessage, unsigned long id, int mask, char *path, int size, struct stat *st, unsigned char remote)
 {
     struct notifyfs_message_body message;
     int nreturn=0;
@@ -172,8 +176,26 @@ int send_fsevent_message(int fd, unsigned char typemessage, unsigned long id, in
     message.body.fsevent.mask=mask;
     message.body.fsevent.len=size;
     message.body.fsevent.unique=new_uniquectr();
+    message.body.fsevent.remote=remote;
 
-    nreturn=send_message(fd, &message, (void *) path, size, NULL, 0);
+    if ( st ) {
+
+	copy_stat(&(message.body.fsevent.st), st);
+	message.body.fsevent.statset=1;
+
+    }
+
+    if ( path ) {
+
+	/* include the trailing \0 */
+
+	nreturn=send_message(fd, &message, (void *) path, size, NULL, 0);
+
+    } else {
+
+	nreturn=send_message(fd, &message, NULL, 0, NULL, 0);
+
+    }
 
     return nreturn;
 
@@ -184,7 +206,7 @@ int send_fsevent_message(int fd, unsigned char typemessage, unsigned long id, in
 int send_setwatch_bypath_message(int fd, unsigned long id, int mask, char *path)
 {
 
-    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYPATH, id, mask, (void *)path, strlen(path));
+    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYPATH, id, mask, (void *)path, strlen(path)+1, NULL, 0);
 
 }
 
@@ -193,7 +215,7 @@ int send_setwatch_bypath_message(int fd, unsigned long id, int mask, char *path)
 int send_setwatch_byino_message(int fd, unsigned long id, int mask, unsigned long long ino)
 {
 
-    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYINO, id, mask, (void *)&ino, sizeof(unsigned long long));
+    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYINO, id, mask, (void *)&ino, sizeof(unsigned long long), NULL, 0);
 
 }
 
@@ -202,7 +224,7 @@ int send_setwatch_byino_message(int fd, unsigned long id, int mask, unsigned lon
 int send_delwatch_message(int fd, unsigned long id)
 {
 
-    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_DELWATCH, id, 0, NULL, 0);
+    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_DELWATCH, id, 0, NULL, 0, NULL, 0);
 
 }
 
@@ -211,7 +233,7 @@ int send_delwatch_message(int fd, unsigned long id)
 int send_sleepwatch_message(int fd, unsigned long id)
 {
 
-    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_SLEEPWATCH, id, 0, NULL, 0);
+    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_SLEEPWATCH, id, 0, NULL, 0, NULL, 0);
 
 }
 
@@ -220,16 +242,16 @@ int send_sleepwatch_message(int fd, unsigned long id)
 int send_wakewatch_message(int fd, unsigned long id)
 {
 
-    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_WAKEWATCH, id, 0, NULL, 0);
+    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_WAKEWATCH, id, 0, NULL, 0, NULL, 0);
 
 }
 
 /* specific function to send a notify message*/
 
-int send_notify_message(int fd, unsigned long id, int mask, char *path, int len)
+int send_notify_message(int fd, unsigned long id, int mask, char *path, int len, struct stat *st, unsigned char remote)
 {
 
-    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_DELWATCH, id, mask, (void *) path, len);
+    return send_fsevent_message(fd, NOTIFYFS_MESSAGE_FSEVENT_NOTIFY, id, mask, (void *) path, len, st, remote);
 
 }
 
@@ -283,7 +305,7 @@ int send_client_message(int fd, unsigned char typemessage, char *path, int mask)
 
     if ( path ) {
 
-	nreturn=send_message(fd, &message, (void *) path, strlen(path), NULL, 0);
+	nreturn=send_message(fd, &message, (void *) path, strlen(path)+1, NULL, 0);
 
     } else {
 
@@ -338,7 +360,7 @@ int send_mountinfo_request(int fd, const char *fstype, const char *basedir, uint
 
     if (basedir) {
 
-	nreturn=send_message(fd, &message, (void *) basedir, strlen(basedir), NULL, 0);
+	nreturn=send_message(fd, &message, (void *) basedir, strlen(basedir)+1, NULL, 0);
 
     } else {
 
@@ -404,6 +426,8 @@ int receive_preview_message(int fd, struct msghdr *msg)
     char data2[lendata2];
     ssize_t lenread;
 
+    logoutput("receive_preview_message");
+
     memset(msg, '\0', sizeof(struct msghdr));
 
     memset(messagebuffer, '\0', lendata0);
@@ -428,16 +452,36 @@ int receive_preview_message(int fd, struct msghdr *msg)
     msg->msg_name=NULL;
     msg->msg_namelen=0;
 
-    lenread=recvmsg(fd, msg, MSG_PEEK);
+    lenread=recvmsg(fd, msg, MSG_PEEK | MSG_WAITALL);
 
     if ( lenread<=0 ){
 
-	if ( lenread<0 ) {
+	/* important that the fd has the O_NONBLOCK flag set
+           otherwise the read command above will block if there is
+           no data available!
+           if it has the O_NONBLOCK flag set, it will exit with an error EAGAIN or EWOULDBLOCK
+           just catch this error here and exit */
 
-	    logoutput("receive_preview_message: error %i reading the buffer", errno);
-	    lenread=-errno;
+	if ( lenread==-1 ) {
+
+	    if ( errno==EAGAIN ) {
+
+		lenread=0;
+
+	    } else {
+
+		logoutput("receive_preview_message: error %i reading the buffer", errno);
+		lenread=-errno;
+
+	    }
 
 	}
+
+    } else {
+	struct notifyfs_message_body *message=(struct notifyfs_message_body *) msg->msg_iov[0].iov_base;
+
+	logoutput("receive_preview_message: len1: %i, len2: %i, len3: %i", msg->msg_iov[0].iov_len, msg->msg_iov[1].iov_len, msg->msg_iov[2].iov_len);
+	logoutput("receive_preview_message: type: %i", message->type);
 
     }
 
@@ -454,7 +498,6 @@ int receive_message(int fd, struct client_struct *client, struct notifyfs_messag
     int nreturn=0;
     ssize_t lenread;
 
-
     /* determine the size of the first io element: it can be of different types */
 
     msg=&bufmsg;
@@ -462,6 +505,8 @@ int receive_message(int fd, struct client_struct *client, struct notifyfs_messag
     readbuffer:
 
     lenread=receive_preview_message(fd, msg);
+
+    // lenread=read(fd, buff, lendata0);
 
     if ( lenread<=0 ){
 
@@ -476,6 +521,17 @@ int receive_message(int fd, struct client_struct *client, struct notifyfs_messag
 	int lendata0=msg->msg_iov[0].iov_len;
 	int lendata1=msg->msg_iov[1].iov_len;
 	int lendata2=msg->msg_iov[2].iov_len;
+
+	if ( msg->msg_iov[0].iov_base ) {
+	    struct notifyfs_message_body *message=(struct notifyfs_message_body *) msg->msg_iov[0].iov_base;
+
+	    /* create size just big enough, plus one for the string terminator */
+
+	    lendata1=message->lendata1;
+	    lendata2=message->lendata2;
+
+	}
+
 	char data0[lendata0];
 	char data1[lendata1];
 	char data2[lendata2];
@@ -507,11 +563,13 @@ int receive_message(int fd, struct client_struct *client, struct notifyfs_messag
 
 	/* do the real reading */
 
-	lenread=recvmsg(fd, msg, MSG_WAITALL);
+	logoutput("receive_message: read and get the message");
+
+	lenread=recvmsg(fd, msg, 0);
 
 	if ( lenread<0 ) {
 
-	    logoutput("receive_message_from_server: fd: %i, error %i", fd, errno);
+	    logoutput("receive_message: fd: %i, error %i", fd, errno);
 
 	    nreturn=-errno;
 	    goto out;
@@ -520,7 +578,7 @@ int receive_message(int fd, struct client_struct *client, struct notifyfs_messag
 	    struct notifyfs_message_body *message;
 	    unsigned char typemessage;
 
-	    logoutput("receive_message_from_server: fd: %i, %i bytes read", fd, lenread);
+	    logoutput("receive_message: fd: %i, %i bytes read", fd, lenread);
 
 	    message=(struct notifyfs_message_body *) data0;
 	    typemessage=message->type;

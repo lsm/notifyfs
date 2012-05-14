@@ -1,1 +1,0 @@
-../handlefuseevent.c

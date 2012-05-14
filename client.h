@@ -41,6 +41,7 @@ struct client_struct {
     unsigned char type;
     int fd;
     pid_t pid;
+    pid_t tid;
     uid_t uid;
     gid_t gid;
     struct client_struct *next;

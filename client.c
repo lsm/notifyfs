@@ -42,6 +42,7 @@
 #include "entry-management.h"
 #include "logging.h"
 #include "mountinfo.h"
+#include "utils.h"
 #include "client.h"
 
 
@@ -103,7 +104,12 @@ struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid
 
     client->type=NOTIFYFS_CLIENTTYPE_UNKNOWN; /* has to be set later when client sends a register message */
     client->fd=fd;
-    client->pid=pid;
+
+    /* pid maybe the tid */
+
+    client->tid=pid;
+    client->pid=0; /* not known yet, will be send later */
+
     client->uid=uid;
     client->gid=gid;
 
@@ -155,6 +161,12 @@ struct client_struct *lookup_client(pid_t pid, unsigned char lockset)
     while (client) {
 
         if ( client->pid==pid ) break;
+
+	/* if client has different threads, check these also
+           they report a different pid*/
+
+	if (belongtosameprocess(client->pid, pid)==1) break;
+
         client=client->next;
 
     }
@@ -272,13 +284,13 @@ void assign_mountpoint_clientfs(struct client_struct *client, struct mount_entry
 
 	    res=lock_mountlist(MOUNTENTRY_CURRENT);
 
-	    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_CURRENT);
+	    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_CURRENT);
 
 	    while (mount_entry) {
 
 		if ( strcmp(mount_entry->mountpoint, client->path)==0 ) break;
 
-    		mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_CURRENT);
+    		mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_CURRENT);
 
 	    }
 
@@ -292,7 +304,7 @@ void assign_mountpoint_clientfs(struct client_struct *client, struct mount_entry
 
 		res=lock_client(client);
 
-		mount_entry->client=(void *) client;
+		mount_entry->data1=(void *) client;
 		client->mount_entry=mount_entry;
 
 		logoutput("assign_mountpoint_clientfs: mount entry found, client is up and complete");
@@ -348,7 +360,7 @@ void assign_mountpoint_clientfs(struct client_struct *client, struct mount_entry
 
 		logoutput("assign_mountpoint_clientfs: client found, client is up and complete");
 
-		mount_entry->client=(void *) client;
+		mount_entry->data1=(void *) client;
 		client->mount_entry=mount_entry;
 		client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
 

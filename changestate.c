@@ -50,11 +50,11 @@
 #include "options.h"
 #include "client.h"
 #include "mountinfo.h"
-#include "mountstatus.h"
 #include "watches.h"
 
 #include "message.h"
 #include "message-server.h"
+#include "determinechanges.h"
 #include "changestate.h"
 
 #define LOG_LOGAREA LOG_LOGAREA_FILESYSTEM
@@ -69,145 +69,27 @@ struct call_info_struct *changestate_call_info_first=NULL;
 struct call_info_struct *changestate_call_info_last=NULL;
 
 
-/* 	compare two stats 
-	returns when a single difference is found...
-	possibly it does the same when comparing only the mtime and ctime values...
-	*/
-
-
-unsigned char compare_attributes(struct stat *st1, struct stat *st2)
-{
-    unsigned char statchanged=FSEVENT_FILECHANGED_NONE;
-
-    /* modification time eg file size , contents of the file, or in case of a directory, the number of entries 
-       has changed... */
-
-    if ( st1->st_mtime != st2->st_mtime ) {
-
-	statchanged|=FSEVENT_FILECHANGED_FILE;
-
-    }
-
-#ifdef  __USE_MISC
-
-    /* time defined as timespec */
-
-    if ( st1->st_mtim.tv_nsec != st2->st_mtim.tv_nsec ) {
-
-	statchanged|=FSEVENT_FILECHANGED_FILE;
-
-    }
-
-#else
-
-    if ( st1->st_mtimensec != st2->st_mtimensec ) {
-
-	statchanged|=FSEVENT_FILECHANGED_FILE;
-
-    }
-
-
-#endif
-
-
-    /* metadata changed like file owner, permissions, mode AND eventual extended attributes */
-
-    if ( st1->st_ctime != st2->st_ctime ) {
-
-	statchanged|=FSEVENT_FILECHANGED_METADATA;
-
-    }
-
-#ifdef  __USE_MISC
-
-    /* time defined as timespec */
-
-    if ( st1->st_ctim.tv_nsec != st2->st_ctim.tv_nsec ) {
-
-	statchanged|=FSEVENT_FILECHANGED_METADATA;
-
-    }
-
-#else
-
-    if ( st1->st_ctimensec != st2->st_ctimensec ) {
-
-	statchanged|=FSEVENT_FILECHANGED_METADATA;
-
-    }
-
-
-#endif
-
-
-    return statchanged;
-
-}
-
-/* function which determines and reads the changes when an event is reported 
-   20120401: only called after inotify event, todo also call at other backends
-
-   when something happens on a watch, this function reads the changes from the underlying fs and 
-   store/cache that in notifyfs, and compare that with what it has in it's cache
-   if there is a difference send a messages about that to clients....
-
-   more todo: read the xattr
-   when handling also the xattr an administration for these is also required
-
-   */
-
-
-unsigned char determinechanges(struct call_info_struct *call_info, int mask)
-{
-    int res;
-    unsigned char filechanged=FSEVENT_FILECHANGED_NONE;
-
-    if ( call_info->entry ) {
-
-	if ( ! call_info->path ) {
-
-	    res=determine_path(call_info, NOTIFYFS_PATH_FORCE);
-	    if (res<0) goto out;
-
-	}
-
-	if ( mask & IN_ATTRIB ) {
-	    struct stat st;
-	    unsigned char statchanged=FSEVENT_FILECHANGED_NONE;
-
-	    /* attributes have changed: read from underlying fs and compare */
-
-	    res=lstat(call_info->path, &st);
-
-	    statchanged=compare_attributes(&(call_info->entry->inode->st), &st);
-
-	    if ( statchanged & (FSEVENT_FILECHANGED_FILE | FSEVENT_FILECHANGED_METADATA) ) {
-
-		copy_stat(&(call_info->entry->inode->st), &st);
-
-		filechanged|=statchanged;
-
-	    }
-
-	    /* here also the xattr ?? */
-
-	}
-
-    }
-
-    out:
-
-    return filechanged;
-
-}
-
 /* function to inform waiting clients interested in a specific watch about an event
+   note:
+
+   - name is without trailing string terminator, and len is the exact len of name
+     to make this work append a terminator here
 */
 
-void send_notify_message_clients(struct effective_watch_struct *effective_watch, int mask, int len, char *name)
+void send_notify_message_clients(struct effective_watch_struct *effective_watch, int mask, int len, char *name, struct stat *st, unsigned char remote)
 {
     struct watch_struct *watch=effective_watch->watches;
     int effmask, res;
+    char stringtosend[len+1];
+
+    if ( len>0 ) {
+
+	memcpy(stringtosend, name, len);
+	stringtosend[len]='\0';
+
+    }
+
+    logoutput("send_notify_message_clients");
 
     /* walk through watches/clients attached to inode */
     /* here lock the effective watch.... */
@@ -234,7 +116,15 @@ void send_notify_message_clients(struct effective_watch_struct *effective_watch,
                     via xattr (system.inotifyfs_watchid)
                     */
 
-            	    res=send_notify_message(watch->client->fd, watch->id, mask, name, len);
+		    if ( len==0 ) {
+
+            		res=send_notify_message(watch->client->fd, watch->client_watch_id, mask, name, len, st, remote);
+
+		    } else {
+
+			res=send_notify_message(watch->client->fd, watch->client_watch_id, mask, stringtosend, len+1, st, remote);
+
+		    }
 
             	    if (res<0) logoutput0("Error (%i) sending inotify event to client on fd %i.", abs(res), watch->client->fd);
 
@@ -310,12 +200,12 @@ void send_status_message_clients(struct effective_watch_struct *effective_watch,
 
 */
 
-void sync_directory_entries(struct effective_watch_struct *effective_watch, unsigned char atinit, unsigned char lockset)
+void sync_directory_entries(char *path, struct effective_watch_struct *effective_watch, unsigned char atinit, unsigned char lockset)
 {
     DIR *dp=NULL;
     struct notifyfs_entry_struct *entry=NULL;
-    char *path;
-    int res;
+    int res, lenpath;
+    pathstring tmppath;
 
     logoutput("sync_directory_entries: directory %s", effective_watch->path);
 
@@ -324,8 +214,6 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
     if ( ! entry ) return;
 
     if ( lockset==0 ) res=lock_effective_watch(effective_watch);
-
-    path=effective_watch->path;
 
     if ( entry->child ) {
 	struct notifyfs_entry_struct *child_entry=entry->child;
@@ -339,21 +227,19 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 
     }
 
-    dp=opendir(path);
+    lenpath=strlen(path);
+
+    dp=opendir(tmppath);
 
     if ( dp ) {
 	struct dirent *de;
 	char *name;
 	struct notifyfs_entry_struct *tmpentry;
-	pathstring tmppath;
-	int lenpath=strlen(path), res, lenname=0;
+	int res, lenname=0;
 	unsigned char entrycreated=0;
 	struct stat st;
 
-	/* create a base path of this directory */
-
-	memcpy(tmppath, path, lenpath);
-	*(tmppath+lenpath)='/';
+	*(path+lenpath)='/';
 
 	while(1) {
 
@@ -378,12 +264,12 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 
 	    /* add this entry to the base path */
 
-	    memcpy(tmppath+lenpath+1, name, lenname);
-	    *(tmppath+lenpath+1+lenname)='\0';
+	    memcpy(path+lenpath+1, name, lenname);
+	    *(path+lenpath+1+lenname)='\0';
 
 	    /* read the stat */
 
-	    res=stat(tmppath, &st);
+	    res=stat(path, &st);
 
 	    if ( res==-1 ) {
 
@@ -442,9 +328,9 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 
 			}
 
-
 			if ( docompare==1 ) {
-			    unsigned char statchanged=0;
+			    unsigned char statchanged=0, changestatus=FSEVENT_FILECHANGED_NONE;
+			    int mask=0;
 
 			    /* TODO: add more checks, like xattr 
 			    note that the function compare_attributes also report 
@@ -452,15 +338,35 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 			    it does not report what, but is that a problem? 
 			    in case of a xattr changed, the name of that xattr is sufficient */
 
-			    statchanged=compare_attributes(&(tmpentry->inode->st), &st);
+			    statchanged=compare_metadata_simple(&(tmpentry->inode->st), &st);
 
-			    if ( statchanged&(FSEVENT_FILECHANGED_FILE | FSEVENT_FILECHANGED_METADATA) ) {
+			    if ( statchanged&FSEVENT_FILECHANGED_METADATA ) {
 
-				copy_stat(&(tmpentry->inode->st), &st);
+				changestatus|=FSEVENT_FILECHANGED_METADATA;
 
 				/* file and/or metadata has changed: send a message */
 
-				send_notify_message_clients(effective_watch, IN_ATTRIB, lenname, name);
+				mask|=IN_ATTRIB;
+
+			    }
+
+			    statchanged=compare_file_simple(&(tmpentry->inode->st), &st);
+
+			    if ( statchanged & FSEVENT_FILECHANGED_FILE ) {
+
+				changestatus|=FSEVENT_FILECHANGED_FILE;
+				mask|=IN_MODIFY;
+
+			    }
+
+			    if ( changestatus & ( FSEVENT_FILECHANGED_FILE | FSEVENT_FILECHANGED_METADATA ) ) {
+
+				copy_stat(&(tmpentry->inode->st), &st);
+
+				/* what caused this?? local or remote?? if local this must have been 
+                                   detected by local fsevent method, so it has to be remote */
+
+				send_notify_message_clients(effective_watch, mask, lenname, name, &st, 1);
 
 			    }
 
@@ -473,7 +379,7 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 			/* what caused this mew entry?? a move or a create?? it's not known and cannot 
 			   be determined...so just take a IN_CREATE*/
 
-			send_notify_message_clients(effective_watch, IN_CREATE, lenname, name);
+			send_notify_message_clients(effective_watch, IN_CREATE, lenname, name, &st, 1);
 
 			copy_stat(&(tmpentry->inode->st), &st);
 
@@ -492,6 +398,7 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 	}
 
 	closedir(dp);
+	*(path+lenpath)='\0';
 
     }
 
@@ -500,11 +407,9 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 
     if ( entry->child ) {
 	struct notifyfs_entry_struct *child_entry=entry->child, *next_entry;
-	pathstring tmppath;
-	int lenpath=strlen(path), lenname;
+	int lenname;
 
-	memcpy(tmppath, path, lenpath);
-	*(tmppath+lenpath)='/';
+	*(path+lenpath)='/';
 
 	while (child_entry) {
 
@@ -521,7 +426,7 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 		   it's impossible to determine what caused this, a move or a delete, so just send a 
 		   IN_DELETE */
 
-		send_notify_message_clients(effective_watch, IN_DELETE, strlen(child_entry->name), child_entry->name);
+		send_notify_message_clients(effective_watch, IN_DELETE, strlen(child_entry->name), child_entry->name, NULL, 1);
 
 		/* what if inode has watch attached: remove that too */
 
@@ -533,10 +438,10 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 		    /* add this entry to the base path */
 
 		    lenname=strlen(child_entry->name);
-		    memcpy(tmppath+lenpath+1, child_entry->name, lenname);
-		    *(tmppath+lenpath+1+lenname)='\0';
+		    memcpy(path+lenpath+1, child_entry->name, lenname);
+		    *(path+lenpath+1+lenname)='\0';
 
-		    call_info.path=tmppath;
+		    call_info.path=path;
 
 		    changestate(&call_info, FSEVENT_INODE_ACTION_REMOVE);
 
@@ -560,12 +465,13 @@ void sync_directory_entries(struct effective_watch_struct *effective_watch, unsi
 
 	}
 
+	*(path+lenpath)='\0';
+
     }
 
     if ( lockset==0 ) res=unlock_effective_watch(effective_watch);
 
 }
-
 
 void del_watch_backend(struct effective_watch_struct *effective_watch)
 {
@@ -587,8 +493,12 @@ void del_watch_backend(struct effective_watch_struct *effective_watch)
 
     }
 
-    if ( effective_watch->typebackend==FSEVENT_BACKEND_METHOD_FORWARD ) {
+    if ( effective_watch->backendset==1 ) {
 	struct client_struct *client=(struct client_struct *) effective_watch->backend;
+
+	/* client has to be defined */
+
+	if ( ! client ) return;
 
 	if ( client->mount_entry ) {
 
@@ -657,20 +567,53 @@ void del_watch_backend(struct effective_watch_struct *effective_watch)
 void set_watch_backend(struct effective_watch_struct *effective_watch, int newmask, unsigned char lockset)
 {
     int res;
+    pathstring path;
 
-    /* always set a inotify watch */
+    /* create path of this watch 
+       note the effective watch is relative to the mountpoint
+       and if it's empty it's on the mountpoint*/
 
-    logoutput("set_watch_backend: setting inotify watch on %s with mask %i", effective_watch->path, newmask);
+    if ( effective_watch->path ) {
 
-    if ( effective_watch->inotify_id==0 ) {
+	if ( is_rootmount(effective_watch->mount_entry) ) {
 
-	sync_directory_entries(effective_watch, 1, lockset);
+	    snprintf(path, PATH_MAX, "/%s", effective_watch->path);
+
+	} else {
+
+	    snprintf(path, PATH_MAX, "%s/%s", effective_watch->mount_entry->mountpoint, effective_watch->path);
+
+	}
+
+    } else {
+
+	if ( is_rootmount(effective_watch->mount_entry) ) {
+
+	    snprintf(path, PATH_MAX, "/");
+
+	} else {
+
+	    snprintf(path, PATH_MAX, "%s", effective_watch->mount_entry->mountpoint);
+
+	}
 
     }
 
-    logoutput("set_watch_backend: call inotify_add_watch on fd %i, path %s and mask %i", notifyfs_options.inotify_fd, effective_watch->path, newmask);
+    /* always set a inotify watch */
 
-    res=inotify_add_watch(notifyfs_options.inotify_fd, effective_watch->path, newmask);
+    logoutput("set_watch_backend: setting inotify watch on %s with mask %i", path, newmask);
+
+    if ( effective_watch->inotify_id==0 ) {
+
+	sync_directory_entries(path, effective_watch, 1, lockset);
+
+    }
+
+    /* by default always set a inotify watch */
+
+    logoutput("set_watch_backend: call inotify_add_watch on fd %i, path %s and mask %i", notifyfs_options.inotify_fd, path, newmask);
+
+    res=inotify_add_watch(notifyfs_options.inotify_fd, path, newmask);
 
     if ( res==-1 ) {
 
@@ -700,24 +643,23 @@ void set_watch_backend(struct effective_watch_struct *effective_watch, int newma
 
     if ( notifyfs_options.filesystems>0 ) {
 
-	if ( effective_watch->typebackend==FSEVENT_BACKEND_METHOD_FORWARD ) {
+	if ( effective_watch->backend ) {
 	    struct client_struct *client=(struct client_struct *) effective_watch->backend;
 
 	    /* here an additional check the client is indeed a fs */
 
 	    if ( client->mount_entry ) {
 
-		logoutput("set_watch_backend: set watch on %s : %li for client fd %i : pid %i : path %s : fs %s", effective_watch->path, effective_watch->backend_id, client->fd, client->pid, client->mount_entry->mountpoint, client->mount_entry->fstype);
+		logoutput("set_watch_backend: set watch on %s : %li for client fd %i : pid %i : path %s : fs %s", path, effective_watch->backend_id, client->fd, client->pid, client->mount_entry->mountpoint, client->mount_entry->fstype);
 
 	    } else {
 
-		logoutput("set_watch_backend: set watch on %s : %li for client fd %i : pid %i : path unknown : fs unknown", effective_watch->path, effective_watch->backend_id, client->fd, client->pid);
+		logoutput("set_watch_backend: set watch on %s : %li for client fd %i : pid %i : path unknown : fs unknown", path, effective_watch->backend_id, client->fd, client->pid);
 
 	    }
 
 	    if ( client->status_fs == NOTIFYFS_CLIENTSTATUS_UP ) {
 		struct mount_entry_struct *mount_entry=client->mount_entry;
-
 
 		/* forward the setting of the mask to the fs */
 
@@ -727,68 +669,49 @@ void set_watch_backend(struct effective_watch_struct *effective_watch, int newma
 
 		    effective_watch->backend_id=effective_watch->id;
 
-		    logoutput("set_watch_backend: forward watch on %s with mask %i, setting id %li", effective_watch->path, newmask, effective_watch->backend_id);
+		    logoutput("set_watch_backend: forward watch on %s with mask %i, setting id %li", path, newmask, effective_watch->backend_id);
 
 		} else {
 
 
-		    logoutput("set_watch_backend: forward watch on %s with mask %i, using id %li", effective_watch->path, newmask, effective_watch->backend_id);
+		    logoutput("set_watch_backend: forward watch on %s with mask %i, using id %li", path, newmask, effective_watch->backend_id);
 
 		}
 
-		/* make sure the effective watch is set in a subdirectory of mountpoint of fs 
-	    	   this should be the case but to be sure */
+		if ( ! effective_watch->path ) {
 
-		res=issubdirectory(effective_watch->path, mount_entry->mountpoint, 1);
+		    /* path is empty: effective_watch on mount_entry */
+
+		    logoutput("sending a message to set watch mask %i on %i/. (root of mount)", newmask, client->pid);
+
+		    res=send_setwatch_bypath_message(client->fd, effective_watch->backend_id, newmask, ".");
+
+
+		} else {
+
+		    /* effective watch is on a real subdirectory */
+
+		    logoutput("sending a message to set watch mask %i on %i/%s", newmask, client->pid, effective_watch->path);
+
+		    res=send_setwatch_bypath_message(client->fd, effective_watch->backend_id, newmask, effective_watch->path);
+
+		}
 
 		if ( res>0 ) {
-		    int lenpath=strlen(mount_entry->mountpoint);
 
-		    /* pass the path on the client fs (without the starting slash)
-                       deal with an empty path here TODO*/
+		    /* suppose there is no error here, something to do...? some ack */
 
-		    if (res==1) {
+        	    effective_watch->backendset=1;
 
-			/* paths are the same */
+		} else {
 
-			logoutput("sending a message to set watch mask %i on %i/. (root of mount)", newmask, client->pid);
+		    if ( res==0 ) {
 
-			res=send_setwatch_bypath_message(client->fd, effective_watch->backend_id, newmask, ".");
-
-
-		    } else {
-			char *pathonclientfs=NULL;
-
-			/* effective watch is on a real subdirectory */
-
-			pathonclientfs=effective_watch->path+lenpath+1;
-
-			/* send the set watch message to the client fs, with path as argument, possibly the ino ?? 
-		    	where the setting the client prefers the ino or the path ?? */
-
-			logoutput("sending a message to set watch mask %i on %i/%s", newmask, client->pid, pathonclientfs);
-
-			res=send_setwatch_bypath_message(client->fd, effective_watch->backend_id, newmask, pathonclientfs);
-
-		    }
-
-		    if ( res>0 ) {
-
-			/* suppose there is no error here, something to do...? some ack */
-
-        		effective_watch->backendset=1;
+			logoutput("set_watch_backend: error, no bytes send for watch id %li", effective_watch->backend_id);
 
 		    } else {
 
-			if ( res==0 ) {
-
-			    logoutput("set_watch_backend: error, no bytes send for watch id %li", effective_watch->backend_id);
-
-			} else {
-
-			    logoutput("set_watch_backend: error %i when sending for watch id %li", res, effective_watch->backend_id);
-
-			}
+			logoutput("set_watch_backend: error %i when sending for watch id %li", res, effective_watch->backend_id);
 
 		    }
 
@@ -798,22 +721,17 @@ void set_watch_backend(struct effective_watch_struct *effective_watch, int newma
 
 		if ( client->mount_entry ) {
 
-		    logoutput("set_watch_backend: forward watch on %s not possible: client %s is not up", effective_watch->path, client->mount_entry->fstype);
+		    logoutput("set_watch_backend: forward watch on %s not possible: client %s is not up", path, client->mount_entry->fstype);
 
 		} else {
 
-		    logoutput("set_watch_backend: forward watch on %s not possible: client (unknown) is not up", effective_watch->path);
+		    logoutput("set_watch_backend: forward watch on %s not possible: client (unknown) is not up", path);
 
 		}
 
 		effective_watch->backendset=0;
 
 	    }
-
-
-	} else {
-
-    	    logoutput("Error: backend %i not reckognized.", effective_watch->typebackend);
 
 	}
 
@@ -947,6 +865,13 @@ int changestate_effective_watch(struct notifyfs_inode_struct *inode, unsigned ch
         }
 
         if ( typeaction==WATCH_ACTION_REMOVE ) {
+
+	    if ( effective_watch->path ) {
+
+		free(effective_watch->path);
+		effective_watch->path=NULL;
+
+	    }
 
             /* remove from global list */
 
@@ -1174,6 +1099,8 @@ static void wait_in_queue_and_process(struct call_info_struct *call_info, unsign
 {
     int res;
     pathstring path;
+
+    logoutput("wait_in_queue_and_process: action %i, path %s", typeaction, call_info->path);
 
     if ( call_info != changestate_call_info_first ) {
 
@@ -1408,34 +1335,41 @@ struct notifyfs_entry_struct *create_notifyfs_path(char *path2create)
 
                     assign_inode(entry);
 
-                    /* here also a check the inode is assigned ..... */
+		    if ( entry->inode ) {
 
-                    /*  is there a function to signal kernel an inode and entry are created 
-                        like fuse_lowlevel_notify_new_inode */
+                	/*  is there a function to signal kernel an inode and entry are created 
+                    	    like fuse_lowlevel_notify_new_inode */
 
-                    add_to_inode_hash_table(entry->inode);
-                    add_to_name_hash_table(entry);
+                	add_to_inode_hash_table(entry->inode);
+                	add_to_name_hash_table(entry);
 
-		    /* maintain the directory tree */
+			/* maintain the directory tree */
 
-                    if ( entry->parent ) {
+                	if ( entry->parent ) {
 
-                        entry->dir_next=NULL;
-                        entry->dir_prev=NULL;
+                    	    entry->dir_next=NULL;
+                    	    entry->dir_prev=NULL;
 
-                        if ( entry->parent->child ) {
+                    	    if ( entry->parent->child ) {
 
-                            entry->parent->child->dir_prev=entry;
-                            entry->dir_next=entry->parent->child;
+                        	entry->parent->child->dir_prev=entry;
+                        	entry->dir_next=entry->parent->child;
 
-                        }
+                    	    }
 
-                        entry->parent->child=entry;
+                    	    entry->parent->child=entry;
 
-                    }
+                	}
 
-                    copy_stat(&(entry->inode->st), &st);
+			update_timespec(&entry->inode->laststat);
+                	copy_stat(&(entry->inode->st), &st);
 
+		    } else {
+
+			remove_entry(entry);
+			entry=NULL;
+
+		    }
 
                 } else {
 
@@ -1471,7 +1405,7 @@ struct notifyfs_entry_struct *create_notifyfs_path(char *path2create)
 
 }
 
-void create_notifyfs_mount_path(struct mount_entry_struct *mount_entry, unsigned char doinit)
+void create_notifyfs_mount_path(struct mount_entry_struct *mount_entry)
 {
     struct notifyfs_entry_struct *entry;
 
@@ -1479,7 +1413,7 @@ void create_notifyfs_mount_path(struct mount_entry_struct *mount_entry, unsigned
 
     if ( entry ) {
 
-	mount_entry->entry=(void *) entry;
+	mount_entry->data0=(void *) entry;
 	entry->mount_entry=mount_entry;
 
 	mount_entry->status=MOUNT_STATUS_UP;
@@ -1561,26 +1495,33 @@ static void send_mount_message_to_clients(struct mount_entry_struct *mount_entry
    (mountpoint, mountsource, fstype)
    */
 
-int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_struct *removed_mounts, struct mount_list_struct *removed_mounts_keep, unsigned char doinit)
+void update_notifyfs(unsigned char firstrun)
 {
     struct mount_entry_struct *mount_entry=NULL;
     struct notifyfs_entry_struct *entry;
+    struct client_struct *client;
     int nreturn=0, res;
 
     logoutput("update_notifyfs");
 
+    /* log based on condition */
+
+    logoutput_list(MOUNTENTRY_ADDED, 0);
+    logoutput_list(MOUNTENTRY_REMOVED, 0);
+    logoutput_list(MOUNTENTRY_REMOVED_KEEP, 0);
+
     /* walk through removed mounts to see it affects the fs */
 
-    res=lock_mountlist(MOUNTENTRY_REMOVED);
+    res=lock_mountlist();
 
     /* start with last: the list is sorted, bigger/longer (also submounts) mounts are first this way */
 
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_REMOVED);
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_REMOVED);
 
     while (mount_entry) {
 
 
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
+        entry=(struct notifyfs_entry_struct *) mount_entry->data0;
 
         /* if normal umount then remove the tree... 
                if umounted by autofs then set tree to sleep */
@@ -1588,8 +1529,10 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
         if ( entry ) {
             struct call_info_struct call_info;
 
+	    init_call_info(&call_info, entry);
+
             call_info.path=mount_entry->mountpoint;
-            call_info.entry=entry;
+	    call_info.mount_entry=mount_entry;
 
             /* normal umount: remove whole tree */
 
@@ -1599,20 +1542,19 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
 
 	/* if a client fs is attached: set down */
 
-	if ( mount_entry->client ) {
-	    struct client_struct *client=(struct client_struct *) mount_entry->client;
+	client=(struct client_struct *) mount_entry->data1;
+
+	if ( client ) {
 
 	    res=lock_client(client);
 
 	    if ( client->status_fs!=NOTIFYFS_CLIENTSTATUS_DOWN ) {
 
-		// logoutput("");
+		/* if not mounted anymore set the client down */
+
 		logoutput("set mount %s and attached client %i down", mount_entry->mountpoint, client->pid);
 
 		client->status_fs=NOTIFYFS_CLIENTSTATUS_DOWN;
-		client->pid=0;
-		client->uid=0;
-		client->gid=0;
 
 	    }
 
@@ -1622,24 +1564,24 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
 
 	/* send message to inform clients.. not on startup */
 
-	if ( doinit==0 ) send_mount_message_to_clients(mount_entry);
+	if ( firstrun==0 ) send_mount_message_to_clients(mount_entry);
 
-        mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_REMOVED);
+        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_REMOVED);
 
     }
 
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_REMOVED_KEEP);
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_REMOVED_KEEP);
 
     while (mount_entry) {
 
 	if ( mount_entry->processed==1 ) {
 
-	    mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_REMOVED_KEEP);
+	    mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_REMOVED_KEEP);
 	    continue;
 
 	}
 
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
+        entry=(struct notifyfs_entry_struct *) mount_entry->data0;
 
         /* if normal umount then remove the tree... 
                if umounted by autofs then set tree to sleep */
@@ -1647,8 +1589,10 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
         if ( entry ) {
             struct call_info_struct call_info;
 
+	    init_call_info(&call_info, entry);
+
             call_info.path=mount_entry->mountpoint;
-            call_info.entry=entry;
+	    call_info.mount_entry=mount_entry;
 
             changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
 
@@ -1656,13 +1600,11 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
 
 	mount_entry->processed=1;
 
-	/* if a client fs is attached, set it to sleep (and clear pid, uid, gid) */
+	client=(struct client_struct *) mount_entry->data1;
 
-	/* something like: 
-	set_status_clientfs*/
+	/* if a client fs is attached, set it to sleep */
 
-	if ( mount_entry->client ) {
-	    struct client_struct *client=(struct client_struct *) mount_entry->client;
+	if ( client ) {
 
 	    res=lock_client(client);
 
@@ -1671,9 +1613,6 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
 		logoutput("set mount %s and attached client %i to sleep", mount_entry->mountpoint, client->pid);
 
 		client->status_fs=NOTIFYFS_CLIENTSTATUS_SLEEP;
-		client->pid=0;
-		client->uid=0;
-		client->gid=0;
 
 	    }
 
@@ -1681,55 +1620,47 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
 
 	}
 
-	/* send message to inform clients.. not on startup */
+	/* send message to inform clients.. not on startup... TODO */
 
-	if ( doinit==0 ) send_mount_message_to_clients(mount_entry);
+	if ( firstrun==0 ) send_mount_message_to_clients(mount_entry);
 
-        mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_REMOVED_KEEP);
+        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_REMOVED_KEEP);
 
     }
 
-    res=unlock_mountlist(MOUNTENTRY_REMOVED);
-
     /* in any case the watches set on an autofs managed fs, get out of "sleep" mode */
 
-    res=lock_mountlist(MOUNTENTRY_ADDED);
-
-    mount_entry=get_next_mount_entry(NULL, MOUNTENTRY_ADDED);
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_ADDED);
 
     while (mount_entry) {
-        struct notifyfs_entry_struct *entry=NULL;
 
 
-	if ( strcmp(mount_entry->mountpoint, "/") == 0 ) {
-	    struct mount_entry_struct *rootmount=get_rootmount();
+	if ( is_rootmount(mount_entry) ) {
 
-	    if ( rootmount==mount_entry ) {
+	    /* link rootmount and rootentry */
 
-		/* for sure set here the root mount */
+	    if ( ! mount_entry->data0 ) {
 
-		if ( ! mount_entry->entry ) {
+		/* not already assigned */
 
-		    /* not already assigned */
+		entry=get_rootentry();
 
-		    entry=get_rootentry();
-
-		    mount_entry->entry=(void *) entry;
-		    entry->mount_entry=mount_entry;
-
-		}
-
-		goto next;
+		mount_entry->data0=(void *) entry;
+		entry->mount_entry=mount_entry;
 
 	    }
 
+	    /* root is already created */
+
+	    goto next;
+
 	}
 
-	/* match a client fs if there is one, not at init... */
+	/* match a client fs if there is one, not at init(TODO) */
 
-	if ( doinit==0 ) assign_mountpoint_clientfs(NULL, mount_entry);
+	if ( firstrun==0 ) assign_mountpoint_clientfs(NULL, mount_entry);
 
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
+        entry=(struct notifyfs_entry_struct *) mount_entry->data0;
 
         if ( entry ) {
             struct call_info_struct call_info;
@@ -1737,8 +1668,10 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
             /* entry does exist already, there is a tree already related to this mount */
             /* walk through tree and wake everything up */
 
+	    init_call_info(&call_info, entry);
+
             call_info.path=mount_entry->mountpoint;
-            call_info.entry=entry;
+	    call_info.mount_entry=mount_entry;
 
             changestate(&call_info, FSEVENT_ACTION_TREE_UP);
 
@@ -1759,23 +1692,23 @@ int update_notifyfs(struct mount_list_struct *added_mounts, struct mount_list_st
 
 	    }
 
-            create_notifyfs_mount_path(mount_entry, doinit);
+            create_notifyfs_mount_path(mount_entry);
 
         }
 
 	/* send message to inform clients.. not on startup */
 
-	if ( doinit==0 ) send_mount_message_to_clients(mount_entry);
+	if ( firstrun==0 ) send_mount_message_to_clients(mount_entry);
 
 	next:
 
-        mount_entry=get_next_mount_entry(mount_entry, MOUNTENTRY_ADDED);
+        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_ADDED);
 
     }
 
     unlock:
 
-    res=unlock_mountlist(MOUNTENTRY_ADDED);
+    res=unlock_mountlist();
 
 }
 

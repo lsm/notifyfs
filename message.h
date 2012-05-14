@@ -66,6 +66,8 @@
 
 #define NOTIFYFS_MESSAGE_MASK_MOUNT             1
 
+#define NOTIFYFS_INIT_CB	{NULL,NULL,NULL,NULL,NULL}
+
 typedef char pathstring[PATH_MAX+1];
 
 struct notifyfs_fsevent_message {
@@ -74,6 +76,9 @@ struct notifyfs_fsevent_message {
     unsigned long id;
     int mask;
     unsigned len;
+    struct stat st;
+    unsigned char statset;
+    unsigned char remote;
 };
 
 struct notifyfs_mount_message {
@@ -95,6 +100,8 @@ struct notifyfs_client_message {
     uint64_t unique;
     unsigned char type;
     int messagemask;
+    pid_t pid;
+    pid_t tid;
 };
 
 struct notifyfs_reply_message {
@@ -106,6 +113,8 @@ struct notifyfs_reply_message {
 
 struct notifyfs_message_body {
     unsigned char type;
+    int lendata1;
+    int lendata2;
     union {
 	struct notifyfs_mount_message mountinfo;
 	struct notifyfs_fsevent_message fsevent;
@@ -126,13 +135,13 @@ struct notifyfs_message_callbacks {
 
 int send_message(int fd, struct notifyfs_message_body *message, void *data1, int len1, void *data2, int len2);
 
-int send_fsevent_message(int fd, unsigned char typemessage, unsigned long id, int mask, char *path, int size);
+int send_fsevent_message(int fd, unsigned char typemessage, unsigned long id, int mask, char *path, int size, struct stat *st, unsigned char remote);
 int send_setwatch_bypath_message(int fd, unsigned long id, int mask, char *path);
 int send_setwatch_byino_message(int fd, unsigned long id, int mask, unsigned long long ino);
 int send_delwatch_message(int fd, unsigned long id);
 int send_sleepwatch_message(int fd, unsigned long id);
 int send_wakewatch_message(int fd, unsigned long id);
-int send_notify_message(int fd, unsigned long id, int mask, char *path, int len);
+int send_notify_message(int fd, unsigned long id, int mask, char *path, int len, struct stat *st, unsigned char remote);
 
 int reply_message(int fd, uint64_t unique, int nerror);
 
