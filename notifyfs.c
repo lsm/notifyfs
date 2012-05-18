@@ -3702,7 +3702,7 @@ int main(int argc, char *argv[])
 
 	/* add socket to epoll for reading */
 
-	epoll_xdata=add_to_epoll(socket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_networksocket_fd, NULL, &xdata_network);
+	epoll_xdata=add_to_epoll(networksocket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_networksocket_fd, NULL, &xdata_network);
 
 	if ( ! epoll_xdata ) {
 
@@ -3711,7 +3711,7 @@ int main(int argc, char *argv[])
 
 	} else {
 
-    	    logoutput("socket fd %i added to epoll", networksocket_fd);
+    	    logoutput("networksocket fd %i added to epoll", networksocket_fd);
 
 	    add_xdata_to_list(epoll_xdata);
 
