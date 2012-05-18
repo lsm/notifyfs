@@ -52,6 +52,9 @@ static void print_usage(const char *progname)
 	                "          [--accessmode=NR,]\n"
 	                "          [--testmode]\n"
 	                "          [--filesystems]\n"
+			"          [--forwardovernetwork]\n"
+			"          [--listennetwork]\n"
+			"          [--networkport=NR]\n"
 	                "          [--fuseoptions=STRING]\n"
 	                "          --mountpoint=PATH\n", progname);
 
@@ -83,6 +86,9 @@ static void print_help() {
     fprintf(stdout, "    --access=NUMBER            set accessmode (0=no check,1=root has access,2=check client)\n");
     fprintf(stdout, "    --testmode[=0/1]           enable testmode (1=testmode, 0=default)\n");
     fprintf(stdout, "    --filesystems[=0/1]        enable filesystems as backend (0=no filesystems, 1=default)\n");
+    fprintf(stdout, "    --forwardovernetwork[=0/1] enable forwarding of watches over network (0=no forwarding,default)\n");
+    fprintf(stdout, "    --listennetwork[=0/1]      enable on network for incoming watches (0=not listening,default)\n");
+    fprintf(stdout, "    --networkport=NR           networkport when forwarding or listening\n");
     fprintf(stdout, "    --fuseoptions=opt1,opt2,.. add extra options to fuse:\n");
     fprintf(stdout, "      auto_unmount 	    auto unmount on process termination\n");
     fprintf(stdout, "      nonempty 	    	    allow mounts over non-empty file/dir\n");
@@ -218,16 +224,19 @@ static int parsefuseoptions(struct fuse_args *notifyfs_fuse_args, char *fuseopti
 int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args)
 {
     static struct option long_options[] = {
-	{"help", optional_argument, 		0, 0},
-	{"version", optional_argument, 		0, 0},
-	{"logging", optional_argument, 		0, 0},
-	{"logarea", optional_argument, 		0, 0},
-	{"testmode", optional_argument,      	0, 0},
-	{"accessmode", optional_argument,	0, 0},
-	{"filesystems", optional_argument,	0, 0},
-	{"socket", optional_argument,		0, 0},
-	{"mountpoint", optional_argument,	0, 0},
-	{"fuseoptions", optional_argument, 	0, 0},
+	{"help", 		optional_argument, 		0, 0},
+	{"version", 		optional_argument, 		0, 0},
+	{"logging", 		optional_argument, 		0, 0},
+	{"logarea", 		optional_argument, 		0, 0},
+	{"testmode", 		optional_argument,      	0, 0},
+	{"accessmode", 		optional_argument,		0, 0},
+	{"filesystems", 	optional_argument,		0, 0},
+	{"socket", 		optional_argument,		0, 0},
+	{"mountpoint", 		optional_argument,		0, 0},
+	{"fuseoptions", 	optional_argument, 		0, 0},
+	{"networkport", 	optional_argument, 		0, 0},
+	{"forwardovernetwork", 	optional_argument, 		0, 0},
+	{"listennetwork",	optional_argument, 		0, 0},
 	{0,0,0,0}
 	};
     int res, long_options_index=0, nreturn=0;
@@ -260,6 +269,17 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
     memset(notifyfs_options.mountpoint, '\0', PATH_MAX);
 
+    /* network port */
+
+    notifyfs_options.networkport=790;
+
+    /* forward watches over network */
+
+    notifyfs_options.forwardovernetwork=0;
+
+    /* listen to incoming connections from other hosts */
+
+    notifyfs_options.listennetwork=0;
 
     /* start the fuse options with the program name, just like the normal argv */
 
@@ -461,6 +481,50 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
 		    }
 
+		} else if ( strcmp(long_options[long_options_index].name, "forwardovernetwork")==0 ) {
+
+		    if ( optarg ) {
+
+			notifyfs_options.forwardovernetwork=(atoi(optarg)>0) ? 1 : 0;
+
+		    } else {
+
+			fprintf(stderr, "Enable forwarding of watches over network.\n");
+
+			notifyfs_options.forwardovernetwork=1;
+
+		    }
+
+		} else if ( strcmp(long_options[long_options_index].name, "listennetwork")==0 ) {
+
+		    if ( optarg ) {
+
+			notifyfs_options.listennetwork=(atoi(optarg)>0) ? 1 : 0;
+
+		    } else {
+
+			fprintf(stderr, "Enable listening on network.\n");
+
+			notifyfs_options.listennetwork=1;
+
+		    }
+
+		} else if ( strcmp(long_options[long_options_index].name, "networkport")==0 ) {
+
+		    if ( optarg ) {
+
+			notifyfs_options.networkport=atoi(optarg);
+
+		    } else {
+
+			fprintf(stderr, "Warning: listening on networkport requires an argument. Cannot continue.\n");
+
+			notifyfs_options.networkport=0;
+			nreturn=-1;
+			goto out;
+
+		    }
+
 		} else if ( strcmp(long_options[long_options_index].name, "fuseoptions")==0 ) {
 
 		    if ( optarg ) {
@@ -510,6 +574,33 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 	    default:
 
 		fprintf(stdout,"Warning: getoption returned character code 0%o!\n", res);
+
+	}
+
+    }
+
+    /* check networkoptions */
+
+    if ( notifyfs_options.listennetwork==1 || notifyfs_options.forwardovernetwork==1 ) {
+
+	/* the network port must be defined (and the same for every server) */
+
+	if ( notifyfs_options.networkport==0 ) {
+
+	    fprintf(stderr, "Error: when forwarding watches over network or listening on the network a port must be set. Cannot continue.\n");
+	    nreturn=-1;
+	    goto out;
+
+	}
+
+    } else {
+
+	/* not listening and not forwarding over the network: the port doesn't have to be set 
+           when that is the case issue a warning */
+
+	if ( notifyfs_options.networkport>0 ) {
+
+	    fprintf(stderr, "Warning: when not forwarding watches over network and not listening on the network setting a networkport is useless.\n");
 
 	}
 

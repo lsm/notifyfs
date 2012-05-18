@@ -67,7 +67,9 @@ int unlock_clientslist();
 struct client_struct *get_clientslist();
 int lock_client(struct client_struct *client);
 int unlock_client(struct client_struct *client);
-void assign_mountpoint_clientfs(struct client_struct *client, struct mount_entry_struct *mount_entry);
+
+unsigned char find_and_assign_clientfs_to_mount(struct mount_entry_struct *mount_entry);
+unsigned char find_and_assign_mount_to_clientfs(struct client_struct *client);
 
 
 #endif

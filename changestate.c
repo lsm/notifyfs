@@ -51,10 +51,14 @@
 #include "client.h"
 #include "mountinfo.h"
 #include "watches.h"
+#include "epoll-utils.h"
 
 #include "message.h"
 #include "message-server.h"
 #include "determinechanges.h"
+
+#include "networksocket.h"
+#include "networkutils.h"
 #include "changestate.h"
 
 #define LOG_LOGAREA LOG_LOGAREA_FILESYSTEM
@@ -1255,7 +1259,7 @@ struct notifyfs_entry_struct *create_notifyfs_path(char *path2create)
 {
     char *path, *slash, *name;
     struct notifyfs_inode_struct *pinode; 
-    struct notifyfs_entry_struct *pentry, *entry;
+    struct notifyfs_entry_struct *pentry, *entry=NULL;
     unsigned char fullpath=0;
     int res;
     pathstring tmppath;
@@ -1414,6 +1418,8 @@ void create_notifyfs_mount_path(struct mount_entry_struct *mount_entry)
     if ( entry ) {
 
 	mount_entry->data0=(void *) entry;
+	mount_entry->typedata0=NOTIFYFS_MOUNTDATA_ENTRY;
+
 	entry->mount_entry=mount_entry;
 
 	mount_entry->status=MOUNT_STATUS_UP;
@@ -1480,6 +1486,273 @@ static void send_mount_message_to_clients(struct mount_entry_struct *mount_entry
     res=unlock_clientslist();
 
     logoutput("send_mount_message_to_clients: %i messages send for %s", nummessages, mount_entry->mountpoint);
+
+}
+
+/* function to get the value of field from options */
+
+void get_value_from_options(char *options, const char *option, char *value, int len)
+{
+    char *poption;
+
+    if ( ! options || ! option ) return;
+
+    poption=strstr(options, option);
+
+    if ( poption ) {
+	char *endoption=strchrnul(poption, ',');
+	char *issign=strchr(poption, '=');
+
+	if ( issign ) {
+
+	    if ( issign<endoption && endoption-issign < len ) {
+
+		memcpy(value, issign+1, endoption-issign-1);
+
+	    }
+
+	}
+
+    }
+
+}
+
+/* function to get remote host and information about the directory on that remote host from the mountsource 
+   with sshfs this is simple
+   it gets more difficult with cifs, mountsource is in netbios format
+   and with ...*/
+
+int determine_remotehost(struct mount_entry_struct *mount_entry, char *user, int len1, char *host, int len2, char *path, int len3)
+{
+    int nreturn=0;
+    char *fstype=mount_entry->fstype;
+    char *mountsource=mount_entry->mountsource;
+    char *options=mount_entry->superoptions;
+
+    if ( strcmp(fstype, "fuse.sshfs")==0 ) {
+	int len=strlen(mountsource);
+
+	memset(user, '\0', len1);
+	memset(host, '\0', len2);
+	memset(path, '\0', len3);
+
+	/* remote host is in mountsource */
+	/* sshfs uses the user@xxx.xxx.xxx.xxx:/path format when in ipv4
+           user is optional, which defaults to the user making the creating 
+           path is also optional, it defaults to the home directory of the user on the remote host*/
+
+	if (len>0 ) {
+	    char *separator1, *separator2;
+
+	    /* look for user part */
+
+	    separator1=strchr(mountsource, '@');
+
+	    if ( separator1 ) {
+
+		/* there is a user part */
+
+		if ( separator1-mountsource < len1 ) {
+
+		    memcpy(user, mountsource, separator1-mountsource);
+
+		} else {
+
+		    /* not enough room */
+
+		    nreturn=-ENOMEM;
+		    goto out;
+
+		}
+
+		separator1++;
+
+	    } else {
+
+		separator1=mountsource;
+
+	    }
+
+	    /* look for host part (there must be a : )*/
+
+	    separator2=strchr(separator1, ':');
+
+	    if ( separator2 ) {
+		int len;
+
+		if ( separator2-separator1<len2 ) {
+
+		    memcpy(host, separator1, separator2-separator1);
+
+		} else {
+
+		    /* not enough room */
+
+		    nreturn=-ENOMEM;
+		    goto out;
+
+		}
+
+		len=strlen(separator2+1);
+
+		if ( len>0 ) {
+
+		    /* there is a path part */
+
+		    if ( len<len3 ) {
+
+			memcpy(path, separator2+1, len);
+
+		    } else {
+
+			/* not enough room */
+
+			nreturn=-ENOMEM;
+			goto out;
+
+		    }
+
+		}
+
+	    } else {
+
+		/* error: no ":" separator */
+
+		nreturn=-EINVAL;
+		goto out;
+
+	    }
+
+	    /* if no user part: get it from options */
+
+	    if ( strlen(user)==0 ) {
+
+		get_value_from_options(options, "user_id", user, len1);
+
+	    }
+
+	}
+
+    } /* other filesystems */
+
+    out:
+
+    return nreturn;
+
+}
+
+/* isn't there a better way to deal with this?? it is already known that 
+   there is a program on this machine is running which uses a certain service and is a mounted network filesystem 
+   for now I do it this way.....
+   and maybe fuse.sshfs uses a different port....ugh*/
+
+typedef struct { const char *fstype; const char *service; } fsservicemap;
+
+const fsservicemap supportedfs[] = {{ "fuse.sshfs", "22"}};
+
+
+char *filesystem_is_supported_networkfs(struct mount_entry_struct *mount_entry)
+{
+    char *service=NULL;
+    int i;
+
+    for (i=0;i<(sizeof(supportedfs)/sizeof(supportedfs[0]));i++) {
+
+	if ( strcmp(mount_entry->fstype, supportedfs[i].fstype)==0 ) {
+
+	    service=(char *)supportedfs[i].service;
+	    break;
+
+	}
+
+    }
+
+    return service;
+
+}
+
+/* function to determine the backend of a mountpoint, if there is any */
+
+void determine_backend_mountpoint(struct mount_entry_struct *mount_entry)
+{
+
+    /* clientfs backend of mount entry is in field data1, check it's possible to forward to fs */
+
+    if ( mount_entry->typedata1==NOTIFYFS_MOUNTDATA_NOTSET ) {
+
+	/* test the fs can receive and forward */
+
+	if ( find_and_assign_clientfs_to_mount(mount_entry)==1 ) {
+
+	    logoutput("determine_backend_mountpoint: client fs found, set as backend");
+	    return;
+
+	}
+
+    }
+
+    /* other notifyfs servers are in field data2, check it's possible and required to communicate with this server */
+
+    if ( mount_entry->typedata2==NOTIFYFS_MOUNTDATA_NOTSET && notifyfs_options.forwardovernetwork==1 ) {
+
+	if ( strcmp(mount_entry->fstype, "fuse.sshfs")==0 ) {
+	    char path[PATH_MAX];
+	    char host[64]; /* guess this is enough */
+	    char user[32];
+	    int res;
+
+	    /* extract info from the mountsource, fstype and options */
+
+	    res=determine_remotehost(mount_entry, user, 32, host, 64, path, PATH_MAX);
+
+	    if (res==0 ) {
+		char *ipv4address;
+
+		/* determine the ipv4 address of the remote host, givven the hostid in the mountsource, and the port 22 
+                   note that fuse.sshfs may use another port, this is a TODO*/
+
+		ipv4address=get_ipv4address(host, "22");
+
+		if ( ipv4address ) {
+		    struct notifyfsserver_struct *notifyfsserver=NULL;
+
+		    logoutput("determine_backend_mountpoint: got ipv4 %s, user %s, path %s", ipv4address, user, path);
+
+		    /* TODO: check a notifyfsserver with this address is already connected... 
+                       otherwise try to connect to it (carefull: do not try to connect when once tried over and over every new mount */
+
+		    notifyfsserver=lookup_notifyfsserver_peripv4(ipv4address, 0);
+
+		    if ( notifyfsserver ) {
+
+			/* server found */
+
+			mount_entry->data2=(void *) notifyfsserver;
+			mount_entry->typedata2=NOTIFYFS_MOUNTDATA_REMOTESERVER;
+
+		    } else {
+
+			/* here something like try to connect to remote host */
+
+			logoutput("determine_backend_mountpoint: no remote notifyfsserver found for %s, trying to connect", ipv4address);
+
+			res=connect_to_remote_notifyfsserver(ipv4address, notifyfs_options.networkport);
+
+			/* if successfull..register the notifyfsserver...and send a register message */
+
+		    }
+
+		} else {
+
+		    logoutput("determine_backend_mountpoint: unable to get ipv4 from %s", mount_entry->mountsource);
+
+		}
+
+	    }
+
+	}
+
+    }
 
 }
 
@@ -1658,7 +1931,7 @@ void update_notifyfs(unsigned char firstrun)
 
 	/* match a client fs if there is one, not at init(TODO) */
 
-	if ( firstrun==0 ) assign_mountpoint_clientfs(NULL, mount_entry);
+	determine_backend_mountpoint(mount_entry);
 
         entry=(struct notifyfs_entry_struct *) mount_entry->data0;
 

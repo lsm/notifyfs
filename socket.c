@@ -39,13 +39,10 @@
 #include <sys/un.h>
 #include <sys/epoll.h>
 
-#include <fuse/fuse_lowlevel.h>
-
 #define LOG_LOGAREA LOG_LOGAREA_SOCKET
 
 #include "logging.h"
 #include "notifyfs.h"
-#include "entry-management.h"
 #include "epoll-utils.h"
 #include "watches.h"
 

@@ -1,4 +1,4 @@
-OBJS = utils.o options.o xattr.o client.o socket.o epoll-utils.o handlefuseevent.o entry-management.o access.o notifyfs.o mountinfo.o mountinfo-monitor.o message.o message-server.o path-resolution.o watches.o changestate.o determinechanges.o
+OBJS = utils.o options.o xattr.o client.o socket.o epoll-utils.o handlefuseevent.o entry-management.o access.o notifyfs.o mountinfo.o mountinfo-monitor.o message.o message-server.o path-resolution.o watches.o changestate.o determinechanges.o networksocket.o networkutils.o
 EXECUTABLE = notifyfs
 
 CC=gcc
@@ -30,6 +30,8 @@ access.o: access.h logging.h entry-management.h notifyfs.h path-resolution.h
 mountinfo.o: mountinfo.h logging.h global-defines.h
 mountinfo-monitor.o: mountinfo.h mountinfo-monitor.h logging.h global-defines.h
 socket.o: socket.h message.h logging.h global-defines.h notifyfs.h
+networksocket.o: networksocket.h message.h logging.h global-defines.h notifyfs.h
+networkutils.o: networkutils.h logging.h
 
 message.o: message.h logging.h global-defines.h
 message-server.o: message.h message-server.h logging.h global-defines.h

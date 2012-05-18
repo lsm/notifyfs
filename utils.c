@@ -34,10 +34,9 @@
 
 #include <sys/stat.h>
 #include <sys/param.h>
+#include <sys/types.h>
 #include <sys/inotify.h>
 #include <fcntl.h>
-
-
 
 //
 // unslash a path, remove double slashes and a trailing slash
@@ -395,3 +394,4 @@ int print_mask(unsigned int mask, char *string, size_t size)
     return pos;
 
 }
+

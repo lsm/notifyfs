@@ -60,8 +60,12 @@ struct mount_entry_struct {
     struct mount_entry_struct *next;
     struct mount_entry_struct *prev;
     struct mount_entry_struct *parent;
+    unsigned char typedata0;
     void *data0;
+    unsigned char typedata1;
     void *data1;
+    unsigned char typedata2;
+    void *data2;
 };
 
 struct mount_list_struct {

@@ -192,6 +192,16 @@ struct client_struct *get_clientslist()
     return clients_list;
 }
 
+unsigned char is_clientfs(struct client_struct *client)
+{
+    return (client->type&NOTIFYFS_CLIENTTYPE_FS) ? 1 : 0;
+}
+
+unsigned char is_clientapp(struct client_struct *client)
+{
+    return (client->type&NOTIFYFS_CLIENTTYPE_APP) ? 1 : 0;
+}
+
 
 int lock_client(struct client_struct *client)
 {
@@ -247,135 +257,123 @@ unsigned char check_client_is_running(struct client_struct *client)
 
 }
 
-/*  function which called to match a client fs and a mount entry
+/* function to look for a client fs which matches a mount 
+   this is typically called after a mount is added */
 
-    this is called when a client registers itself as client fs and
-    when a mount entry is added
-
-    it is called at both events because a client fs can send a 
-    registerfs message AFTER it's mounted
-
-*/
-
-void assign_mountpoint_clientfs(struct client_struct *client, struct mount_entry_struct *mount_entry)
+unsigned char find_and_assign_clientfs_to_mount(struct mount_entry_struct *mount_entry)
 {
     int res;
+    struct client_struct *client=NULL;
 
-    // logoutput("assign_mountpoint_clientfs: match clientfs and mount entry");
+    if ( ! mount_entry ) goto out;
 
-    if ( client ) {
+    res=lock_clientslist();
 
-	if ( ! (client->type&NOTIFYFS_CLIENTTYPE_FS) ) {
+    client=get_clientslist();
 
-	    logoutput("assign_mountpoint_clientfs: error, client set, but not a fs");
-	    return;
+    while (client) {
 
-	}
+	if ( is_clientfs(client)==0 ) {
 
-	/* the thing here is to lookup the mount_entry matching the path the client fs is mounted at */
-
-	if ( mount_entry ) {
-
-	    logoutput("assign_mountpoint_clientfs: client and mount entry both defined: error");
-
-	} else {
-
-	    // logoutput("assign_mountpoint_clientfs: lookup mount entry matching %s", client->path);
-
-	    res=lock_mountlist(MOUNTENTRY_CURRENT);
-
-	    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_CURRENT);
-
-	    while (mount_entry) {
-
-		if ( strcmp(mount_entry->mountpoint, client->path)==0 ) break;
-
-    		mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_CURRENT);
-
-	    }
-
-	    res=unlock_mountlist(MOUNTENTRY_CURRENT);
-
-	    if ( ! mount_entry ) {
-
-		logoutput("assign_mountpoint_clientfs: mount entry not found");
-
-	    } else {
-
-		res=lock_client(client);
-
-		mount_entry->data1=(void *) client;
-		client->mount_entry=mount_entry;
-
-		logoutput("assign_mountpoint_clientfs: mount entry found, client is up and complete");
-
-		client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
-
-		res=unlock_client(client);
-
-	    }
+	    client=client->next;
+	    continue;
 
 	}
 
-    } else {
+	if ( strcmp(client->path, mount_entry->mountpoint)==0 ) break;
 
-	if ( ! mount_entry ) {
-
-	    logoutput("assign_mountpoint_clientfs: client and mount entry both not defined: error");
-
-	} else {
-
-	    // logoutput("assign_mountpoint_clientfs: lookup client fs matching %s", mount_entry->mountpoint);
-
-	    res=lock_clientslist();
-
-	    client=get_clientslist();
-
-	    while (client) {
-
-		if ( ! (client->type&NOTIFYFS_CLIENTTYPE_FS) ) {
-
-		    client=client->next;
-		    continue;
-
-		}
-
-		// if ( client->status==NOTIFYFS_CLIENTSTATUS_NOTSET ) {
-
-		    /* only look at clients not up */
-
-		    if ( strcmp(client->path, mount_entry->mountpoint)==0 ) break;
-
-		//}
-
-		client=client->next;
-
-	    }
-
-	    res=unlock_clientslist();
-
-	    if ( client ) {
-
-		res=lock_client(client);
-
-		logoutput("assign_mountpoint_clientfs: client found, client is up and complete");
-
-		mount_entry->data1=(void *) client;
-		client->mount_entry=mount_entry;
-		client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
-
-		res=unlock_client(client);
-
-	    } else {
-
-		logoutput("assign_mountpoint_clientfs: client not found");
-
-	    }
-
-	}
+	client=client->next;
 
     }
 
+    res=unlock_clientslist();
+
+    if ( client ) {
+
+	res=lock_client(client);
+
+	logoutput("find_and_assign_clientfs_to_mount: client found, client is up and complete");
+
+	mount_entry->data1=(void *) client;
+	mount_entry->typedata1=NOTIFYFS_MOUNTDATA_LOCALCLIENT;
+
+	client->mount_entry=mount_entry;
+	client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
+
+	res=unlock_client(client);
+
+    } else {
+
+	logoutput("find_and_assign_clientfs_to_mount: client not found");
+
+    }
+
+    out:
+
+    return (client) ? 1 : 0;
+
 }
 
+
+
+/*  function which called to match a client fs and a mount entry
+    this is called when a client registers itself as client fs
+*/
+
+unsigned char find_and_assign_mount_to_clientfs(struct client_struct *client)
+{
+    int res;
+    struct mount_entry_struct *mount_entry=NULL;
+
+    if ( ! client ) goto out;
+
+    if ( is_clientfs(client)==0 ) {
+
+	logoutput("find_and_assign_mount_to_clientfs: error, client set, but not a fs");
+	goto out;
+
+    }
+
+    /* the thing here is to lookup the mount_entry matching the path the client fs is mounted at */
+
+    res=lock_mountlist(MOUNTENTRY_CURRENT);
+
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_CURRENT);
+
+    while (mount_entry) {
+
+	if ( strcmp(mount_entry->mountpoint, client->path)==0 ) break;
+
+	mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_CURRENT);
+
+    }
+
+    res=unlock_mountlist(MOUNTENTRY_CURRENT);
+
+    if ( ! mount_entry ) {
+
+	logoutput("find_and_assign_mount_to_clientfs: mount entry not found");
+
+    } else {
+
+	res=lock_client(client);
+
+	mount_entry->data1=(void *) client;
+	mount_entry->typedata1=NOTIFYFS_MOUNTDATA_LOCALCLIENT;
+
+	client->mount_entry=mount_entry;
+
+	logoutput("find_and_assign_mount_to_clientfs: mount entry found, client is up and complete");
+
+	client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
+
+	res=unlock_client(client);
+
+    }
+
+    out:
+
+    return (mount_entry) ? 1 : 0;
+
+}
 

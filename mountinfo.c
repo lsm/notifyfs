@@ -193,8 +193,12 @@ void init_mount_entry(struct mount_entry_struct *mount_entry)
     mount_entry->prev=NULL;
     mount_entry->parent=NULL;
 
+    mount_entry->typedata0=0;
     mount_entry->data0=NULL;
+    mount_entry->typedata1=0;
     mount_entry->data1=NULL;
+    mount_entry->typedata2=0;
+    mount_entry->data2=NULL;
 
 }
 

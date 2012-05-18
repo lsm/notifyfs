@@ -93,6 +93,8 @@ int init_watch_hashtables()
 
     }
 
+    return nreturn;
+
 }
 
 /* here some function to lookup the eff watch, given the mount entry */
@@ -160,15 +162,26 @@ struct effective_watch_struct *get_next_effective_watch(struct effective_watch_s
 
 void set_backend(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch)
 {
-    effective_watch->typebackend=FSEVENT_BACKEND_METHOD_INOTIFY; /* default */
+    unsigned char typebackend=FSEVENT_BACKEND_METHOD_NOTSET; /* default */
+
+    /* test the fs is a client fs */
 
     if ( call_info->mount_entry ) {
 	struct mount_entry_struct *mount_entry=call_info->mount_entry;
 
 	if ( mount_entry->data1 ) {
+	    struct client_struct *client=(struct client_struct *) mount_entry->data1;
 
-	    effective_watch->typebackend=FSEVENT_BACKEND_METHOD_FORWARD;
-	    effective_watch->backend=mount_entry->data1;
+	    if ( client ) {
+
+		if ( client->type&NOTIFYFS_CLIENTTYPE_FS ) {
+
+		    effective_watch->typebackend=FSEVENT_BACKEND_METHOD_FORWARD;
+		    effective_watch->backend=mount_entry->data1;
+
+		}
+
+	    }
 
 	}
 

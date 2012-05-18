@@ -37,7 +37,8 @@
 #define TYPE_FD_CLIENT                  5
 #define TYPE_FD_INOTIFY                 6
 #define TYPE_FD_MOUNTINFO               7
-#define TYPE_FD_CUSTOMMAX               8
+#define TYPE_FD_SERVER			8
+#define TYPE_FD_CUSTOMMAX               9
 
 
 /* struct to identify the fd when epoll singals activity on that fd */

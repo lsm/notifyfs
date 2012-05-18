@@ -3283,7 +3283,8 @@ void handle_client_message(struct client_struct *client,  struct notifyfs_client
 
 			client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
 			client->mount_entry=NULL;
-			assign_mountpoint_clientfs(client, NULL);
+
+			find_and_assign_mount_to_clientfs(client);
 
 		    }
 
@@ -3764,6 +3765,11 @@ int main(int argc, char *argv[])
     /* signal the mountmonitor to do the initial reading of the mounttable */
 
     signal_mountmonitor(1);
+
+    /* if configured add a network socket */
+
+    // if ( notifyfs_options.listennetwork==1 ) {
+
 
     /* add the fuse channel(=fd) to the mainloop */
 
