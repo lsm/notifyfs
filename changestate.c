@@ -1529,12 +1529,13 @@ int determine_remotehost(struct mount_entry_struct *mount_entry, char *user, int
     char *mountsource=mount_entry->mountsource;
     char *options=mount_entry->superoptions;
 
+    memset(user, '\0', len1);
+    memset(host, '\0', len2);
+    memset(path, '\0', len3);
+
+
     if ( strcmp(fstype, "fuse.sshfs")==0 ) {
 	int len=strlen(mountsource);
-
-	memset(user, '\0', len1);
-	memset(host, '\0', len2);
-	memset(path, '\0', len3);
 
 	/* remote host is in mountsource */
 	/* sshfs uses the user@xxx.xxx.xxx.xxx:/path format when in ipv4
@@ -1623,17 +1624,32 @@ int determine_remotehost(struct mount_entry_struct *mount_entry, char *user, int
 
 	    }
 
-	    /* if no user part: get it from options */
+	}
 
-	    if ( strlen(user)==0 ) {
+	/* if no user part: get it from options */
 
-		get_value_from_options(options, "user_id", user, len1);
+	if ( strlen(user)==0 ) {
 
-	    }
+	    get_value_from_options(options, "user_id", user, len1);
 
 	}
 
-    } /* other filesystems */
+    } else if ( strcmp(fstype, "cifs")==0 ) {
+	char *separator=strrchr(mountsource, '/');
+
+	if ( separator ) strcpy(path, separator+1);
+
+	/* remote "directory" is not set, but the share in SMB world. store this in stead of path */
+
+	/* remote host is in options*/
+	/* cifs stores the remote host in field addr= in options 
+           and the user in username */
+
+	get_value_from_options(options, "addr", host, len2);
+	get_value_from_options(options, "username", user, len1);
+
+    }
+
 
     out:
 
@@ -1694,61 +1710,76 @@ void determine_backend_mountpoint(struct mount_entry_struct *mount_entry)
     /* other notifyfs servers are in field data2, check it's possible and required to communicate with this server */
 
     if ( mount_entry->typedata2==NOTIFYFS_MOUNTDATA_NOTSET && notifyfs_options.forwardovernetwork==1 ) {
+	char *ipv4address=NULL;
+	char path[PATH_MAX];
+	char host[64]; /* guess this is enough */
+	char user[32];
+	int res;
 
 	if ( strcmp(mount_entry->fstype, "fuse.sshfs")==0 ) {
-	    char path[PATH_MAX];
-	    char host[64]; /* guess this is enough */
-	    char user[32];
-	    int res;
 
 	    /* extract info from the mountsource, fstype and options */
 
 	    res=determine_remotehost(mount_entry, user, 32, host, 64, path, PATH_MAX);
 
 	    if (res==0 ) {
-		char *ipv4address;
 
 		/* determine the ipv4 address of the remote host, givven the hostid in the mountsource, and the port 22 
                    note that fuse.sshfs may use another port, this is a TODO*/
 
 		ipv4address=get_ipv4address(host, "22");
 
-		if ( ipv4address ) {
-		    struct notifyfsserver_struct *notifyfsserver=NULL;
+	    }
 
-		    logoutput("determine_backend_mountpoint: got ipv4 %s, user %s, path %s", ipv4address, user, path);
+	} else if ( strcmp(mount_entry->fstype, "cifs")==0 ) {
 
-		    /* TODO: check a notifyfsserver with this address is already connected... 
-                       otherwise try to connect to it (carefull: do not try to connect when once tried over and over every new mount */
+	    /* extract info from the mountsource, fstype and options */
 
-		    notifyfsserver=lookup_notifyfsserver_peripv4(ipv4address, 0);
+	    res=determine_remotehost(mount_entry, user, 32, host, 64, path, PATH_MAX);
 
-		    if ( notifyfsserver ) {
+	    if (res==0 ) {
 
-			/* server found */
+		/* determine the ipv4 address of the remote host, givven the hostid in the mountsource, and the port 22 
+                   note that fuse.sshfs may use another port, this is a TODO*/
 
-			mount_entry->data2=(void *) notifyfsserver;
-			mount_entry->typedata2=NOTIFYFS_MOUNTDATA_REMOTESERVER;
-
-		    } else {
-
-			/* here something like try to connect to remote host */
-
-			logoutput("determine_backend_mountpoint: no remote notifyfsserver found for %s, trying to connect", ipv4address);
-
-			res=connect_to_remote_notifyfsserver(ipv4address, notifyfs_options.networkport);
-
-			/* if successfull..register the notifyfsserver...and send a register message */
-
-		    }
-
-		} else {
-
-		    logoutput("determine_backend_mountpoint: unable to get ipv4 from %s", mount_entry->mountsource);
-
-		}
+		ipv4address=get_ipv4address(host, "445");
 
 	    }
+
+	}
+
+	if ( ipv4address ) {
+	    struct notifyfsserver_struct *notifyfsserver=NULL;
+
+	    logoutput("determine_backend_mountpoint: got ipv4 %s, user %s, path %s", ipv4address, user, path);
+
+	    /* TODO: check a notifyfsserver with this address is already connected... 
+               otherwise try to connect to it (carefull: do not try to connect when once tried over and over every new mount */
+
+	    notifyfsserver=lookup_notifyfsserver_peripv4(ipv4address, 0);
+
+	    if ( notifyfsserver ) {
+
+		/* server found */
+
+		mount_entry->data2=(void *) notifyfsserver;
+		mount_entry->typedata2=NOTIFYFS_MOUNTDATA_REMOTESERVER;
+
+	    } else {
+
+		/* here something like try to connect to remote host */
+
+		logoutput("determine_backend_mountpoint: no remote notifyfsserver found for %s, trying to connect", ipv4address);
+
+		res=connect_to_remote_notifyfsserver(ipv4address, notifyfs_options.networkport);
+
+		/* if successfull..register the notifyfsserver...and send a register message */
+
+	    }
+
+	} else {
+
+	    logoutput("determine_backend_mountpoint: unable to get ipv4 from %s", mount_entry->mountsource);
 
 	}
 
