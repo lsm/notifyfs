@@ -349,7 +349,9 @@ static const INTEXTMAP inotify_textmap[] = {
             { "IN_MOVE_SELF", IN_MOVE_SELF},
             { "IN_ONLYDIR", IN_ONLYDIR},
             { "IN_DONT_FOLLOW", IN_DONT_FOLLOW},
+#ifdef IN_EXCL_UNLINK
             { "IN_EXCL_UNLINK", IN_EXCL_UNLINK},
+#endif
             { "IN_MASK_ADD", IN_MASK_ADD},
             { "IN_ISDIR", IN_ISDIR},
             { "IN_Q_OVERFLOW", IN_Q_OVERFLOW},
