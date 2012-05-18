@@ -42,6 +42,7 @@
 #define LOG_LOGAREA LOG_LOGAREA_MESSAGE
 
 #include "logging.h"
+#include "notifyfs.h"
 #include "client.h"
 #include "message.h"
 #include "mountinfo.h"

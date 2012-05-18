@@ -68,7 +68,7 @@
 
 #define NOTIFYFS_INIT_CB	{NULL,NULL,NULL,NULL,NULL}
 
-typedef char pathstring[PATH_MAX+1];
+// typedef char pathstring[PATH_MAX+1];
 
 struct notifyfs_fsevent_message {
     uint64_t unique;
