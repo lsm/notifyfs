@@ -82,6 +82,8 @@
 #include "message.h"
 #include "message-server.h"
 
+#include "networksocket.h"
+
 struct notifyfs_options_struct notifyfs_options;
 
 struct fuse_chan *notifyfs_chan;
@@ -3537,13 +3539,14 @@ int main(int argc, char *argv[])
 {
     struct fuse_args notifyfs_fuse_args = FUSE_ARGS_INIT(0, NULL);
     struct fuse_session *notifyfs_session;
-    int res, epoll_fd, socket_fd, inotify_fd, mountinfo_fd;
+    int res, epoll_fd, socket_fd, inotify_fd, mountinfo_fd, networksocket_fd;
     struct stat st;
     pthread_t threadid_mountmonitor=0;
     struct epoll_extended_data_struct *epoll_xdata=NULL;
     struct epoll_extended_data_struct xdata_inotify={0, 0, NULL, NULL, NULL, NULL};
     struct epoll_extended_data_struct xdata_socket={0, 0, NULL, NULL, NULL, NULL};
     struct epoll_extended_data_struct xdata_mountinfo={0, 0, NULL, NULL, NULL, NULL};
+    struct epoll_extended_data_struct xdata_network={0, 0, NULL, NULL, NULL, NULL};
 
 
     umask(0);
@@ -3684,6 +3687,40 @@ int main(int argc, char *argv[])
     assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_REPLY, &handle_reply_message);
     assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_MOUNTINFO_REQ, &handle_mountinfo_request);
 
+    /* listen to the network */
+
+    if ( notifyfs_options.listennetwork==1 ) {
+
+	networksocket_fd=create_networksocket(notifyfs_options.networkport);
+
+	if ( networksocket_fd<=0 ) {
+
+    	    logoutput("Error creating networksocket fd: %i.", networksocket_fd);
+    	    goto out;
+
+	}
+
+	/* add socket to epoll for reading */
+
+	epoll_xdata=add_to_epoll(socket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_networksocket_fd, NULL, &xdata_network);
+
+	if ( ! epoll_xdata ) {
+
+    	    logoutput("Error adding networksocket fd to mainloop.");
+    	    goto out;
+
+	} else {
+
+    	    logoutput("socket fd %i added to epoll", networksocket_fd);
+
+	    add_xdata_to_list(epoll_xdata);
+
+	}
+
+	notifyfs_options.networksocket_fd=networksocket_fd;
+
+    }
+
 
     /*
     *    add a inotify instance to epoll : default backend 
@@ -3794,6 +3831,16 @@ int main(int argc, char *argv[])
 	xdata_inotify.fd=0;
 	notifyfs_options.inotify_fd=0;
 	remove_xdata_from_list(&xdata_inotify);
+
+    }
+
+    if ( xdata_network.fd>0 ) {
+
+	res=remove_xdata_from_epoll(&xdata_network, 0);
+	close(xdata_network.fd);
+	xdata_network.fd=0;
+	notifyfs_options.networksocket_fd=0;
+	remove_xdata_from_list(&xdata_network);
 
     }
 
