@@ -216,6 +216,8 @@ int create_networksocket(int port)
 {
     int nreturn=0;
 
+    logoutput("create_networksocket: open networksocket for %i", port);
+
     /* add socket */
 
     networksocket_fd = socket(PF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
@@ -251,22 +253,6 @@ int create_networksocket(int port)
     if ( listen(networksocket_fd, LISTEN_BACKLOG) != 0 ) {
 
         nreturn=-errno;
-
-    } else {
-	struct epoll_extended_data_struct *server_xdata;
-	/* add to epoll */
-
-	server_xdata=add_to_epoll(networksocket_fd, EPOLLIN | EPOLLET, TYPE_FD_SERVER, &handle_data_on_networkconnection_fd, NULL, NULL);
-
-	if ( ! server_xdata ) {
-
-	    logoutput("handle_data_on_networksocket_fd: error adding server fd %i to mainloop", networksocket_fd);
-
-	} else {
-
-	    add_xdata_to_list(server_xdata);
-
-	}
 
     }
 
