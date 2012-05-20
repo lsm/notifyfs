@@ -52,7 +52,7 @@
 #include "watches.h"
 
 #include "mountinfo.h"
-#include "message-server.h"
+#include "message.h"
 
 #include "networksocket.h"
 
@@ -65,6 +65,20 @@ int networksocket_fd;
 struct notifyfsserver_struct *notifyfsserver_list=NULL;
 pthread_mutex_t notifyfsserver_list_mutex=PTHREAD_MUTEX_INITIALIZER;
 
+struct notifyfs_message_callbacks message_cb={NULL, NULL, NULL, NULL};
+
+void assign_message_callback_notifyfsserver(unsigned char type, void *callback)
+{
+
+    assign_message_callback(type, callback, &message_cb);
+
+}
+
+int receive_message_from_notifyfsserver(int fd)
+{
+    return receive_message(fd, NULL, &message_cb);
+
+}
 
 /* function to read when data arrives on a network connection fd 
    the remote site can be a server (data is fsevent) 
@@ -111,7 +125,7 @@ void handle_data_on_networkconnection_fd(struct epoll_extended_data_struct *epol
 
 	/* following reads the data (checks it versus the remote role) and does the right action */
 
-	// nlenread=receive_message_from_remote_notifyfsserver(epoll_xdata->fd, notifyfsserver);
+	nlenread=receive_message_from_notifyfsserver(epoll_xdata->fd);
 
     }
 
@@ -205,6 +219,10 @@ void handle_data_on_networksocket_fd(struct epoll_extended_data_struct *epoll_xd
 	/* add server, remote server is initiator */
 
 	register_notifyfsserver(connection_fd, 0);
+
+	/* send a message to the remote client */
+
+	/* hello remote server, please send what you want */
 
     }
 

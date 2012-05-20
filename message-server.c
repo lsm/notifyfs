@@ -50,7 +50,7 @@
 #include "message.h"
 #include "message-server.h"
 
-struct notifyfs_message_callbacks message_cb={NULL, NULL, NULL, NULL};
+static struct notifyfs_message_callbacks message_cb={NULL, NULL, NULL, NULL};
 
 void assign_message_callback_server(unsigned char type, void *callback)
 {
