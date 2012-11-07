@@ -30,6 +30,47 @@
 #define WATCH_ACTION_SLEEP      2
 #define WATCH_ACTION_WAKEUP     3
 
+#define NOTIFYFS_FSEVENT_DATANAME_LEN	255
+
+#define NOTIFYFS_FSEVENT_NOTSET					0
+#define NOTIFYFS_FSEVENT_META					1
+#define NOTIFYFS_FSEVENT_FILE					2
+#define NOTIFYFS_FSEVENT_MOVE					4
+#define NOTIFYFS_FSEVENT_ACCESS					8
+#define NOTIFYFS_FSEVENT_FS					16
+
+#define NOTIFYFS_FSEVENT_META_NOTSET				0
+#define NOTIFYFS_FSEVENT_META_ATTRIB_NOTSET			1
+#define NOTIFYFS_FSEVENT_META_ATTRIB_MODE			2
+#define NOTIFYFS_FSEVENT_META_ATTRIB_OWNER			4
+#define NOTIFYFS_FSEVENT_META_ATTRIB_GROUP			8
+#define NOTIFYFS_FSEVENT_META_ATTRIB				14
+#define NOTIFYFS_FSEVENT_META_XATTR_NOTSET			16
+#define NOTIFYFS_FSEVENT_META_XATTR_CREATE			32
+#define NOTIFYFS_FSEVENT_META_XATTR_MODIFY			64
+#define NOTIFYFS_FSEVENT_META_XATTR_DELETE			128
+#define NOTIFYFS_FSEVENT_META_XATTR				224
+
+#define NOTIFYFS_FSEVENT_FILE_NOTSET				0
+#define NOTIFYFS_FSEVENT_FILE_MODIFIED				1
+#define NOTIFYFS_FSEVENT_FILE_SIZE				2
+#define NOTIFYFS_FSEVENT_FILE_OPEN				4
+#define NOTIFYFS_FSEVENT_FILE_READ				8
+#define NOTIFYFS_FSEVENT_FILE_CLOSE_WRITE			16
+#define NOTIFYFS_FSEVENT_FILE_CLOSE_NOWRITE			32
+
+#define NOTIFYFS_FSEVENT_MOVE_NOTSET				0
+#define NOTIFYFS_FSEVENT_MOVE_CREATED				1
+#define NOTIFYFS_FSEVENT_MOVE_MOVED				2
+#define NOTIFYFS_FSEVENT_MOVE_MOVED_FROM			4
+#define NOTIFYFS_FSEVENT_MOVE_MOVED_TO				8
+#define NOTIFYFS_FSEVENT_MOVE_DELETED				16
+
+#define NOTIFYFS_FSEVENT_FS_NOTSET				0
+#define NOTIFYFS_FSEVENT_FS_MOUNT				1
+#define NOTIFYFS_FSEVENT_FS_UNMOUNT				2
+#define NOTIFYFS_FSEVENT_FS_NLINKS				4
+
 struct effective_watch_struct {
     struct notifyfs_inode_struct *inode;
     unsigned int mask;
@@ -72,6 +113,17 @@ struct watch_struct {
     struct watch_struct *prev_per_client;
 };
 
+struct notifyfs_fsevent_struct {
+    int group;
+    int type;
+    struct notifyfs_entry_struct *entry;
+    union {
+	struct stat st;
+	char name[NOTIFYFS_FSEVENT_DATANAME_LEN];
+    } data;
+};
+
+
 // Prototypes
 
 int init_watch_hashtables();
@@ -104,10 +156,17 @@ void remove_client_watch_from_client(struct watch_struct *watch);
 int check_for_effective_watch(char *path);
 
 int get_clientmask(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset);
-unsigned long get_clientid(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset);
 
-void set_backend(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch);
+// void set_backend(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch);
+
 void init_effective_watches();
 int set_mount_entry_effective_watch(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch);
+
+void set_watch_backend_os_specific(struct effective_watch_struct *effective_watch, char *path, int mask);
+void change_watch_backend_os_specific(struct effective_watch_struct *effective_watch, char *path, int mask);
+void remove_watch_backend_os_specific(struct effective_watch_struct *effective_watch);
+
+void send_notify_message_clients(struct effective_watch_struct *effective_watch, int mask, int len, char *name, struct stat *st, unsigned char remote);
+void send_status_message_clients(struct effective_watch_struct *effective_watch, unsigned char typemessage);
 
 #endif

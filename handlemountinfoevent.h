@@ -16,16 +16,14 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef NOTIFYFS_MESSAGE_SERVER_H
-#define NOTIFYFS_MESSAGE_SERVER_H
+
+#ifndef FUSE_WORKSPACE_HANDLEMOUNTINFOEVENTS_H
+#define FUSE_WORKSPACE_HANDLEMOUNTINFOEVENTS_H
+
 
 // Prototypes
 
-void assign_message_callback_server(unsigned char type, void *callback);
-
-int send_mount_message(int fd, struct mount_entry_struct *mount_entry, uint64_t unique);
-int send_fd_message(int fd, int fdtosend);
-
-int receive_message_from_client(int fd, struct client_struct *client);
+void process_mountinfo(void *data);
+int process_mountinfo_event(int fd, void *data, uint32_t events);
 
 #endif

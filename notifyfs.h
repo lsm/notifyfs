@@ -32,11 +32,6 @@ struct notifyfs_options_struct {
      int logarea;
      unsigned char accessmode;
      unsigned char testmode;
-     unsigned char filesystems;
-     unsigned char forwardovernetwork;
-     unsigned char listennetwork;
-     int networkport;
-     int networksocket_fd;
      int socket_fd;
      int inotify_fd;
      pathstring pidfile;

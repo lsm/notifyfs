@@ -31,13 +31,10 @@ struct call_info_struct {
     pthread_t threadid;
     char *path;
     unsigned char freepath;
-    void *backend;
-    unsigned char typebackend;
     struct call_info_struct *next;
     struct call_info_struct *prev;
     struct mount_entry_struct *mount_entry;
     const struct fuse_ctx *ctx;
-    struct client_struct *client;
 };
 
 // Prototypes
@@ -47,5 +44,7 @@ int determine_path(struct call_info_struct *call_info, unsigned char flags);
 struct call_info_struct *get_call_info(struct notifyfs_entry_struct *entry);
 void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_struct *entry);
 void remove_call_info(struct call_info_struct *call_info);
+
+void create_notifyfs_path(struct call_info_struct *call_info);
 
 #endif

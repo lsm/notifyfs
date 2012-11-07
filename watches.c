@@ -34,7 +34,10 @@
 #include <sys/stat.h>
 #include <sys/param.h>
 #include <sys/epoll.h>
+
+#ifdef HAVE_INOTIFY
 #include <sys/inotify.h>
+#endif
 
 #include <pthread.h>
 
@@ -49,12 +52,20 @@
 #include <fuse/fuse_lowlevel.h>
 
 #include "logging.h"
+#include "epoll-utils.h"
 #include "notifyfs.h"
 #include "entry-management.h"
 #include "path-resolution.h"
 #include "mountinfo.h"
 #include "client.h"
 #include "watches.h"
+#include "utils.h"
+
+#ifdef HAVE_INOTIFY
+#include "watches-backend-inotify.c"
+#else
+#include "watches-backend-inotify-notsup.c"
+#endif
 
 struct eff_watch_list_struct {
     struct effective_watch_struct *first;
@@ -157,38 +168,6 @@ struct effective_watch_struct *get_next_effective_watch(struct effective_watch_s
 
 }
 
-/* function to set the backend */
-/* TODO: */
-
-void set_backend(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch)
-{
-    unsigned char typebackend=FSEVENT_BACKEND_METHOD_NOTSET; /* default */
-
-    /* test the fs is a client fs */
-
-    if ( call_info->mount_entry ) {
-	struct mount_entry_struct *mount_entry=call_info->mount_entry;
-
-	if ( mount_entry->data1 ) {
-	    struct client_struct *client=(struct client_struct *) mount_entry->data1;
-
-	    if ( client ) {
-
-		if ( client->type&NOTIFYFS_CLIENTTYPE_FS ) {
-
-		    effective_watch->typebackend=FSEVENT_BACKEND_METHOD_FORWARD;
-		    effective_watch->backend=mount_entry->data1;
-
-		}
-
-	    }
-
-	}
-
-    }
-
-}
-
 /* function to set the path for the effective watch 
    this is the path relative to the mount point of the 
    fs it's on
@@ -273,10 +252,6 @@ int set_mount_entry_effective_watch(struct call_info_struct *call_info, struct e
     return nreturn;
 
 }
-
-
-
-
 
 
 
@@ -377,85 +352,6 @@ int unlock_effective_watches()
     return pthread_mutex_unlock(&effective_watches_mutex);
 
 }
-
-#ifdef NONEXIST_OPTION
-
-/* add effective watch to list
-   important is to keep the list sorted (by path) */
-
-void add_effective_watch_to_list(struct effective_watch_struct *effective_watch)
-{
-    int res;
-    struct effective_watch_struct *tmp_effective_watch;
-
-    if ( effective_watch->path ) {
-
-	logoutput("add_effective_watch_to_list: %s", effective_watch->path);
-
-    } else {
-
-	logoutput("add_effective_watch_to_list: unknown path");
-
-    }
-
-    res=pthread_mutex_lock(&effective_watches_mutex);
-
-    if ( ! eff_watches_list.first ) {
-
-	eff_watches_list.first=effective_watch;
-	effective_watch->prev=NULL;
-
-    }
-
-    if ( ! eff_watches_list.last ) {
-
-	eff_watches_list.last=effective_watch;
-	effective_watch->next=NULL;
-
-    } else {
-
-	tmp_effective_watch=eff_watches_list.first;
-	res=0;
-
-	while ( tmp_effective_watch ) {
-
-	    res=strcmp(effective_watch->path, tmp_effective_watch->path);
-
-	    if ( res<=0 ) break;
-
-	    tmp_effective_watch=tmp_effective_watch->next;
-
-	}
-
-	if ( res>0 ) {
-
-	    /* there is no bigger: add it at tail */
-
-	    eff_watches_list.last->next=effective_watch;
-	    effective_watch->prev=eff_watches_list.last;
-	    eff_watches_list.last=effective_watch;
-
-	} else {
-
-	    /* tmp_effective_watch is "bigger" : insert before tmp_effective_watch */
-
-	    if ( tmp_effective_watch->prev ) tmp_effective_watch->prev->next=effective_watch;
-	    effective_watch->prev=tmp_effective_watch->prev;
-
-	    effective_watch->next=tmp_effective_watch;
-	    tmp_effective_watch->prev=effective_watch;
-
-	    if ( eff_watches_list.first==tmp_effective_watch ) eff_watches_list.first=effective_watch;
-
-	}
-
-    }
-
-    res=pthread_mutex_unlock(&effective_watches_mutex);
-
-}
-
-#endif
 
 /* add effective watch to list
    */
@@ -584,7 +480,6 @@ struct effective_watch_struct *lookup_watch(unsigned char type, unsigned long id
 
     }
 
-
     res=pthread_mutex_unlock(&effective_watches_mutex);
 
     if ( effective_watch ) {
@@ -630,7 +525,6 @@ int unlock_effective_watch(struct effective_watch_struct *effective_watch)
     int res;
 
     res=pthread_mutex_lock(&effective_watch->lock_mutex);
-
     effective_watch->lock=0;
     res=pthread_cond_broadcast(&effective_watch->lock_condition);
     res=pthread_mutex_unlock(&effective_watch->lock_mutex);
@@ -700,93 +594,6 @@ int calculate_effmask(struct effective_watch_struct *effective_watch, unsigned c
     }
 
     return effmask;
-
-}
-
-/* get the mask per client, given the pid */
-
-int get_clientmask(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset)
-{
-    int client_watch_mask=0;
-
-    if ( effective_watch ) {
-        struct watch_struct *watch=NULL;
-
-        if ( lockset==0 ) pthread_mutex_lock(&(effective_watch->lock_mutex));
-
-        watch=effective_watch->watches;
-
-        while(watch) {
-
-            if ( watch->client->pid==pid ) {
-
-                client_watch_mask=watch->mask;
-                break;
-
-            }
-
-	    /* check also the tid */
-
-	    if ( belongtosameprocess(watch->client->pid, pid)==1 ) {
-
-                client_watch_mask=watch->mask;
-                break;
-
-            }
-
-            watch=watch->next_per_watch;
-
-        }
-
-        if ( lockset==0 ) pthread_mutex_unlock(&(effective_watch->lock_mutex));
-
-    }
-
-    return client_watch_mask;
-
-}
-
-/* get the id per client, given the pid */
-
-unsigned long get_clientid(struct effective_watch_struct *effective_watch, pid_t pid, unsigned char lockset)
-{
-    unsigned long client_watch_id=0;
-
-    if ( effective_watch ) {
-        struct watch_struct *watch=NULL;
-
-        if ( lockset==0 ) pthread_mutex_lock(&(effective_watch->lock_mutex));
-
-        watch=effective_watch->watches;
-
-        while(watch) {
-
-            if ( watch->client->pid==pid ) {
-
-                client_watch_id=watch->client_watch_id;
-                break;
-
-            }
-
-	    /* check also the tid */
-
-	    if ( belongtosameprocess(watch->client->pid, pid)==1 ) {
-
-                client_watch_id=watch->client_watch_id;
-                break;
-
-            }
-
-
-            watch=watch->next_per_watch;
-
-        }
-
-        if ( lockset==0 ) pthread_mutex_unlock(&(effective_watch->lock_mutex));
-
-    }
-
-    return client_watch_id;
 
 }
 
@@ -911,3 +718,28 @@ void remove_client_watch_from_client(struct watch_struct *watch)
 
 }
 
+void set_watch_backend_os_specific(struct effective_watch_struct *effective_watch, char *path, int mask)
+{
+    int res=set_watch_backend_inotify(effective_watch, path, mask);
+}
+
+void change_watch_backend_os_specific(struct effective_watch_struct *effective_watch, char *path, int mask)
+{
+    int res=change_watch_backend_inotify(effective_watch, path, mask);
+}
+
+
+void remove_watch_backend_os_specific(struct effective_watch_struct *effective_watch)
+{
+    remove_watch_backend_inotify(effective_watch);
+}
+
+void initialize_fsnotify_backends()
+{
+    initialize_inotify();
+}
+
+void close_fsnotify_backends()
+{
+    close_inotify();
+}

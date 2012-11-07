@@ -25,6 +25,7 @@
 #define MOUNTENTRY_REMOVED              2
 #define MOUNTENTRY_CURRENT_SORTED       3
 #define MOUNTENTRY_REMOVED_KEEP         4
+#define MOUNTENTRY_FSTAB		5
 
 #define MOUNT_STATUS_NOTSET             0
 #define MOUNT_STATUS_UP                 1
@@ -36,6 +37,11 @@
 #define MOUNTINFO_CB_NEXT_IN_CHANGED	3
 #define MOUNTINFO_CB_LOCK		4
 #define MOUNTINFO_CB_UNLOCK		5
+#define MOUNTINFO_CB_IGNOREENTRY	6
+#define MOUNTINFO_CB_FIRSTRUN		7
+
+#define MOUNTENTRY_TYPEDATA_OBJECT	1
+#define MOUNTENTRY_TYPEDATA_MOUNTDATA	2
 
 
 struct mount_entry_struct {
@@ -57,6 +63,7 @@ struct mount_entry_struct {
     unsigned char status;
     unsigned char remount;
     unsigned char processed;
+    unsigned char fstab;
     struct mount_entry_struct *next;
     struct mount_entry_struct *prev;
     struct mount_entry_struct *parent;
@@ -79,6 +86,8 @@ struct mountinfo_cb_struct {
     struct mount_entry_struct *(*next_in_changed) (struct mount_entry_struct *mount_entry, int direction, unsigned char type);
     int (*lock) ();
     int (*unlock) ();
+    unsigned char (*ignore) (char *source, char *fs, char *path);
+    void (*firstrun) ();
 };
 
 
@@ -94,6 +103,8 @@ int unlock_mountlist();
 void register_mountinfo_callback(unsigned char type, void *callback);
 void run_callback_onupdate(unsigned char firstrun);
 
+unsigned char ignore_mount_entry(char *source, char *fs, char *path);
+
 struct mount_entry_struct *next_mount_entry_changed(struct mount_entry_struct *mount_entry, int direction, unsigned char type);
 struct mount_entry_struct *get_next_mount_entry(struct mount_entry_struct *mount_entry, int direction, unsigned char type);
 
@@ -107,11 +118,15 @@ void remove_mount_from_list(struct mount_list_struct *mount_list, struct mount_e
 unsigned char mount_is_up(struct mount_entry_struct *mount_entry);
 unsigned char mounted_by_autofs(struct mount_entry_struct *mount_entry);
 struct mount_entry_struct *get_rootmount();
+
 struct mount_entry_struct *get_mount(char *path);
+struct mount_entry_struct *source_mounted(char *source);
+
 void set_rootmount(struct mount_entry_struct *mount_entry);
 unsigned char is_rootmount(struct mount_entry_struct *mount_entry);
 unsigned char rootmount_isset();
 
 void logoutput_list(unsigned char type, unsigned char lockset);
+int umount_mount_entry(struct mount_entry_struct *mount_entry);
 
 #endif

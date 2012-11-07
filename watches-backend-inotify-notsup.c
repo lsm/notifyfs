@@ -16,12 +16,27 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef NOTIFYFS_MESSAGE_CLIENT_H
-#define NOTIFYFS_MESSAGE_CKIENT_H
 
-// Prototypes
+static inline int set_watch_backend_inotify(struct effective_watch_struct *effective_watch, char *path, int mask)
+{
+    return 0;
+}
+static inline int change_watch_backend_inotify(struct effective_watch_struct *effective_watch, char *path, int mask)
+{
+    return 0;
+}
+static inline void remove_watch_backend_inotify(struct effective_watch_struct *effective_watch, char *path, int mask)
+{
+    return;
+}
 
-void assign_message_callback_client(unsigned char type, void *callback);
-int receive_message_from_server(int fd);
+static inline void initialize_inotify()
+{
+    return;
+}
 
-#endif
+static inline void close_inotify()
+{
+    return;
+
+}

@@ -228,7 +228,6 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
 
     }
 
-
     /* check the supplementary groups*/
 
     logoutput2("CHECK_ACCESS, testing group permissions (suppl)");

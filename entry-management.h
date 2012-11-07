@@ -76,10 +76,7 @@ struct notifyfs_entry_struct {
     struct notifyfs_entry_struct *name_next;
     struct notifyfs_entry_struct *name_prev;
     struct notifyfs_entry_struct *parent;
-    struct notifyfs_entry_struct *dir_next;
-    struct notifyfs_entry_struct *dir_prev;
-    struct notifyfs_entry_struct *child; /* in case of a directory pointing to the first child */
-    size_t namehash;
+    int nameindex_value;
     unsigned char status;
     struct mount_entry_struct *mount_entry;
     unsigned char synced;
@@ -88,11 +85,15 @@ struct notifyfs_entry_struct {
 // Prototypes
 
 int init_hashtables();
+
 void add_to_inode_hash_table(struct notifyfs_inode_struct *inode);
 void add_to_name_hash_table(struct notifyfs_entry_struct *entry);
 void remove_entry_from_name_hash(struct notifyfs_entry_struct *entry);
+
 struct notifyfs_inode_struct *find_inode(fuse_ino_t ino);
-struct notifyfs_entry_struct *find_entry(fuse_ino_t parent, const char *name);
+struct notifyfs_entry_struct *find_entry_raw(struct notifyfs_entry_struct *parent, const char *name, unsigned char raw);
+struct notifyfs_entry_struct *find_entry(fuse_ino_t ino, const char *name);
+
 struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent, const char *name, struct notifyfs_inode_struct *inode);
 void remove_entry(struct notifyfs_entry_struct *entry);
 void assign_inode(struct notifyfs_entry_struct *entry);
@@ -104,5 +105,7 @@ unsigned char isrootentry(struct notifyfs_entry_struct *entry);
 unsigned long long get_inoctr();
 struct notifyfs_inode_struct *get_rootinode();
 struct notifyfs_entry_struct *get_rootentry();
+
+struct notifyfs_entry_struct *get_next_entry(struct notifyfs_entry_struct *parent, struct notifyfs_entry_struct *entry);
 
 #endif

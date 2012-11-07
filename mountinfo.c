@@ -33,6 +33,8 @@
 
 #include <sys/stat.h>
 #include <sys/param.h>
+#include <sys/mount.h>
+
 #include <fcntl.h>
 #include <pthread.h>
 
@@ -66,7 +68,8 @@ struct mountinfo_cb_struct mountinfo_cb={
                                          .next_in_current=NULL,
                                          .next_in_changed=&next_mount_entry_changed, 
                                          .lock=&lock_mountlist,
-                                         .unlock=&unlock_mountlist};
+                                         .unlock=&unlock_mountlist,
+					 .ignore=NULL};
 
 struct mount_entry_struct *rootmount=NULL;
 
@@ -97,6 +100,14 @@ void register_mountinfo_callback(unsigned char type, void *callback)
 
 	mountinfo_cb.unlock=callback;
 
+    } else if ( type==MOUNTINFO_CB_IGNOREENTRY ) {
+
+	mountinfo_cb.ignore=callback;
+
+    } else if ( type==MOUNTINFO_CB_FIRSTRUN ) {
+
+	mountinfo_cb.firstrun=callback;
+
     }
 
 }
@@ -116,7 +127,36 @@ void run_callback_onupdate(unsigned char firstrun)
 
     }
 
-    logoutput("run_callback_onupdate: ready");
+}
+
+void run_callback_firstrun()
+{
+
+    if ( mountinfo_cb.firstrun ) {
+
+	logoutput("run_callback_firstrun: callback defined");
+
+	(*mountinfo_cb.firstrun) ();
+
+    } else {
+
+	logoutput("run_callback_onupdate: callback not defined");
+
+    }
+
+}
+
+unsigned char ignore_mount_entry(char *source, char *fs, char *path)
+{
+    unsigned char ignore=0;
+
+    if ( mountinfo_cb.ignore ) {
+
+	ignore=(*mountinfo_cb.ignore) (source, fs, path);
+
+    }
+
+    return ignore;
 
 }
 
@@ -185,6 +225,7 @@ void init_mount_entry(struct mount_entry_struct *mount_entry)
     mount_entry->status=0;
     mount_entry->remount=0;
     mount_entry->processed=0;
+    mount_entry->fstab=0;
 
     mount_entry->unique=0;
     mount_entry->generation=0;
@@ -558,6 +599,31 @@ struct mount_entry_struct *get_mount(char *path)
 
 }
 
+struct mount_entry_struct *source_mounted(char *source)
+{
+    int res=0;
+    struct mount_entry_struct *mount_entry=NULL;
+
+    res=lock_mountlist();
+
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_CURRENT_SORTED);
+
+    while(mount_entry) {
+
+	if (strcmp(mount_entry->mountsource, source)==0) break;
+
+	mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_CURRENT_SORTED);
+
+    }
+
+    res=unlock_mountlist();
+
+    return mount_entry;
+
+}
+
+
+
 void logoutput_list(unsigned char type, unsigned char lockset)
 {
     int res=0;
@@ -643,5 +709,18 @@ void logoutput_list(unsigned char type, unsigned char lockset)
     }
 
     if (lockset==0) res=unlock_mountlist(type);
+
+}
+
+int umount_mount_entry(struct mount_entry_struct *mount_entry)
+{
+
+    if (mount_entry && mount_entry->mountpoint) {
+
+	return umount2(mount_entry->mountpoint, MNT_DETACH);
+
+    }
+
+    return -ENOENT;
 
 }

@@ -51,7 +51,7 @@
 #include "path-resolution.h"
 #include "watches.h"
 #include "mountinfo.h"
-#include "client.h"
+#include "message.h"
 
 unsigned char call_info_lock;
 pthread_mutex_t call_info_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -357,13 +357,10 @@ void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_st
     call_info->effective_watch=NULL;
     call_info->path=NULL;
     call_info->freepath=0;
-    call_info->backend=NULL;
-    call_info->typebackend=0;
     call_info->next=NULL;
     call_info->prev=NULL;
     call_info->mount_entry=NULL;
     call_info->ctx=NULL;
-    call_info->client=NULL;
 
 }
 
@@ -383,35 +380,15 @@ struct call_info_struct *get_call_info(struct notifyfs_entry_struct *entry)
 
         call_info=create_call_info();
 
-        if ( ! call_info ) goto out;
-
     }
 
     res=pthread_mutex_unlock(&call_info_unused_mutex);
 
-    init_call_info(call_info, entry);
+    if (call_info) init_call_info(call_info, entry);
 
     out:
 
     return call_info;
-
-}
-
-void remove_call_info_from_list(struct call_info_struct *call_info)
-{
-    int res=0;
-
-    res=pthread_mutex_lock(&call_info_mutex);
-
-    if ( call_info->prev ) call_info->prev->next=call_info->next;
-    if ( call_info->next ) call_info->next->prev=call_info->prev;
-    if ( call_info_list==call_info ) call_info_list=call_info->next;
-
-    /* signal waiting operations call on path is removed*/
-
-    res=pthread_cond_broadcast(&call_info_condition);
-
-    res=pthread_mutex_unlock(&call_info_mutex);
 
 }
 
@@ -432,5 +409,141 @@ void remove_call_info(struct call_info_struct *call_info)
     call_info->prev=NULL;
 
     res=pthread_mutex_unlock(&call_info_unused_mutex);
+
+}
+
+/* function which creates a path in notifyfs 
+
+    it does this by testing every subpath and create that in notifyfs
+    typically used at startup when creating the different mountpoints
+
+*/
+
+void create_notifyfs_path(struct call_info_struct *call_info)
+{
+    char *path, *slash, *name;
+    struct notifyfs_inode_struct *pinode; 
+    struct notifyfs_entry_struct *pentry, *entry;
+    int res;
+    char tmppath[strlen(call_info->path)+1];
+    struct stat st;
+
+    pentry=get_rootentry();
+    pinode=pentry->inode;
+    entry=NULL;
+
+    call_info->entry=NULL;
+    call_info->entry2remove=NULL;
+    call_info->effective_watch=NULL;
+
+    call_info->mount_entry=get_rootmount();
+    call_info->ctx=NULL;
+
+    strcpy(tmppath, call_info->path);
+    path=tmppath;
+
+    logoutput("create_notifyfs_path: creating %s", tmppath);
+
+    /*  translate path into entry 
+        suppose here safe that entry is a subdir of root entry...*/
+
+    while(1) {
+
+        /*  walk through path from begin to end and 
+            check every part */
+
+        slash=strchr(path, '/');
+
+        if ( slash==path ) {
+
+            /* ignore the starting slash*/
+
+            path++;
+
+            /* if nothing more (==only a slash) stop here */
+
+            if (strlen(path)==0) break;
+
+            continue;
+
+        }
+
+        if ( slash ) *slash='\0';
+
+        name=path;
+
+        if ( name ) {
+
+            entry=find_entry(pinode->ino, name);
+
+            if ( ! entry ) {
+
+        	/* check the stat */
+
+        	res=lstat(tmppath, &st);
+
+        	if ( res==-1 ) {
+
+            	    /* what to do here?? the path does not exist */
+            	    entry=NULL;
+            	    break;
+
+        	}
+
+                entry=create_entry(pentry, name, NULL);
+
+                if (entry) {
+
+                    assign_inode(entry);
+
+		    if ( entry->inode ) {
+
+                	/*  is there a function to signal kernel an inode and entry are created 
+                    	    like fuse_lowlevel_notify_new_inode */
+
+                	add_to_inode_hash_table(entry->inode);
+                	add_to_name_hash_table(entry);
+
+                	copy_stat(&(entry->inode->st), &st);
+
+		    } else {
+
+			remove_entry(entry);
+			entry=NULL;
+			break;
+
+		    }
+
+                } else {
+
+                    break;
+
+                }
+
+            }
+
+	    if (entry->mount_entry) call_info->mount_entry=entry->mount_entry;
+
+        }
+
+        if ( ! slash ) {
+
+            break;
+
+        } else {
+
+	    /* shift */
+
+            /* make slash a slash again (was turned into a \0) */
+            *slash='/';
+            path=slash+1;
+            pentry=entry;
+            pinode=pentry->inode;
+
+        }
+
+    }
+
+    call_info->entry=entry;
 
 }

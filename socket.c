@@ -45,106 +45,57 @@
 #include "notifyfs.h"
 #include "epoll-utils.h"
 #include "watches.h"
-
-#include "client.h"
-#include "mountinfo.h"
-#include "message-server.h"
-
 #include "socket.h"
-
-
 
 #define LISTEN_BACKLOG 50
 
 struct sockaddr_un address;
 socklen_t address_length;
 int socket_fd;
+struct epoll_extended_data_struct xdata_socket=EPOLL_XDATA_INIT;
 
-/* function which is called when data on a connection fd 
-   examples of incoming data:
-   - setting type of client, like app or fs
-   - signoff
-   - event from client fs 
-   */
+struct socket_callbacks_struct {
+    int (*socketfd_cb) (int fd, pid_t pid, uid_t uid, gid_t gid);
+};
 
-void handle_data_on_connection_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
+struct socket_callbacks_struct socket_callbacks={NULL};
+
+void assign_socket_callback(int (*socketfd_cb) (int fd, pid_t pid, uid_t uid, gid_t gid))
 {
-    int nreturn=0;
-
-    if ( events & ( EPOLLHUP | EPOLLRDHUP ) ) {
-	struct client_struct *client=(struct client_struct *) epoll_xdata->data;
-
-        // hangup of remote site
-        // a hickup: what to do with the data still available on the fd
-
-        /* lookup the client and remove it */
-
-        nreturn=remove_xdata_from_epoll(epoll_xdata, 0);
-
-        if ( nreturn<0 ) {
-
-            logoutput("error(%i) removing xdata from epoll\n", nreturn);
-
-        }
-
-	close(epoll_xdata->fd);
-	epoll_xdata->fd=0;
-
-	remove_xdata_from_list(epoll_xdata);
-
-	free(epoll_xdata);
-
-	if ( client ) {
-
-	    /* set client to down */
-
-	    client->status_fs=NOTIFYFS_CLIENTSTATUS_DOWN;
-	    client->status_app=NOTIFYFS_CLIENTSTATUS_DOWN;
-	    client->fd=0;
-
-	}
-
-
-    } else {
-        int nlenread=0;
-        struct client_struct *client=(struct client_struct *) epoll_xdata->data;
-
-        /* here handle the data available for read */
-
-        logoutput("handling data on connection fd %i", epoll_xdata->fd);
-
-	nlenread=receive_message_from_client(epoll_xdata->fd, client);
-
-	if ( nlenread<0 ) nreturn=nlenread;
-
-    }
+    socket_callbacks.socketfd_cb=socketfd_cb;
 
 }
+
 
 /*
 * function to handle when data arrives on the socket
 * this means that a client tries to connect
 */
 
-void handle_data_on_socket_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
+void handle_data_on_socket_fd(int fd, void *data, uint32_t events)
 {
     struct epoll_extended_data_struct *client_xdata;
     struct client_struct *client;
     int connection_fd;
     struct ucred cr;
     socklen_t cl=sizeof(cr), res;
+    int n;
 
     logoutput("handle_data_on_socket_fd");
 
     // add a new fd to communicate
 
-    connection_fd = accept4(epoll_xdata->fd, (struct sockaddr *) &address, &address_length, SOCK_NONBLOCK);
+    connection_fd = accept4(fd, (struct sockaddr *) &address, &address_length, SOCK_NONBLOCK);
 
     if ( connection_fd==-1 ) {
 
         return;
 
     }
+
+    getsockopt(connection_fd, SOL_SOCKET, SO_RCVBUF, (void *) &n, sizeof(int));
+
+    logoutput("handle_data_on_socket_fd: size of buffer: %i", n);
 
     /* get the credentials */
 
@@ -156,25 +107,13 @@ void handle_data_on_socket_fd(struct epoll_extended_data_struct *epoll_xdata, ui
 
     }
 
-    /* check for client */
+    logoutput("handle_data_on_socket_fd: pid %i", cr.pid);
 
-    client=register_client(connection_fd, cr.pid, cr.uid, cr.gid);
-    if ( ! client ) return;
+    if (socket_callbacks.socketfd_cb) {
 
-    /* add to epoll */
-
-    client_xdata=add_to_epoll(connection_fd, EPOLLIN | EPOLLET, TYPE_FD_CLIENT, &handle_data_on_connection_fd, (void *) client, NULL);
-
-    if ( ! client_xdata ) {
-
-	logoutput("error adding client fd %i to mainloop", connection_fd);
-
-    } else {
-
-	add_xdata_to_list(client_xdata);
+	res=(* socket_callbacks.socketfd_cb) (connection_fd, cr.pid, cr.uid, cr.gid);
 
     }
-
 
 }
 
@@ -217,8 +156,22 @@ int create_socket(char *path)
         goto out;
 
     } else {
+	struct epoll_extended_data_struct *epoll_xdata;
 
-        nreturn=socket_fd;
+	epoll_xdata=add_to_epoll(socket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_socket_fd, NULL, &xdata_socket, NULL);
+
+	if ( ! epoll_xdata ) {
+
+	    nreturn=-errno;
+    	    logoutput("create_socket: error adding socket fd to mainloop.");
+
+	} else {
+
+    	    logoutput("create_socket: socket fd %i added to epoll", socket_fd);
+	    add_xdata_to_list(epoll_xdata, NULL);
+	    nreturn=socket_fd;
+
+	}
 
     }
 

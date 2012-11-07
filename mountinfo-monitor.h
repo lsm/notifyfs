@@ -22,7 +22,8 @@
 
 #define MOUNTINFO_FILE "/proc/self/mountinfo"
 
-void signal_mountmonitor();
-int start_mountmonitor(pthread_t *pthreadid, void *callback_onupdate);
+void read_fstab();
+void handle_change_mounttable();
+unsigned char device_found_in_fstab(char *device);
 
 #endif

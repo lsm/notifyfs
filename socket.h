@@ -22,9 +22,7 @@
 
 // Prototypes
 
-void handle_data_on_connection_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo);
-void handle_data_on_socket_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo);
-
+void assign_socket_callback(int (*socketfd_cb) (int fd, pid_t pid, uid_t uid, gid_t gid));
 int create_socket(char *path);
 
 #endif

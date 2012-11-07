@@ -19,57 +19,60 @@
 #ifndef NOTIFYFS_CLIENT_H
 #define NOTIFYFS_CLIENT_H
 
-#define NOTIFYFS_CLIENTTYPE_UNKNOWN     0
-#define NOTIFYFS_CLIENTTYPE_FS          1
-#define NOTIFYFS_CLIENTTYPE_APP         2
-
 #define NOTIFYFS_CLIENTSTATUS_NOTSET    0
 #define NOTIFYFS_CLIENTSTATUS_UP        1
 #define NOTIFYFS_CLIENTSTATUS_DOWN      2
 #define NOTIFYFS_CLIENTSTATUS_SLEEP     3
 
-
-// struct to describe the client
-// has a fd it listens to
-// has credentials (pid, uid, gid)
-// and is part of the list of clients
-// has a pointer to custom data:
-// - watches for a client app
-// - path for a client fs
-
 struct client_struct {
-    unsigned char type;
     int fd;
+    char buff0[sizeof(struct notifyfs_message_body)];
+    char recvbuff[NOTIFYFS_SERVER_RECVBUFFERSIZE];
+    char sendbuff[NOTIFYFS_SERVER_SENDBUFFERSIZE];
+    size_t buff0size;
+    size_t recvbuffsize;
+    size_t sendbuffsize;
     pid_t pid;
     pid_t tid;
     uid_t uid;
     gid_t gid;
     struct client_struct *next;
     struct client_struct *prev;
-    pthread_mutex_t lock_mutex;
-    pthread_cond_t lock_condition;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
     unsigned char lock;
-    unsigned char status_app;
-    unsigned char status_fs;
+    unsigned char status;
     unsigned char messagemask;
     struct watch_struct *watches;
-    struct mount_entry_struct *mount_entry;
-    char *path;
 };
 
+struct command_list_struct {
+    char *path;
+    char *name;
+    unsigned char typeentry;
+    int maxentries;
+};
+
+struct clientcommand_struct {
+    uint64_t unique;
+    struct client_struct *client;
+    unsigned char type;
+    union {
+	struct command_list_struct list;
+    } command;
+};
 
 // Prototypes
 
-struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid_t gid);
 struct client_struct *lookup_client(pid_t pid, unsigned char lockset);
+
 int lock_clientslist();
 int unlock_clientslist();
 struct client_struct *get_clientslist();
-int lock_client(struct client_struct *client);
-int unlock_client(struct client_struct *client);
 
-unsigned char find_and_assign_clientfs_to_mount(struct mount_entry_struct *mount_entry);
-unsigned char find_and_assign_mount_to_clientfs(struct client_struct *client);
+void lock_client(struct client_struct *client);
+void unlock_client(struct client_struct *client);
 
+int client_socketfd_callback(int fd, pid_t pid, uid_t uid, gid_t gid);
 
 #endif

@@ -1,5 +1,4 @@
 /*
-
   2010, 2011 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
@@ -17,21 +16,13 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef _DETERMINECHANGES_H
-#define _DETERMINECHANGES_H
+#ifndef TESTAPP_USERMENU_H
+#define TESTAPP_USERMENU_H
 
-#define FSEVENT_FILECHANGED_NONE	0
-#define FSEVENT_FILECHANGED_FILE	1
-#define FSEVENT_FILECHANGED_METADATA	2
-#define FSEVENT_FILECHANGED_XATTR	4
-#define FSEVENT_FILECHANGED_REMOVED	8
 
 // Prototypes
 
-unsigned char compare_file_simple(struct stat *st1, struct stat *st2);
-unsigned char compare_metadata_simple(struct stat *st1, struct stat *st2);
-unsigned char determinechanges(struct stat *cached_st, int mask, struct stat *st);
-void update_timespec(struct timespec *laststat);
+int start_showmenu_thread(pthread_t *pthreadid);
 
 #endif
 

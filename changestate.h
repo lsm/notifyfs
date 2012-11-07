@@ -22,13 +22,11 @@
 
 // Prototypes
 
-void send_notify_message_clients(struct effective_watch_struct *effective_watch, int mask, int len, char *name, struct stat *st, unsigned char remote);
-void send_status_message_clients(struct effective_watch_struct *effective_watch, unsigned char typemessage);
-
 void del_watch_backend(struct effective_watch_struct *effective_watch);
 void set_watch_backend(struct effective_watch_struct *effective_watch, int newmask, unsigned char lockset);
 
 void changestate(struct call_info_struct *call_info, unsigned char typeaction);
+void process_notifyfs_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent);
 
 void update_notifyfs(unsigned char firstrun);
 

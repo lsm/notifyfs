@@ -36,15 +36,15 @@
 #include <unistd.h>
 #include <errno.h>
 #include <err.h>
-#include <assert.h>
 
 #include <inttypes.h>
 #include <ctype.h>
-#include <sys/types.h>
 
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/epoll.h>
-#include <sys/signalfd.h>
+#include <sys/mount.h>
+
 #include <pthread.h>
 #include <syslog.h>
 
@@ -54,154 +54,257 @@
 
 #include "logging.h"
 #include "epoll-utils.h"
+#include "workerthreads.h"
 #include "handlefuseevent.h"
 
-ssize_t maxbuffsize=0;
+extern struct fuse_lowlevel_ops notifyfs_oper;
+extern struct fuse_chan *fuse_kern_chan_new(int fd);
+extern struct fuse_args global_fuse_args;
 
-unsigned char nextfreethread=0;
+struct fusebuffer_struct {
+    char *buff;
+    size_t buffsize;
+    int lenread;
+    struct fusebuffer_struct *next;
+};
 
-pthread_mutex_t workerthreads_mutex=PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t workerthreads_cond=PTHREAD_COND_INITIALIZER;
-struct fuse_workerthread_struct *workerthread_queue_first=NULL;
-struct fuse_workerthread_struct *workerthread_queue_last=NULL;
+static struct fusebuffer_struct *firstinqueue=NULL;
+static struct fusebuffer_struct *lastinqueue=NULL;
+static pthread_mutex_t queue_mutex=PTHREAD_MUTEX_INITIALIZER;
+static int nrbuffers=0;
 
-struct fuse_workerthread_struct workerthread[NUM_WORKER_THREADS];
-
-unsigned char exitfusesession=0;
-static struct fuse_session *fusesession=NULL;
-const char *fusemountpoint=NULL;
-
-struct epoll_extended_data_struct xdata_fuse={0, 0, NULL, NULL, NULL, NULL};
-
-typedef struct FUSEOPCODEMAP {
-		const char *name;
-		int opcode;
-		} FUSEOPCODEMAP;
-
-static const FUSEOPCODEMAP fuseopcodemap[] = {
-		    {"FUSE_LOOKUP", 1},
-		    {"FUSE_FORGET", 2},
-		    {"FUSE_GETATTR", 3},
-		    {"FUSE_SETATTR", 4},
-		    {"FUSE_READLINK", 5},
-		    {"FUSE_SYMLINK", 6},
-		    {"FUSE_MKNOD", 8},
-		    {"FUSE_MKDIR", 9},
-		    {"FUSE_UNLINK", 10},
-		    {"FUSE_RMDIR", 11},
-		    {"FUSE_RENAME", 12},
-		    {"FUSE_LINK", 13},
-		    {"FUSE_OPEN", 14},
-		    {"FUSE_READ", 15},
-		    {"FUSE_WRITE", 16},
-		    {"FUSE_STATFS", 17},
-		    {"FUSE_RELEASE", 18},
-		    {"FUSE_FSYNC", 20},
-		    {"FUSE_SETXATTR", 21},
-		    {"FUSE_GETXATTR", 22},
-		    {"FUSE_LISTXATTR", 23},
-		    {"FUSE_REMOVEXATTR", 24},
-		    {"FUSE_FLUSH", 25},
-		    {"FUSE_INIT", 26},
-		    {"FUSE_OPENDIR", 27},
-		    {"FUSE_READDIR", 28},
-		    {"FUSE_RELEASEDIR", 29},
-		    {"FUSE_FSYNCDIR", 30},
-		    {"FUSE_GETLK", 31},
-		    {"FUSE_SETLK", 32},
-		    {"FUSE_SETLKW", 33},
-		    {"FUSE_ACCESS", 34},
-		    {"FUSE_CREATE", 35},
-		    {"FUSE_INTERRUPT", 36},
-		    {"FUSE_BMAP", 37},
-		    {"FUSE_DESTROY", 38},
-		    {"FUSE_IOCTL", 39},
-		    {"FUSE_POLL", 40},
-		    {"FUSE_NOTIFY_REPLY", 41},
-		    {"FUSE_BATCH_FORGET", 42}};
+static struct fuse_session *session=NULL;
+static struct fuse_chan *chan=NULL;
+static int fuse_fd=0;
+static struct epoll_extended_data_struct xdata_fuse=EPOLL_XDATA_INIT;
+static unsigned char exitsession=0;
+static unsigned char fuse_mounted=0;
+static char *fuse_mountpoint=NULL;
 
 
-static int print_opcode(int opcode, char *string, size_t size)
+int mount_notifyfs(char *mountpoint)
 {
-    int i, pos=0, len;
+    const char *devname = "/dev/fuse";
+    const char *fstype  = "fuse.notifyfs";
+    const char *source  = "notifyfs";
+    int fd, res, nreturn=0;
+    char vfsdata[128];
+    struct stat st;
 
-    for (i=0;i<(sizeof(fuseopcodemap)/sizeof(fuseopcodemap[0]));i++) {
+    fd=open(devname, O_RDWR);
 
-        if ( fuseopcodemap[i].opcode==opcode ) {
+    if (fd == -1) {
 
-            len=strlen(fuseopcodemap[i].name);
+	nreturn=-errno;
+	goto out;
 
-            if ( pos + len + 1  > size ) {
+    }
 
-                pos=-1;
-                goto out;
+    res=stat(mountpoint, &st);
 
-            } else {
+    if (res==-1) {
 
-                if ( pos>0 ) {
+	logoutput("mount_notifyfs: mountpoint does not exist/failed to access(error: %s)", strerror(errno));
+	nreturn=-errno;
+	goto out;
 
-                    *(string+pos)=';';
-                    pos++;
+    }
 
-                }
+    snprintf(vfsdata, 128,  "fd=%i,rootmode=%o,user_id=%i,group_id=%i,allow_other", fd, st.st_mode & S_IFMT, getuid(), getgid());
 
-                strcpy(string+pos, fuseopcodemap[i].name);
-                pos+=len;
+    logoutput("mount_notifyfs: mount %s %s %s %s", source, mountpoint, fstype, vfsdata);
 
-            }
+    res=mount(source, mountpoint, fstype, MS_NODEV | MS_NOATIME | MS_NOSUID, vfsdata);
 
-	    break;
+    if (res==-1) {
 
-        }
+	nreturn=-errno;
+
+    } else {
+
+	nreturn=fd;
 
     }
 
     out:
 
-    return pos;
+    return nreturn;
 
 }
 
 
-int read_fuseevent(struct fuse_chan *ch, struct fuse_session *se, struct fuse_workerthread_struct *workerthread)
+/*  initialize a buffer to read the event available in the channel fd
+    note the buffsize is normally very big, while the events here with
+    notifyfs are simple commands (no writes)
+    */
+
+int init_fusebuffer(struct fusebuffer_struct *fusebuffer)
+{
+    int nreturn=0;
+    size_t buffsize=fuse_chan_bufsize(chan);
+
+    logoutput("init_fusebuffer: allocate memory size %zi", buffsize);
+
+    fusebuffer->buff=malloc(buffsize);
+
+    if ( fusebuffer->buff ) {
+
+	memset(fusebuffer->buff, '\0', buffsize);
+    	fusebuffer->buffsize=buffsize;
+	fusebuffer->lenread=0;
+	fusebuffer->next=NULL;
+
+    } else {
+
+	logoutput("init_fusebuffer: error allocate memory");
+    	nreturn=-ENOMEM;
+
+    }
+
+    out:
+
+    return nreturn;
+
+}
+
+struct fusebuffer_struct *get_fusebuffer()
+{
+    struct fusebuffer_struct *fusebuffer=NULL;
+
+    pthread_mutex_lock(&queue_mutex);
+
+    if ( firstinqueue ) {
+
+	fusebuffer=firstinqueue;
+	firstinqueue=fusebuffer->next;
+	fusebuffer->next=NULL;
+
+	if (lastinqueue==fusebuffer) lastinqueue=firstinqueue;
+
+    } else {
+
+	logoutput("get_fusebuffer: no free fuse buffer available: create one");
+
+	fusebuffer=malloc(sizeof(struct fusebuffer_struct));
+
+	if (fusebuffer) {
+
+	    init_fusebuffer(fusebuffer);
+
+	    if ( ! fusebuffer->buff ) {
+
+		free(fusebuffer);
+		fusebuffer=NULL;
+
+		logoutput("get_fusebuffer: error creating a buffer");
+
+	    } else {
+
+		nrbuffers++;
+
+		logoutput("get_fusebuffer: number buffers %i", nrbuffers);
+
+	    }
+
+	}
+
+    }
+
+    pthread_mutex_unlock(&queue_mutex);
+
+    return fusebuffer;
+
+}
+
+void put_fusebuffer(struct fusebuffer_struct *fusebuffer)
+{
+
+    pthread_mutex_lock(&queue_mutex);
+
+    fusebuffer->next=NULL;
+
+    if ( lastinqueue ) lastinqueue->next=fusebuffer;
+    lastinqueue=fusebuffer;
+
+    if ( ! firstinqueue ) firstinqueue=fusebuffer;
+
+    pthread_mutex_unlock(&queue_mutex);
+
+}
+
+void destroy_fusebuffer(struct fusebuffer_struct *fusebuffer)
+{
+
+    if (fusebuffer->buff) {
+
+	free(fusebuffer->buff);
+	fusebuffer->buff=NULL;
+
+    }
+
+    free(fusebuffer);
+
+}
+
+void destroy_fusebuffers()
+{
+    struct fusebuffer_struct *fusebuffer;
+
+    pthread_mutex_lock(&queue_mutex);
+
+    fusebuffer=firstinqueue;
+
+    while(fusebuffer) {
+
+	firstinqueue=fusebuffer->next;
+
+	destroy_fusebuffer(fusebuffer);
+
+	fusebuffer=firstinqueue;
+
+    }
+
+    pthread_mutex_unlock(&queue_mutex);
+
+    lastinqueue=NULL;
+
+}
+
+/* function which reads data available on fuse chan (=fd) into a buffer 
+*/
+
+static int read_fuse_event(struct fusebuffer_struct *fusebuffer)
 {
     int nreturn=0, res;
-
+    unsigned char count=0;
 
     readbuff:
 
-
-    res=fuse_session_receive_buf(se, &(workerthread->fbuf), &ch);
-
-    // res=fuse_chan_recv(&ch, workerthread->fbuf.mem, workerthread->fbuf.size);
-
-    logoutput( "thread %i ready receive buf res: %i", workerthread->nr, res);
-
+    res=fuse_chan_recv(&chan, fusebuffer->buff, fusebuffer->buffsize);
 
     if ( res==-EAGAIN ) {
 
-        /* jump back... is this safe and will not result in an endless loop ??*/
+        /* jump back... to prevent an endless loop build in a counter */
 
-        logoutput( "thread %i got a EAGAIN error reading the buffer", workerthread->nr);
-        goto readbuff;
+	logoutput("read_fuse_event: error EAGAIN");
+
+	if (count<5) {
+
+	    count++;
+    	    goto readbuff;
+
+	}
 
     } else if ( res==-EINTR ) {
 
+	logoutput("read_fuse_event: error EINTR");
 	nreturn=0;
 
     } else if ( res<=0 ) {
 
-        if ( res<0 ) {
+	logoutput("read_fuse_event: error %i", res);
 
-            logoutput( "thread %i got error %i", workerthread->nr, res);
-
-        } else {
-
-            logoutput( "thread %i got zero reading the buffer", workerthread->nr);
-
-        }
-
-        exitfusesession=1;
+	if (res==0) exitsession=1;
         nreturn=res;
 
     } else {
@@ -209,35 +312,11 @@ int read_fuseevent(struct fuse_chan *ch, struct fuse_session *se, struct fuse_wo
 	/* no error */
 
 	nreturn=res;
-
-        /* show some information about what the call is about */
-
-	if (!(workerthread->fbuf.flags & FUSE_BUF_IS_FD)) {
-            struct fuse_in_header *in = (struct fuse_in_header *) workerthread->fbuf.mem;
-            char outputstring[32];
-            int res2;
-
-	    res2=print_opcode(in->opcode, outputstring, 32);
-
-	    if ( res2>0 ) {
-
-            	logoutput( "thread %i read %i bytes: opcode %i/%s", workerthread->nr, res, in->opcode, outputstring);
-
-	    } else {
-
-            	logoutput( "thread %i read %i bytes: opcode %i", workerthread->nr, res, in->opcode);
-
-	    }
-
-	} else {
-
-            logoutput( "thread %i read %i bytes: opcode not available", workerthread->nr, res);
-
-        }
-
-	workerthread->fbuf.size=res;
+	fusebuffer->lenread=res;
 
     }
+
+    out:
 
     return nreturn;
 
@@ -249,237 +328,18 @@ int read_fuseevent(struct fuse_chan *ch, struct fuse_session *se, struct fuse_wo
 // it maybe a permanent or a temporary one
 //
 
-static void *thread_to_process_fuse_event(void *threadarg)
+static void process_fusebuffer(void *data)
 {
-    struct fuse_workerthread_struct *workerthread;
-    bool permanentthread;
-    int res;
+    struct fusebuffer_struct *fusebuffer=(struct fusebuffer_struct *) data;
 
-    workerthread=(struct fuse_workerthread_struct *) threadarg;
+    fuse_session_process(session, fusebuffer->buff, fusebuffer->lenread, chan);
 
-    if ( ! workerthread ) {
+    /* put fusebuffer back on queue */
 
-        logoutput( "unable to start thread, argument not set");
-        goto out;
-
-    }
-
-    permanentthread=false;
-    if ( workerthread->typeworker==TYPE_WORKER_PERMANENT ) permanentthread=true;
-    workerthread->threadid=pthread_self();
-
-    while (1) {
-
-        // if permanent : wait for the condition
-        // this is set by the mainloop to inform this thread there is data ready to process
-
-        if ( permanentthread ) {
-
-            // wait for event
-
-            workerthread->busy=0;
-
-            /* clear various settings... (A)*/
-            workerthread->se=NULL;
-            workerthread->ch=NULL;
-
-	    res=pthread_mutex_lock(&workerthreads_mutex);
-
-	    /* wait till this thread is the next free one */
-
-	    while ( workerthread->busy==0 && exitfusesession==0 ) {
-
-		res=pthread_cond_wait(&workerthreads_cond, &workerthreads_mutex);
-
-	    }
-
-	    res=pthread_mutex_unlock(&workerthreads_mutex);
-
-            logoutput( "thread %i waking up", workerthread->nr);
-
-            /* after here settings cleared at (A) are set again */
-
-            workerthread->busy=1;
-
-        }
-
-        // possibly activated to terminate
-
-        if ( exitfusesession==1 ) {
-
-	    logoutput( "thread %i exit", workerthread->nr);
-
-            workerthread->busy=0;
-            break;
-
-        }
-
-	res=pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-
-        fuse_session_process_buf(workerthread->se, &(workerthread->fbuf), workerthread->ch);
-
-	res=pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-
-	if ( ! ( workerthread->fbuf.flags & FUSE_BUF_IS_FD ) ) {
-
-	    /* when dealing with a memory buffer reset the buffer */
-
-	    memset(workerthread->fbuf.mem, '\0', workerthread->fbuf.size);
-	    workerthread->fbuf.size=maxbuffsize;
-
-	}
-
-        if ( fuse_session_exited(workerthread->se) ) {
-
-            exitfusesession=1;
-            break;
-
-        }
-
-        if ( ! permanentthread ) {
-
-            break;
-
-        }
-
-	/* ready: put it on tail */
-
-	res=pthread_mutex_lock(&workerthreads_mutex);
-
-	if ( workerthread_queue_last ) {
-
-	    workerthread_queue_last->next=workerthread;
-	    workerthread->prev=workerthread_queue_last;
-
-	    workerthread_queue_last=workerthread;
-
-	} else {
-
-	    workerthread_queue_last=workerthread;
-
-	}
-
-	if ( ! workerthread_queue_first ) workerthread_queue_first=workerthread;
-
-	workerthread->busy=0;
-
-	res=pthread_mutex_unlock(&workerthreads_mutex);
-
-    }
-
-    out:
-
-    if ( permanentthread ) workerthread->threadid=0;
-
-    pthread_exit(NULL);
+    fusebuffer->lenread=0;
+    put_fusebuffer(fusebuffer);
 
 }
-
-void log_threadsqueue()
-{
-    struct fuse_workerthread_struct *workerthread;
-    char outputstring[64], *tmpchar;
-    int res, len=64;
-
-    workerthread=workerthread_queue_first;
-
-    tmpchar=&outputstring[0];
-
-    while (workerthread) {
-
-	res=snprintf(tmpchar, len, "%i:", workerthread->nr);
-
-	len-=res;
-	tmpchar+=res;
-
-	workerthread=workerthread->next;
-
-    }
-
-    logoutput("in queue: %s", outputstring);
-
-}
-
-void stopfusethreads()
-{
-    int i;
-
-    for (i=0; i<NUM_WORKER_THREADS; i++) {
-
-        if ( workerthread[i].threadid>0 ) {
-
-    	    pthread_cancel(workerthread[i].threadid);
-    	    workerthread[i].threadid=0;
-
-	}
-
-	if ( ! ( workerthread[i].fbuf.flags & FUSE_BUF_IS_FD ) ) {
-
-	    /* when space is allocated free it */
-
-    	    if ( workerthread[i].fbuf.mem ) {
-
-        	free(workerthread[i].fbuf.mem);
-        	workerthread[i].fbuf.mem=NULL;
-
-    	    }
-
-	}
-
-    }
-
-    pthread_cond_destroy(&workerthreads_cond);
-    pthread_mutex_destroy(&workerthreads_mutex);
-
-}
-
-void terminatefuse(struct epoll_extended_data_struct *epoll_xdata)
-{
-    struct fuse_chan *ch=NULL;
-
-    logoutput("terminatefuse");
-
-    /* remove from epoll */
-
-    if ( xdata_fuse.fd>0 ) {
-
-	remove_xdata_from_epoll(&xdata_fuse, 0);
-
-    }
-
-    remove_xdata_from_list(&xdata_fuse);
-
-    /* try to determine the channel */
-
-    if ( ! ch ) ch=(struct fuse_chan *) xdata_fuse.data;
-
-    if ( ! ch ) {
-
-	if ( fusesession ) ch=fuse_session_next_chan(fusesession, NULL);
-
-    }
-
-    if ( fusemountpoint ) {
-
-	fuse_unmount(fusemountpoint, ch);
-	xdata_fuse.fd=0;
-
-	fusemountpoint=NULL;
-	ch=NULL;
-
-    }
-
-    if ( fusesession ) {
-
-	fuse_session_destroy(fusesession);
-	fusesession=NULL;
-
-    }
-
-    stopfusethreads();
-
-}
-
 
 /*
  * process an event on a fuse fd
@@ -491,279 +351,199 @@ void terminatefuse(struct epoll_extended_data_struct *epoll_xdata)
  * . event
  */
 
-int process_fuse_event(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
+int process_fuse_event(int fd, void *data, uint32_t events)
 {
-    int nreturn=0, res, lenread=0;
-    struct fuse_session *se=NULL;
-    struct fuse_chan *ch=NULL;
+    int nreturn=0, res;
 
-    if ( signo>0 ) {
-
-	/* terminate the fuse part */
-
-	logoutput("process_fuse_event: received a signal from mainloop to terminate, doing nothing now");
-
-	// if ( fusesession ) terminatefuse(epoll_xdata);
-
-    } else if ( ! fusesession ) {
-
-	logoutput("process_fuse_event: no session available..error");
-
-    } else if ( events & (EPOLLERR | EPOLLHUP) ) {
+    if ( events & (EPOLLERR | EPOLLHUP) ) {
 
         logoutput( "process_fuse_event: event %i causes exit", events);
-
-        setmainloop_exit(0);
-        goto out;
+        exitsession=1;
 
     } else if ( ! (events & EPOLLIN) ) {
 
 	/* only react on incoming events */
-
 	/* huh?? */
 
-        logoutput( "process_fuse_event: fd %i not available for read", epoll_xdata->fd);
-        goto out;
-
-    }
-
-    ch=(struct fuse_chan *) epoll_xdata->data;
-    se=fuse_chan_session(ch);
-
-    /* look for a free thread */
-
-    res=pthread_mutex_lock(&workerthreads_mutex);
-
-    if ( ! workerthread_queue_first ) {
-
-	/* there is no thread available... just wait here... 
-	   possibly add a timeout here*/
-
-	while ( ! workerthread_queue_first ) {
-
-	    res=pthread_cond_wait(&workerthreads_cond, &workerthreads_mutex);
-
-	}
-
-    }
-
-
-    if ( workerthread_queue_first ) {
-
-	/* here for testing... */
-
-	log_threadsqueue();
-
-	/* take the first */
-
-	nextfreethread=workerthread_queue_first->nr;
-
-        workerthread[nextfreethread].se=se;
-        workerthread[nextfreethread].ch=ch;
-
-        /* reset the buffer */
-
-        workerthread[nextfreethread].fbuf.size=maxbuffsize;
-
-	logoutput("trying to set thread %i to work", nextfreethread);
-
-	/* read the buffer */
-
-	lenread=read_fuseevent(ch, se, &workerthread[nextfreethread]);
-
-	if ( exitfusesession==1 ) {
-
-	    if ( lenread<=0 ) {
-
-		setmainloop_exit(lenread);
-
-	    } else {
-
-    		setmainloop_exit(0);
-
-	    }
-
-    	    goto out;
-
-	} else if ( lenread>0 ) {
-
-	    workerthread[nextfreethread].busy=1;
-
-	    /* remove from queue */
-
-	    if ( workerthread_queue_first->next ) {
-
-		workerthread_queue_first=workerthread_queue_first->next;
-		workerthread_queue_first->prev=NULL;
-
-	    } else {
-
-		workerthread_queue_first=NULL;
-		workerthread_queue_last=NULL;
-
-	    }
-
-	    workerthread[nextfreethread].next=NULL;
-	    workerthread[nextfreethread].prev=NULL;
-
-    	    /* use a condition variable in stead of semaphore:
-        	send a broadcast */
-
-	    res=pthread_cond_broadcast(&workerthreads_cond);
-
-	}
-
-    }
-
-    res=pthread_mutex_unlock(&workerthreads_mutex);
-
-    out:
-
-    logoutput("process_fuse_event: nreturn %i", nreturn);
-
-    return nreturn;
-
-}
-
-int addfusechannelstomainloop(struct fuse_session *se, const char *mountpoint)
-{
-    struct fuse_chan *ch = NULL;
-    int nreturn=0;
-
-    if ( fusesession || fusemountpoint ) {
-
-	logoutput("add fuse channels to mainloop: error, fusesession and/or mountpoint already defined");
-	goto out;
+        logoutput( "process_fuse_event: fd %i not available for read", fd);
 
     } else {
+	struct fusebuffer_struct *fusebuffer=NULL;
+	int lenread;
 
-	fusesession=se;
-	fusemountpoint=mountpoint;
+	fusebuffer=get_fusebuffer();
 
-    }
+	if ( ! fusebuffer) {
 
-    ch = fuse_session_next_chan(fusesession, NULL);
-
-    while (ch) {
-        size_t buffsize=fuse_chan_bufsize(ch);
-        int fd, fdflags, res;
-        struct epoll_extended_data_struct *epoll_xdata;
-
-        if ( buffsize > maxbuffsize ) maxbuffsize=buffsize;
-
-        fd=fuse_chan_fd(ch);
-
-	/* set to nonblocking */
-
-	fdflags=fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, fdflags | O_NONBLOCK);
-
-        logoutput("add fuse channels to mainloop: adding fuse fd %i to mainloop", fd);
-
-        epoll_xdata=add_to_epoll(fd, EPOLLIN, TYPE_FD_FUSE, &process_fuse_event, (void *) ch, &xdata_fuse);
-
-	if ( epoll_xdata ) {
-
-	    add_xdata_to_list(epoll_xdata);
-
-	} else {
-
-	    logoutput("add fuse channels to mainloop: error adding fuse to mainloop");
-	    nreturn=-EIO;
+	    logoutput( "process_fuse_event: unable to allocate fusebuffer");
 	    goto out;
 
 	}
 
-	/* walk through every channel for this session --- ahum there is only one channel per session --- */
+	/* read the buffer */
 
-        ch = fuse_session_next_chan(fusesession, ch);
+	lenread=read_fuse_event(fusebuffer);
+
+	if (exitsession==1) {
+
+	    fusebuffer->lenread=0;
+	    put_fusebuffer(fusebuffer);
+	    goto out;
+
+	} else if (lenread>0) {
+	    struct workerthread_struct *workerthread=NULL;
+
+	    /* get a thread to do the work */
+
+	    workerthread=get_thread_from_queue(0);
+
+	    if ( ! workerthread ) {
+
+		logoutput( "process_fuse_event: unable to get a workerthread");
+		goto out;
+
+	    }
+
+	    /* assign the right callbacks and data */
+
+	    workerthread->processevent_cb=process_fusebuffer;
+	    workerthread->data=(void *) fusebuffer;
+
+	    /* send signal to start */
+
+	    signal_workerthread(workerthread);
+
+	}
 
     }
 
-    logoutput("mainloop: setting maximum buffer size: %i", maxbuffsize);
-
     out:
+
+    if ( exitsession==1 ) nreturn=EVENTLOOP_EXIT;
 
     return nreturn;
 
 }
 
-int startfusethreads()
+
+void finish_fuse()
 {
-    int i, nreturn=0, res;
-    pthread_t pthreadid;
 
-    /* init and fire up the different fuse worker threads */
+    if (session) {
 
-    for (i=0; i<NUM_WORKER_THREADS; i++) {
+	fuse_session_destroy(session);
+	session=NULL;
+	chan=NULL;
+
+    } else if (chan) {
+
+	fuse_chan_destroy(chan);
+	chan=NULL;
+
+    }
+
+    if (fuse_mounted==1) {
+
+	fuse_unmount(fuse_mountpoint, chan);
+	fuse_mounted=0;
+	fuse_mountpoint=NULL;
+
+    }
+
+    destroy_fusebuffers();
+
+}
 
 
-        workerthread[i].busy=0;
-        workerthread[i].nr=i;
-        workerthread[i].typeworker=TYPE_WORKER_PERMANENT;
+int initialize_fuse(char *mountpoint)
+{
+    int nreturn=0;
+    struct epoll_extended_data_struct *epoll_xdata;
+    char *arg;
+    int argc=0;
 
-        /* create the buffer per thread:
-           every thread gets it's own buffer
-           use the new buffer definition per 201201, a fd 
-           is also possible */
+    logoutput("initialize_fuse: mountpoint %s", mountpoint);
 
-	/* here where to set the flags..... */
+    fuse_fd=mount_notifyfs(mountpoint);
 
-	workerthread[i].fbuf.flags=0;
+    if (fuse_fd<=0) {
 
-	if ( ! ( workerthread[i].fbuf.flags & FUSE_BUF_IS_FD ) ) {
-    	    workerthread[i].fbuf.mem=malloc(maxbuffsize);
+	logoutput("initialize_fuse: unable to mount mountpoint %s", mountpoint);
+	nreturn=fuse_fd;
+	goto error;
 
-    	    if ( ! workerthread[i].fbuf.mem ) {
+    }
 
-        	nreturn=-ENOMEM;
-        	goto out;
+    fuse_mounted=1;
+    fuse_mountpoint=mountpoint;
 
-    	    }
+    chan=fuse_kern_chan_new(fuse_fd);
 
-	    memset(workerthread[i].fbuf.mem, '\0', maxbuffsize);
-    	    workerthread[i].fbuf.size=maxbuffsize;
+    if ( ! chan ) {
 
-	}
+	logoutput("initialize_fuse: unable to add fuse channel to mountpoint %s", mountpoint);
+	nreturn=-EIO;
+	goto error;
 
-        workerthread[i].fbuf.fd=0;
-        workerthread[i].fbuf.pos=0;
+    } else {
 
-	/* add thread to queue (no need to lock)*/
+	logoutput("initialize_fuse: added fuse channel to mountpoint %s", mountpoint);
 
-	if ( ! workerthread_queue_first ) workerthread_queue_first=&(workerthread[i]);
+    }
 
-	if ( ! workerthread_queue_last ) {
+    arg=global_fuse_args.argv;
 
-	    workerthread_queue_last=&(workerthread[i]);
+    while(1) {
+
+	if (arg) {
+
+	    logoutput("initialize_fuse: argument %s", arg);
+
+	    argc++;
+	    arg=global_fuse_args.argv[argc];
 
 	} else {
 
-	    workerthread_queue_last->next=&(workerthread[i]);
-	    workerthread[i].prev=workerthread_queue_last;
-
-	    workerthread_queue_last=&(workerthread[i]);
+	    break;
 
 	}
 
-        res=pthread_create(&pthreadid, NULL, thread_to_process_fuse_event, (void *) &workerthread[i]);
+    }
 
-        if ( res!=0 ) {
+    session=fuse_lowlevel_new(&global_fuse_args, &notifyfs_oper, sizeof(notifyfs_oper), NULL);
 
-            // error
+    if ( ! session ) {
 
-            logoutput( "Error creating a new thread (nr: %i, error: %i).", i, res);
-            nreturn=res;
+	logoutput("initialize_fuse: unable to add fuse session to mountpoint %s", mountpoint);
+	nreturn=-EIO;
+	goto error;
 
-            goto out;
+    } else {
 
-        }
+	logoutput("initialize_fuse: added fuse session to mountpoint %s", mountpoint);
 
     }
 
-    out:
+    fuse_session_add_chan(session, chan);
+
+    epoll_xdata=add_to_epoll(fuse_fd, EPOLLIN, TYPE_FD_FUSE, &process_fuse_event, NULL, &xdata_fuse, NULL);
+
+    if ( ! epoll_xdata ) {
+
+	logoutput("manage_mount: cannot add %s to eventloop", mountpoint);
+	nreturn=-EIO;
+	goto error;
+
+    }
+
+    add_xdata_to_list(epoll_xdata, NULL);
+
+    return nreturn;
+
+    error:
+
+    finish_fuse();
 
     return nreturn;
 
 }
-

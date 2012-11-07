@@ -64,334 +64,32 @@
 #include "notifyfs.h"
 
 #include "epoll-utils.h"
+
 #include "handlefuseevent.h"
+#include "handlemountinfoevent.h"
+
+#include "workerthreads.h"
 
 #include "utils.h"
 #include "options.h"
 #include "xattr.h"
+#include "message.h"
+#include "client-io.h"
 #include "client.h"
 #include "socket.h"
 #include "access.h"
+
 #include "mountinfo.h"
 #include "mountinfo-monitor.h"
 
-#include "watches.h"
-#include "determinechanges.h"
-#include "changestate.h"
-
-#include "message.h"
-#include "message-server.h"
-
-#include "networksocket.h"
-
 struct notifyfs_options_struct notifyfs_options;
+struct fuse_args global_fuse_args = FUSE_ARGS_INIT(0, NULL);
 
 struct fuse_chan *notifyfs_chan;
 struct notifyfs_entry_struct *root_entry;
 extern struct mount_entry_struct *root_mount;
 unsigned char loglevel=0;
 int logarea=0;
-
-/* function to remove a client app */
-
-void remove_client_app(struct client_struct *client)
-{
-    int res;
-
-    /* remove every watch of this client */
-
-    if ( client->watches ) {
-	struct watch_struct *watch=client->watches;
-	struct effective_watch_struct *effective_watch=NULL;
-	int newmask,oldmask;
-
-	/* remove the watch from the inodes, and if there no watches left there, 
-	   remove the effective_watch */
-
-	while (watch) {
-
-	    /* here remove from effective watch */
-
-	    effective_watch=watch->effective_watch;
-
-	    if ( effective_watch ) {
-
-    		/* lock the effective watch */
-
-		res=lock_effective_watch(effective_watch);
-
-		/* remove watch from inode/effective_watch */
-
-		if ( effective_watch->watches==watch ) effective_watch->watches=watch->next_per_watch;
-
-		if ( watch->next_per_watch ) {
-
-		    watch->next_per_watch->prev_per_watch=watch->prev_per_watch;
-		    watch->next_per_watch=NULL;
-
-		}
-
-		if ( watch->prev_per_watch ) {
-
-		    watch->prev_per_watch->next_per_watch=watch->next_per_watch;
-		    watch->prev_per_watch=NULL;
-
-		}
-
-		/* recalculate the effective mask */
-
-		oldmask=effective_watch->mask;
-		newmask=calculate_effmask(effective_watch, 1);
-
-		if ( effective_watch->nrwatches==0 ) {
-
-		    /* remove the effective watch */
-
-		    logoutput("remove_client_app: remove effective watch, no more watches...");
-
-		    del_watch_backend(effective_watch);
-
-		    if (effective_watch->inode) effective_watch->inode->effective_watch=NULL;
-		    effective_watch->inode=NULL;
-
-		    if ( effective_watch->path ) {
-
-			free(effective_watch->path);
-			effective_watch->path=NULL;
-
-		    }
-
-		    remove_effective_watch_from_list(effective_watch, 0);
-		    move_effective_watch_to_unused(effective_watch);
-
-		    /* big to do : correct the fs, is the inode still usefull?? */
-
-
-		} else {
-
-		    newmask|=(IN_DELETE_SELF | IN_MOVE_SELF);
-
-		    if ( newmask != oldmask ) {
-
-			effective_watch->mask=newmask;
-
-			/* here update the current backend watch */
-
-			set_watch_backend(effective_watch, newmask, 1);
-
-		    }
-
-		}
-
-		res=unlock_effective_watch(effective_watch);
-
-	    }
-
-	    client->watches=watch->next_per_client;
-	    watch->client=NULL;
-	    watch->prev_per_client=NULL;
-
-	    if ( watch->next_per_client ) {
-
-		watch=watch->next_per_client;
-		free(watch->prev_per_client);
-		watch->prev_per_client=NULL;
-
-	    } else {
-
-		free(watch);
-		watch=NULL;
-
-	    }
-
-	}
-
-    }
-
-}
-
-
-void remove_client_fs(struct client_struct *client)
-{
-    int res;
-    struct effective_watch_struct *effective_watch;
-    unsigned char dosleep=0;
-
-    if ( client->mount_entry ) {
-
-	if ( client->mount_entry->isautofs==1 ) {
-
-	    /* here: when dealing with a autofs mounted fs, set the watches to sleep mode, otherwise remove */
-	    /* possibly */
-
-	    dosleep=1;
-
-	}
-
-    }
-
-    res=lock_effective_watches();
-
-    /* first remove any watch using this client fs as backend */
-
-    effective_watch=get_next_effective_watch(NULL);
-
-    while(effective_watch) {
-
-	if ( client != (struct client_struct *) effective_watch->backend ) {
-
-	    /* forwarding watch, but different client */
-
-	    effective_watch=effective_watch->next;
-	    continue;
-
-	}
-
-    	/* lock the effective watch */
-
-	res=lock_effective_watch(effective_watch);
-
-	/* every watch */
-
-	if ( effective_watch->watches ) {
-	    struct watch_struct *watch=effective_watch->watches;
-
-	    while(watch) {
-
-		if ( dosleep==0 ) {
-
-		    effective_watch->watches=watch->next_per_watch; /* shift */
-		    watch->prev_per_watch=NULL;
-		    watch->next_per_watch=NULL;
-
-		}
-
-		if ( watch->client ) {
-		    struct client_struct *client_app=watch->client;
-
-		    /* send client a message */
-
-		    if ( dosleep==1 ) {
-
-			send_sleepwatch_message(client_app->fd, watch->id);
-
-		    } else {
-
-			send_delwatch_message(client_app->fd, watch->id);
-
-			/*remove watch from client app */
-
-			res=lock_client(client_app);
-
-			if ( client_app->watches==watch ) client_app->watches=watch->next_per_client;
-            		if ( watch->prev_per_client ) watch->prev_per_client->next_per_client=watch->next_per_client;
-            		if ( watch->next_per_client ) watch->next_per_client->prev_per_client=watch->prev_per_client;
-
-			res=unlock_client(client_app);
-
-            		watch->prev_per_client=NULL;
-            		watch->next_per_client=NULL;
-            		watch->client=NULL;
-
-            		free(watch);
-
-			effective_watch->nrwatches--;
-
-		    }
-
-		}
-
-		if ( dosleep==0 ) {
-
-		    watch=effective_watch->watches;
-
-		} else {
-
-		    watch=watch->next_per_watch;
-
-		}
-
-	    }
-
-	}
-
-	if ( effective_watch->nrwatches==0 ) {
-	    struct effective_watch_struct *tmp_effective_watch=get_next_effective_watch(effective_watch);
-
-	    /* detach from inode */
-
-	    if ( effective_watch->inode ) effective_watch->inode->effective_watch=NULL;
-	    effective_watch->inode=NULL;
-
-	    if ( effective_watch->path ) {
-
-		free(effective_watch->path);
-		effective_watch->path=NULL;
-
-	    }
-
-	    /* remove the effective watch (lock set)*/
-
-	    remove_effective_watch_from_list(effective_watch, 1);
-
-	    /* move to unused */
-
-	    move_effective_watch_to_unused(effective_watch);
-
-	    unlock_effective_watch(effective_watch);
-
-	    effective_watch=tmp_effective_watch;
-
-	} else {
-
-	    unlock_effective_watch(effective_watch);
-
-	    effective_watch=get_next_effective_watch(effective_watch);
-
-	}
-
-    }
-
-    res=unlock_effective_watches();
-
-    if ( client->path ) {
-
-	free(client->path);
-	client->path=NULL;
-
-    }
-
-}
-
-void remove_client(struct client_struct *client)
-{
-    int res;
-
-    /* lock client */
-
-    res=lock_client(client);
-
-    client->status_fs=NOTIFYFS_CLIENTSTATUS_DOWN;
-    client->status_app=NOTIFYFS_CLIENTSTATUS_DOWN;
-
-    if ( client->type & NOTIFYFS_CLIENTTYPE_FS ) {
-
-	remove_client_fs(client);
-
-    }
-
-    if ( client->type & NOTIFYFS_CLIENTTYPE_APP ) {
-
-	remove_client_app(client);
-
-    }
-
-    /* unlock client 
-       do not destroy it yet, this is done when the client really disconnects from socket */
-
-    res=unlock_client(client);
-
-}
 
 unsigned char test_access_fsuser(struct call_info_struct *call_info)
 {
@@ -417,10 +115,6 @@ unsigned char test_access_fsuser(struct call_info_struct *call_info)
 	struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
 
 	if ( client ) {
-
-	    /* keep for later use */
-
-	    call_info->client=client;
 
 	    accessdeny=0;
 	    goto out;
@@ -493,7 +187,7 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     /* if watch attached then not stat , this action will cause a notify action (inotify: IN_ACCESS) */
 
-    if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
+    //  if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
 
     if ( dostat==1 ) {
 
@@ -524,10 +218,8 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
         if (nreturn!=-1) {
 
-	    update_timespec(&inode->laststat);
 	    copy_stat(&inode->st, &(e.attr));
 
-	    inode->lastaction=FSEVENT_STAT_STAT;
 
 	} else {
 
@@ -586,16 +278,16 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    //if ( nreturn==-ENOENT && call_info.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
 	/* here change the action to DOWN and leave it to changestate what to do?
 	   REMOVE of SLEEP */
 
-        if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
+        //if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
 
-    }
+    //}
 
     if ( call_info.freepath==1 ) free(call_info.path);
 
@@ -693,7 +385,7 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     /* if watch attached then not stat */
 
-    if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
+    // if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
 
     if ( dostat==1 ) {
 
@@ -727,9 +419,7 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
         /* copy inode->st to st */
 
-	update_timespec(&inode->laststat);
         copy_stat(&st, &inode->st);
-	inode->lastaction=FSEVENT_STAT_STAT;
         nreturn=0;
 
     }
@@ -750,13 +440,13 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    //if ( nreturn==-ENOENT && call_info.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
+        //if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
 
-    }
+    //}
 
     if ( call_info.freepath==1 ) free(call_info.path);
 
@@ -819,7 +509,7 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
 
     /* if watch attached then not stat */
 
-    if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
+    // if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
 
     /* if dealing with an autofs managed fs do not stat
        but what to do when there is no cached stat??
@@ -851,8 +541,6 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
         if (res!=-1) {
 
 	    copy_stat(&inode->st, &st);
-	    update_timespec(&inode->laststat);
-	    inode->lastaction=FSEVENT_STAT_STAT;
 
 	}
 
@@ -912,13 +600,13 @@ static void notifyfs_access (fuse_req_t req, fuse_ino_t ino, int mask)
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path ) {
+    //if ( nreturn==-ENOENT && call_info.path ) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
+        //if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
 
-    }
+    //}
 
     if ( call_info.freepath==1 ) free(call_info.path);
 
@@ -1071,8 +759,6 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 	entry->inode->nlookup++;
 
 	copy_stat(&entry->inode->st, &(e.attr));
-	update_timespec(&entry->inode->laststat);
-	entry->inode->lastaction=FSEVENT_STAT_STAT;
 
 	e.ino = entry->inode->ino;
 	e.attr.st_ino = e.ino;
@@ -1082,24 +768,6 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
         add_to_inode_hash_table(entry->inode);
         add_to_name_hash_table(entry);
-
-        /* insert in directory (some lock required (TODO)????) */
-
-        if ( entry->parent ) {
-
-            entry->dir_next=NULL;
-            entry->dir_prev=NULL;
-
-            if (entry->parent->child) {
-
-                entry->parent->child->dir_prev=entry;
-                entry->dir_next=entry->parent->child;
-
-            }
-
-            entry->parent->child=entry;
-
-        }
 
         logoutput("mkdir successfull");
 
@@ -1267,8 +935,6 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 	entry->inode->nlookup++;
 
 	copy_stat(&entry->inode->st, &(e.attr));
-	update_timespec(&entry->inode->laststat);
-	entry->inode->lastaction=FSEVENT_STAT_STAT;
 
 	e.ino = entry->inode->ino;
 	e.attr.st_ino = e.ino;
@@ -1278,24 +944,6 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
         add_to_inode_hash_table(entry->inode);
         add_to_name_hash_table(entry);
-
-        /* insert in directory (some lock required (TODO)????) */
-
-        if ( entry->parent ) {
-
-            entry->dir_next=NULL;
-            entry->dir_prev=NULL;
-
-            if (entry->parent->child) {
-
-                entry->parent->child->dir_prev=entry;
-                entry->dir_next=entry->parent->child;
-
-            }
-
-            entry->parent->child=entry;
-
-        }
 
         logoutput("mknod succesfull");
 
@@ -1447,6 +1095,8 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
 }
 
+
+
 static int do_readdir_localhost(fuse_req_t req, char *buf, size_t size, off_t upperfs_offset, struct notifyfs_generic_dirp_struct *dirp)
 {
     size_t bufpos = 0;
@@ -1517,12 +1167,11 @@ static int do_readdir_localhost(fuse_req_t req, char *buf, size_t size, off_t up
 
         } else {
 
-
             if ( dirp->underfs_offset == 3 ) {
 
                 /* first "normal" entry */
 
-                dirp->entry=dirp->generic_fh.entry->child;
+                dirp->entry=get_next_entry(dirp->generic_fh.entry, NULL);
 
             } else {
 
@@ -1530,7 +1179,7 @@ static int do_readdir_localhost(fuse_req_t req, char *buf, size_t size, off_t up
 
                 if ( ! direntryfrompreviousbatch ) {
 
-                    if ( dirp->entry ) dirp->entry=dirp->entry->dir_next;
+                    if ( dirp->entry ) dirp->entry=get_next_entry(dirp->generic_fh.entry, dirp->entry);
 
                 }
 
@@ -1817,7 +1466,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* if watch attached then not stat */
 
-    if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
+    // if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
 
     /* if dealing with an autofs managed fs do not stat
        but what to do when there is no cached stat??
@@ -1852,8 +1501,6 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
         if ( res!=-1 ) {
 
 	    copy_stat(&inode->st, &st);
-	    update_timespec(&inode->laststat);
-	    inode->lastaction=FSEVENT_STAT_STAT;
 
 	}
 
@@ -1939,13 +1586,13 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    //if ( nreturn==-ENOENT && call_info.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
+    //    if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
 
-    }
+    //}
 
     if ( call_info.freepath==1 ) free(call_info.path);
 
@@ -2015,7 +1662,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* if watch attached then not stat */
 
-    if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
+    // if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
 
     /* if dealing with an autofs managed fs do not stat
        but what to do when there is no cached stat??
@@ -2049,8 +1696,6 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
         if ( res!=-1) {
 
 	    copy_stat(&inode->st, &st);
-	    update_timespec(&inode->laststat);
-	    inode->lastaction=FSEVENT_STAT_STAT;
 
 	}
 
@@ -2202,20 +1847,17 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path ) {
+    //if ( nreturn==-ENOENT && call_info.path ) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
+    //    if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
 
-    }
+    //}
 
     if ( call_info.freepath==1 ) free(call_info.path);
 
 }
-
-
-
 
 static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 {
@@ -2279,7 +1921,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     /* if watch attached then not stat */
 
-    if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
+    // if ( inode->effective_watch && inode->effective_watch->nrwatches>0 ) dostat=0;
 
     /* if dealing with an autofs managed fs do not stat
        but what to do when there is no cached stat??
@@ -2313,8 +1955,6 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
         if (res!=-1) {
 
 	    copy_stat(&inode->st, &st);
-	    update_timespec(&inode->laststat);
-	    inode->lastaction=FSEVENT_STAT_STAT;
 
 	}
 
@@ -2435,13 +2075,13 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    //if ( nreturn==-ENOENT && call_info.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
+    //    if ( entryexists==1 ) changestate(&call_info, NOTIFYFS_TREE_DOWN);
 
-    }
+    //}
 
     if ( call_info.freepath==1 ) free(call_info.path);
 
@@ -2639,885 +2279,234 @@ static void notifyfs_init (void *userdata, struct fuse_conn_info *conn)
 
 }
 
-
 static void notifyfs_destroy (void *userdata)
 {
-
-    // remove pid file
 
     remove_pid_file();
 
 }
 
 
-
-/* wrapper around signal_mountmonitor */
-
-int handle_data_on_mountinfo_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
+void create_notifyfs_mount_path(struct mount_entry_struct *mount_entry)
 {
+    struct call_info_struct call_info;
 
-    if ( ! epoll_xdata ) {
+    init_call_info(&call_info, NULL);
 
-	signal_mountmonitor(1);
+    call_info.path=mount_entry->mountpoint;
+    call_info.freepath=0;
 
-    } else {
+    create_notifyfs_path(&call_info);
 
-	signal_mountmonitor(0);
+    if ( call_info.entry ) {
 
-    }
+	mount_entry->data0=(void *) call_info.entry;
+	mount_entry->typedata0=NOTIFYFS_MOUNTDATA_ENTRY;
+	call_info.entry->mount_entry=mount_entry;
 
-    return 0;
-
-}
-
-
-/* function to process a fsevent reported by
-   inotify or send via socket by client fs
-   it's possible to use one function for both "backends" cause
-   here one method to describe events is used (inotify):
-   mask is in inotify format
-   name is the name of the entry
-   len is the len of name
-   (len is zero, name is NULL when event on watch self 
-    stat st - stat provided by the backend. can be NULL. by providing this an extra stat call is not required
-    a client fs will be able to provide this as part of the fsevent_message
-    method - an id of the backend method
-
-*/
-
-void evaluate_and_process_fsevent(struct effective_watch_struct *effective_watch, char *name, int len, int mask, struct stat *st, unsigned char method)
-{
-    int res;
-    unsigned char remote=(method==FSEVENT_BACKEND_METHOD_FORWARD) ? 1 : 0;
-
-    if (name) {
-
-	logoutput("evaluate_and_process_fsevent: name: %s, len: %i, mask: %i, method: %i", name, len, mask, method);
+	mount_entry->status=MOUNT_STATUS_UP;
 
     } else {
 
-	logoutput("evaluate_and_process_fsevent: NONAME, len: %i, mask: %i, method: %i", len, mask, method);
+	/* somehow failed to create the path */
 
-    }
+	logoutput("create_notifyfs_mount_path: unable to create mount point %s", mount_entry->mountpoint);
 
-    /* if no watch then ready */
-
-    if ( ! effective_watch ) return;
-
-    /* test it's an event on a watch long gone 
-       watches should be disabled when entry/inodes are removed,
-       so receiving messages on them should 
-       not happen, but to make sure */
-
-    if ( ! effective_watch->inode ) {
-
-	return;
-
-    } else if ( effective_watch->inode->status!=FSEVENT_INODE_STATUS_OK ) {
-
-	return;
-
-    }
-
-    if ( name && len>0 ) {
-
-        /* something happens on an entry in the directory.. check it's in use
-        by this fs, the find command will return NULL if it isn't 
-	    (do nothing with close, open and access) */
-
-	if ( mask & ( IN_DELETE | IN_MOVED_FROM | IN_ATTRIB | IN_MODIFY | IN_CREATE | IN_MOVED_TO | IN_IGNORED | IN_UNMOUNT ) ) {
-	    struct notifyfs_entry_struct *entry=NULL;
-
-	    entry=find_entry(effective_watch->inode->ino, name);
-
-	    if ( entry ) {
-
-		/* entry found : entry is part of this fs */
-
-		if ( mask & IN_UNMOUNT ) {
-
-		    logoutput("evaluate_and_process_fsevent: entry %s unmounted, ignored, handled by the mountmonitor", name);
-
-		    return;
-
-		}
-
-		/* process file- and attrib changes 
-                   note the create and moved_to operation are not likely to happen, since the entry already exists here...
-
-                   TODO: with inotify a mkdir or mknod results in IN_CREATE is followed by a IN_ATTRIB
-                   from inotify or VFS point of view these are different operations, but from the userspace these are related!
-                   notifyfs will after the first IN_CREATE do a stat call to get the attributes...
-                   when the IN_ATTRIB follows shortly after that, it again does a stat call.
-                   the question is now is there some way to make/see notifyfs the second IN_ATTRIB can be ignored
-
-                */
-
-		if ( mask & ( IN_ATTRIB | IN_MODIFY | IN_CREATE | IN_MOVED_TO ) ) {
-		    unsigned char filechanged=0, lastaction=0;
-		    struct notifyfs_inode_struct *inode=entry->inode;
-
-		    if ( mask & IN_ATTRIB ) {
-
-			logoutput("evaluate_and_process_fsevent: attributes %s changed", name);
-			lastaction=FSEVENT_STAT_IN_ATTRIB;
-
-		    }
-
-		    if ( mask & IN_MODIFY ) {
-
-			logoutput("evaluate_and_process_fsevent: %s modified", name);
-			lastaction=FSEVENT_STAT_IN_MODIFY;
-
-		    }
-
-		    if ( mask & ( IN_CREATE | IN_MOVED_TO ) ) {
-
-			logoutput("evaluate_and_process_fsevent: entry %s created", name);
-			lastaction=FSEVENT_STAT_IN_CREATE;
-
-		    }
-
-		    if ( ! inode ) return;
-
-		    if ( st ) {
-
-			/* a stat provided by the backend: use that (and trust it to be correct...) */
-
-			filechanged=determinechanges(&(inode->st), mask, st);
-
-		    } else {
-			struct stat test_st;
-			struct call_info_struct call_info;
-
-			/* a stat is not provided: get it here */
-
-            		init_call_info(&call_info, entry);
-
-            		res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-            		if (res<0) return;
-
-			res=lstat(call_info.path, &test_st);
-
-			if ( res==-1 ) {
-
-			    /* strange case: message that entry does exist, but stat gives error... */
-
-			    mask|=IN_DELETE;
-
-			    /* skip the futher actions, go direct to delete... */
-
-			    goto entrydelete1;
-
-			} else {
-
-			    filechanged=determinechanges(&(inode->st), mask, &test_st);
-			    update_timespec(&inode->laststat);
-			    inode->method=method;
-			    inode->lastaction=lastaction;
-
-			}
-
-		    }
-
-		    /* only send when there has really changed something */
-
-		    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
-
-			logoutput("evaluate_and_process_fsevent: a real change, sending message");
-
-			send_notify_message_clients(effective_watch, mask, len, name, &(inode->st), remote);
-
-		    } else {
-
-			logoutput("evaluate_and_process_fsevent: not a real change, not sending message");
-
-		    }
-
-		}
-
-		entrydelete1:
-
-		if ( mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
-		    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
-		    struct call_info_struct call_info;
-		    struct notifyfs_inode_struct *inode=entry->inode;
-
-		    logoutput("evaluate_and_process_fsevent: entry %s removed, checking to send a message", name);
-
-		    /* there must be an inode.... */
-
-		    if ( ! inode ) return;
-
-		    prestatus=inode->status;
-
-            	    init_call_info(&call_info, entry);
-
-            	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-            	    if (res<0) return;
-
-		    /* entry deleted (here) so adjust the filesystem */
-
-		    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
-
-		    /* forward message only when something really changed */
-
-		    if ( prestatus!=inode->status && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
-
-			logoutput("evaluate_and_process_fsevent: a real remove, sending message");
-
-			send_notify_message_clients(effective_watch, mask, len, name, NULL, remote);
-
-		    } else {
-
-			logoutput("evaluate_and_process_fsevent: not a real remove, not sending message");
-
-		    }
-
-		    return;
-
-		}
-
-	    } else {
-
-		/* entry not part of fs, just send the message 
-		maybe additional create the entry 
-		*/
-
-		if ( mask & ( IN_CREATE | IN_MOVED_TO | IN_ATTRIB | IN_MODIFY ) ) {
-		    struct notifyfs_entry_struct *parent_entry=NULL;
-		    unsigned char lastaction;
-
-
-		    logoutput("evaluate_and_process_fsevent: entry %s new, not found in notifyfs, creating it", name);
-
-		    if ( mask & IN_ATTRIB ) {
-
-			logoutput("evaluate_and_process_fsevent: attributes %s changed", name);
-			lastaction=FSEVENT_STAT_IN_ATTRIB;
-
-		    }
-
-		    if ( mask & IN_MODIFY ) {
-
-			logoutput("evaluate_and_process_fsevent: %s modified", name);
-			lastaction=FSEVENT_STAT_IN_MODIFY;
-
-		    }
-
-		    if ( mask & ( IN_CREATE | IN_MOVED_TO ) ) {
-
-			logoutput("evaluate_and_process_fsevent: entry %s created", name);
-			lastaction=FSEVENT_STAT_IN_CREATE;
-
-		    }
-
-		    /* here create the entry */
-
-		    parent_entry=effective_watch->inode->alias;
-		    entry=create_entry(parent_entry, name, NULL);
-
-		    if ( entry ) {
-			struct stat test_st;
-
-			res=0;
-
-			if ( ! st ) {
-			    struct call_info_struct call_info;
-
-			    /* stat not defined: get it here */
-
-                    	    init_call_info(&call_info, entry);
-
-                    	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-                    	    if (res<0) return;
-
-			    st=&test_st;
-
-			    res=lstat(call_info.path, st);
-
-			}
-
-			if ( res==0 ) {
-
-			    /* insert at begin */
-
-			    entry->dir_prev=NULL;
-
-			    if ( parent_entry->child ) parent_entry->child->dir_prev=entry;
-			    entry->dir_next=parent_entry->child;
-			    parent_entry->child=entry;
-
-			    assign_inode(entry);
-			    add_to_name_hash_table(entry);
-			    add_to_inode_hash_table(entry->inode);
-
-			    copy_stat(&(entry->inode->st), st);
-			    update_timespec(&entry->inode->laststat);
-			    entry->inode->method=method;
-			    entry->inode->lastaction=lastaction;
-
-			    send_notify_message_clients(effective_watch, mask, len, name, st, remote);
-
-			} else {
-
-			    /* huh?? should not happen.. received a message the entry does exist
-                               ignore the event futher */
-
-			    remove_entry(entry);
-
-			}
-
-		    }
-
-		} else if ( mask & IN_UNMOUNT ) {
-
-		    /* entry not found in notifyfs, which should not happen since
-		       every mount is managed here */
-
-		    /* a config switch here to send a message or not ? */
-
-		    logoutput("evaluate_and_process_fsevent: entry (not found in notifyfs) %s unmounted, ignored, handled by the mountmonitor", name);
-
-		} else if ( mask & ( IN_DELETE | IN_MOVED_FROM | IN_IGNORED ) ) {
-
-		    logoutput("evaluate_and_process_fsevent: entry %s removed, not found in notifyfs", name);
-
-		    /* received a message an entry is deleted, what was not part of this fs, so do nothing just forward */
-
-		    send_notify_message_clients(effective_watch, mask, len, name, st, remote);
-
-		}
-
-	    }
-
-	}
-
-    } else {
-
-	/*  event on watch self
-	    do nothing with close, open and access*/
-
-	if ( mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_ATTRIB | IN_MODIFY | IN_IGNORED | IN_UNMOUNT ) ) {
-	    struct notifyfs_entry_struct *entry=NULL;
-	    struct notifyfs_inode_struct *inode=NULL;
-
-	    inode=effective_watch->inode;
-	    entry=inode->alias;
-
-	    if ( entry ) {
-
-		/* entry found which is logical, event is on watch, which exists */
-
-		if ( mask & ( IN_ATTRIB | IN_MODIFY ) ) {
-		    unsigned char filechanged=0, lastaction=0;
-
-
-		    if ( mask & IN_ATTRIB ) {
-
-			logoutput("evaluate_and_process_fsevent: watch attributes changed");
-			lastaction=FSEVENT_STAT_IN_ATTRIB;
-
-		    }
-
-		    if ( mask & IN_MODIFY ) {
-
-			logoutput("evaluate_and_process_fsevent: watch modified");
-			lastaction=FSEVENT_STAT_IN_MODIFY;
-
-		    }
-
-		    if ( st ) {
-
-			/* a stat provided by the backend: use that (and trust it to be correct...) */
-
-			filechanged=determinechanges(&(inode->st), mask, st);
-
-		    } else {
-			struct stat test_st;
-			struct call_info_struct call_info;
-
-			/* a stat is not provided: get it here */
-
-            		init_call_info(&call_info, entry);
-
-            		res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-            		if (res<0) return;
-
-			res=lstat(call_info.path, &test_st);
-
-			if ( res==-1 ) {
-
-			    /* strange case: message that entry does exist, but stat gives error... */
-
-			    mask|=IN_DELETE;
-			    goto entrydelete2;
-
-			} else {
-
-			    filechanged=determinechanges(&(inode->st), mask, &test_st);
-			    update_timespec(&inode->laststat);
-			    inode->method=method;
-			    inode->lastaction=lastaction;
-
-			}
-
-		    }
-
-		    /* only send when there has really changed something */
-
-		    if ( filechanged != FSEVENT_FILECHANGED_NONE ) {
-
-			logoutput("evaluate_and_process_fsevent: changes detected, sending message");
-
-			send_notify_message_clients(effective_watch, mask, 0, NULL, &(inode->st), remote);
-
-		    } else {
-
-			logoutput("evaluate_and_process_fsevent: no changes detected");
-
-		    }
-
-		}
-
-		entrydelete2:
-
-		if ( mask & ( IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_UNMOUNT ) ) {
-		    unsigned char prestatus=FSEVENT_INODE_STATUS_REMOVED;
-            	    struct call_info_struct call_info;
-
-		    logoutput("evaluate_and_process_fsevent: (watch) entry %s removed", entry->name);
-
-		    /* entry deleted (here) so adjust the filesystem */
-
-		    prestatus=inode->status;
-
-            	    init_call_info(&call_info, entry);
-
-            	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-            	    if (res<0) return;
-
-		    changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
-
-		    /* forward message only when something really changed */
-
-		    if ( prestatus!=inode->status && inode->status==FSEVENT_INODE_STATUS_REMOVED) {
-
-			send_notify_message_clients(effective_watch, mask, 0, NULL, NULL, remote);
-
-		    }
-
-		}
-
-	    } else {
-
-		/* received an event on watch, but entry is not found.. */
-
-		logoutput("evaluate_and_process_fsevent: (watch) entry not found for watch id %li", effective_watch->id);
-
-	    }
-
-	}
+	mount_entry->status=MOUNT_STATUS_NOTSET;
 
     }
 
 }
 
+/* function to update notifyfs when mounts are added and/or removed 
+   some observations:
+   - not every mountpoint (added or removed) is used by this fs
+   - in case of an fs mounted by fs, it's possible that watches are already set on this fs has been
+   set to "sleep" mode after is has been umounted before
+   -   
+   - note::: added and removed mounts are already sorted in the same way the main sort module works 
+   in mountinfo.c:
+   (mountpoint, mountsource, fstype)
+   */
 
-/* INOTIFY BACKEND SPECIFIC CALLS */
-
-/* read data from inotify fd */
-#define INOTIFY_EVENT_SIZE (sizeof(struct inotify_event))
-#define INOTIFY_BUFF_LEN (1024 * (INOTIFY_EVENT_SIZE + 16))
-
-void handle_data_on_inotify_fd(struct epoll_extended_data_struct *epoll_xdata, uint32_t events, int signo)
+void update_notifyfs(unsigned char firstrun)
 {
-    int nreturn=0;
-    char outputstring[256];
+    struct mount_entry_struct *mount_entry=NULL;
+    struct notifyfs_entry_struct *entry;
+    struct client_struct *client;
+    int nreturn=0, res;
 
-    logoutput1("handle_data_on_inotify_fd.");
+    logoutput("update_notifyfs");
 
-    if ( events & EPOLLIN ) {
-        int lenread=0;
-        char buff[INOTIFY_BUFF_LEN];
+    /* log based on condition */
 
-        lenread=read(epoll_xdata->fd, buff, INOTIFY_BUFF_LEN);
+    logoutput_list(MOUNTENTRY_ADDED, 0);
+    logoutput_list(MOUNTENTRY_REMOVED, 0);
+    logoutput_list(MOUNTENTRY_REMOVED_KEEP, 0);
 
-        if ( lenread<0 ) {
-
-            logoutput0("Error (%i) reading inotify events (fd: %i).", errno, epoll_xdata->fd);
-
-        } else {
-            int i=0, res;
-            struct inotify_event *i_event;
-            struct effective_watch_struct *effective_watch;
-
-            while(i<lenread) {
-
-                i_event = (struct inotify_event *) &buff[i];
-
-                /* handle overflow here */
-
-                if ( (i_event->mask & IN_Q_OVERFLOW) && i_event->wd==-1 ) {
-
-                    /* what to do here: read again?? go back ??*/
-
-                    logoutput0("Error reading inotify events: buffer overflow.");
-                    goto next;
-
-                }
-
-                /* lookup watch using this wd */
-
-                logoutput1("Received an inotify event on wd %i.", i_event->wd);
-
-                memset(outputstring, '\0', 256);
-                res=print_mask(i_event->mask, outputstring, 256);
-
-                if ( res>0 ) {
-
-                    logoutput2("Mask: %i/%s", i_event->mask, outputstring);
-
-                } else {
-
-                    logoutput2("Mask: %i", i_event->mask);
-
-                }
-
-                effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_INOTIFY, i_event->wd);
-
-		/* process the event.... is from inotify, so no stat and it's local*/
-
-		evaluate_and_process_fsevent(effective_watch, i_event->name, i_event->len, i_event->mask, NULL, FSEVENT_BACKEND_METHOD_INOTIFY);
-
-		next:
-
-                i += INOTIFY_EVENT_SIZE + i_event->len;
-
-            }
-
-        }
-
-    }
-
-}
-
-
-
-
-void handle_client_message(struct client_struct *client,  struct notifyfs_client_message *client_message, void *data1, int len1)
-{
-    unsigned char type=client_message->type;
-    char *path=(char *) data1;
-
-    logoutput("handle client message, for message %i, client pid/type %i/%i", type, client->pid, client->type);
-
-    /* check the pid and the tid the client has send, and the tid earlier detected is a task of the mainpid */
-
-    if ( belongtosameprocess(client_message->pid, client_message->tid)==0 ) {
-
-	logoutput("handle client message: pid %i and tid %i send by client (%i) are not part of same process", client_message->pid, client_message->tid, client->tid);
-
-	/* ignore message.. */
-
-	return;
-
-    }
-
-    if ( belongtosameprocess(client_message->pid, client->tid)==0 ) {
-
-	logoutput("handle client message: pid %i send by client and tid %i are not part of same process", client_message->pid, client->tid);
-
-	/* ignore message.. */
-
-	return;
-
-    }
-
-    client->pid=client_message->pid;
-
-    if ( type&(NOTIFYFS_MESSAGE_CLIENT_REGISTERAPP|NOTIFYFS_MESSAGE_CLIENT_REGISTERFS) ) {
-
-	/* received a register client fs message */
-
-	if ( type&NOTIFYFS_MESSAGE_CLIENT_REGISTERFS ) {
-	    unsigned char newclientfs=0;
-
-	    /* register client as fs */
-
-	    if ( ! (client->type&NOTIFYFS_CLIENTTYPE_FS) ) {
-
-		newclientfs=1;
-
-		client->type|=NOTIFYFS_CLIENTTYPE_FS;
-
-	    }
-
-	    if ( newclientfs==1 ) {
-
-		/* path should be an argument */
-
-		if ( client->path ) {
-
-		    if ( path ) {
-
-			logoutput("handle client message: client has already path set(%s) but replacing by %s", client->path, path);
-			free(client->path);
-			client->path=NULL;
-
-		    }
-
-		}
-
-		if ( ! client->path ) {
-
-		    if ( path ) {
-
-			/* use malloc here instead?? */
-
-			client->path=strdup(path);
-
-		    }
-
-		    if ( client->path ) {
-
-			logoutput("handle_client_message: read path (len: %i) %s", strlen(client->path), client->path);
-
-			client->status_fs=NOTIFYFS_CLIENTSTATUS_UP;
-			client->mount_entry=NULL;
-
-			find_and_assign_mount_to_clientfs(client);
-
-		    }
-
-		}
-
-	    }
-
-	}
-
-	if ( type&NOTIFYFS_MESSAGE_CLIENT_REGISTERAPP ) {
-
-	    /* register client as app */
-
-	    client->type|=NOTIFYFS_CLIENTTYPE_APP;
-	    client->status_app=NOTIFYFS_CLIENTSTATUS_UP;
-
-	}
-
-	if ( client->type&NOTIFYFS_CLIENTTYPE_FS ) {
-
-	    logoutput("client %i is a client fs", client->pid);
-
-	}
-
-	if ( client->type&NOTIFYFS_CLIENTTYPE_APP ) {
-
-	    logoutput1("client %i is a client app", client->pid);
-
-	}
-
-	/* use the mask the client has send as messagemask */
-
-	client->messagemask=client_message->messagemask;
-
-
-    }
-
-    if ( type&NOTIFYFS_MESSAGE_CLIENT_SIGNOFF ) {
-
-	/* signoff client */
-
-	logoutput("handle client message, signoff client pid %i", client->pid);
-
-	remove_client(client);
-
-
-    }
-
-}
-
-void handle_fsevent_message(struct client_struct *client, struct notifyfs_fsevent_message *fsevent_message, void *data1, int len1)
-{
-    unsigned char type=fsevent_message->type;
-
-    if ( type==NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYPATH ) {
-
-	logoutput("handle_fsevent_message: setwatch_bypath");
-
-	/* here read the data, it must be complete:
-	   - path and mask 
-	   then set the watch at backend
-	*/
-
-
-    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_SETWATCH_BYINO ) {
-
-	logoutput("handle_fsevent_message: setwatch_byino");
-
-	/* here read the data, it must be complete:
-	   - ino and mask 
-	   then set the watch at backend
-	*/
-
-    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_NOTIFY ) {
-	struct effective_watch_struct *effective_watch;
-
-	logoutput("handle_fsevent_message: notify");
-
-	/* read the data from the client fs 
-	   and pass it through to client apps 
-	   but first filter it out as it maybe an event caused by this fs
-	   and because it comes through a message it's an event on the backend
-	   howto determine....
-	   it's a fact that inotify events have been realised on the VFS,
-	   with events on the backend this is not so
-	   but first filter out the events caused by this host....*/
-
-	/* lookup the watch the event is about using the backend_id */
-
-	/* there must be a client interested */
-
-	effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_FORWARD, fsevent_message->id);
-
-	if ( effective_watch ) {
-
-	    logoutput("handle_fsevent_message: watch found.");
-
-	    if ( fsevent_message->statset==1 ) {
-
-		evaluate_and_process_fsevent(effective_watch, (char *) data1, len1, fsevent_message->mask, &(fsevent_message->st), FSEVENT_BACKEND_METHOD_FORWARD);
-
-	    } else {
-
-		evaluate_and_process_fsevent(effective_watch, (char *) data1, len1, fsevent_message->mask, NULL, FSEVENT_BACKEND_METHOD_FORWARD);
-
-	    }
-
-	} else {
-
-	    logoutput("handle_fsevent_message: watch not found for id %li.", fsevent_message->id);
-
-	}
-
-
-    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_DELWATCH ) {
-
-	logoutput("handle_fsevent_message: delwatch");
-
-    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_SLEEPWATCH ) {
-
-	logoutput("handle_fsevent_message: sleepwatch");
-
-    } else if ( type==NOTIFYFS_MESSAGE_FSEVENT_WAKEWATCH ) {
-
-	logoutput("handle_fsevent_message: wakewatch");
-
-    } else {
-
-	logoutput("handle_fsevent_message: unknown message");
-
-    }
-
-}
-
-void handle_reply_message(struct client_struct *client,  struct notifyfs_reply_message *reply_message, char *path)
-{
-    unsigned char type=reply_message->type;
-
-    if ( type==NOTIFYFS_MESSAGE_REPLY_OK ) {
-
-	logoutput("handle_reply_message: reply_ok");
-
-    } else if ( type==NOTIFYFS_MESSAGE_REPLY_ERROR ) {
-
-	logoutput("handle_reply_message: reply_error");
-
-    } else if ( type==NOTIFYFS_MESSAGE_REPLY_REPLACE ) {
-
-	logoutput("handle_reply_message: reply_error");
-
-    } else {
-
-	logoutput("handle_reply_message: unknown message");
-
-    }
-
-}
-
-void handle_mountinfo_request(struct client_struct *client,  struct notifyfs_mount_message *mount_message, void *data1, void *data2)
-{
-    int res=0;
-    struct mount_entry_struct *mount_entry;
-    char *path=(char *) data1;
-
-    if ( strlen(mount_message->fstype)>0 ) {
-
-	logoutput("handle_mountinfo_request, for fstype %s", mount_message->fstype);
-
-    } else {
-
-	logoutput("handle_mountinfo_request, no fs filter");
-
-    }
-
-    if ( path && strlen(path)>0 ) {
-
-	logoutput("handle_mountinfo_request, a subdirectory of %s", path);
-
-    } else {
-
-	logoutput("handle_mountinfo_request, no path filter");
-
-    }
-
+    /* walk through removed mounts to see it affects the fs */
 
     res=lock_mountlist();
 
-    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_CURRENT);
+    /* start with last: the list is sorted, bigger/longer (also submounts) mounts are first this way */
+
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_REMOVED);
 
     while (mount_entry) {
 
 
-	if ( strlen(mount_message->fstype)>0 ) {
+        entry=(struct notifyfs_entry_struct *) mount_entry->data0;
 
-	    logoutput("handle_mountinfo_request, compare %s with %s", mount_entry->fstype, mount_message->fstype);
+        /* if normal umount then remove the tree... 
+               if umounted by autofs then set tree to sleep */
 
-	    /* filter on filesystem */
+        if ( entry ) {
+            struct call_info_struct call_info;
 
-	    if ( strcmp(mount_message->fstype, mount_entry->fstype)!=0 ) goto next;
+	    init_call_info(&call_info, entry);
 
-	}
+            call_info.path=mount_entry->mountpoint;
+	    call_info.mount_entry=mount_entry;
 
-	if ( path && strlen(path)>0 ) {
+            /* normal umount: remove whole tree */
 
-	    logoutput("handle_mountinfo_request, compare %s with %s", mount_entry->mountpoint, path);
+            // changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE );
 
-	    /* filter on directory */
+        }
 
-	    if ( issubdirectory(mount_entry->mountpoint, path, 1)==0 ) goto next;
+	/* send message to inform clients.. not on startup */
 
-	}
+	// if ( firstrun==0 ) send_mount_message_to_clients(mount_entry);
 
-	res=send_mount_message(client->fd, mount_entry, mount_message->unique);
-
-	next:
-
-	mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_CURRENT);
+        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_REMOVED);
 
     }
 
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_REMOVED_KEEP);
+
+    while (mount_entry) {
+
+	if ( mount_entry->processed==1 ) {
+
+	    mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_REMOVED_KEEP);
+	    continue;
+
+	}
+
+        entry=(struct notifyfs_entry_struct *) mount_entry->data0;
+
+        /* if normal umount then remove the tree... 
+               if umounted by autofs then set tree to sleep */
+
+        if ( entry ) {
+            struct call_info_struct call_info;
+
+	    init_call_info(&call_info, entry);
+
+            call_info.path=mount_entry->mountpoint;
+	    call_info.mount_entry=mount_entry;
+
+            //changestate(&call_info, FSEVENT_ACTION_TREE_REMOVE);
+
+        }
+
+	mount_entry->processed=1;
+
+	client=(struct client_struct *) mount_entry->data1;
+
+	/* send message to inform clients.. not on startup... TODO */
+
+	// if ( firstrun==0 ) send_mount_message_to_clients(mount_entry);
+
+        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_REMOVED_KEEP);
+
+    }
+
+
+    /* in any case the watches set on an autofs managed fs, get out of "sleep" mode */
+
+    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_ADDED);
+
+    while (mount_entry) {
+
+	if ( is_rootmount(mount_entry) ) {
+
+	    /* link rootmount and rootentry */
+
+	    if ( ! mount_entry->data0 ) {
+
+		/* not already assigned */
+
+		entry=get_rootentry();
+
+		mount_entry->data0=(void *) entry;
+		entry->mount_entry=mount_entry;
+
+	    }
+
+	    /* root is already created */
+
+	    goto next;
+
+	}
+
+	/* match a client fs if there is one, not at init(TODO) */
+
+	// determine_backend_mountpoint(mount_entry);
+
+        entry=(struct notifyfs_entry_struct *) mount_entry->data0;
+
+        if ( entry ) {
+            struct call_info_struct call_info;
+
+            /* entry does exist already, there is a tree already related to this mount */
+            /* walk through tree and wake everything up */
+
+	    init_call_info(&call_info, entry);
+
+            call_info.path=mount_entry->mountpoint;
+	    call_info.mount_entry=mount_entry;
+
+            //changestate(&call_info, FSEVENT_ACTION_TREE_UP);
+
+        } else {
+
+	    if ( strcmp(mount_entry->mountpoint, "/") == 0 ) {
+
+		/* skip the root... not necessary to create....*/
+		goto next;
+
+	    } else if ( strcmp(notifyfs_options.mountpoint, mount_entry->mountpoint)==0 ) {
+
+		/* skip the mountpoint of this fs, caused deadlocks in the past... 
+		   this will be not the case anymore since the threads for handling the fuse
+		   events are up and running independent of this thread... needs testing */
+
+		goto next;
+
+	    }
+
+            create_notifyfs_mount_path(mount_entry);
+
+        }
+
+	/* send message to inform clients.. not on startup */
+
+	// if ( firstrun==0 ) send_mount_message_to_clients(mount_entry);
+
+	next:
+
+        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_ADDED);
+
+    }
+
+    unlock:
+
     res=unlock_mountlist();
-
-    /* a reply message to terminate */
-
-    res=reply_message(client->fd, mount_message->unique, 0);
 
 }
 
-
-
-static struct fuse_lowlevel_ops notifyfs_oper = {
+struct fuse_lowlevel_ops notifyfs_oper = {
     .init	= notifyfs_init,
     .destroy	= notifyfs_destroy,
     .lookup	= notifyfs_lookup,
@@ -3537,17 +2526,12 @@ static struct fuse_lowlevel_ops notifyfs_oper = {
 
 int main(int argc, char *argv[])
 {
-    struct fuse_args notifyfs_fuse_args = FUSE_ARGS_INIT(0, NULL);
-    struct fuse_session *notifyfs_session;
-    int res, epoll_fd, socket_fd, inotify_fd, mountinfo_fd, networksocket_fd;
+    int res, epoll_fd, socket_fd, mountinfo_fd;
     struct stat st;
     pthread_t threadid_mountmonitor=0;
     struct epoll_extended_data_struct *epoll_xdata=NULL;
-    struct epoll_extended_data_struct xdata_inotify={0, 0, NULL, NULL, NULL, NULL};
-    struct epoll_extended_data_struct xdata_socket={0, 0, NULL, NULL, NULL, NULL};
-    struct epoll_extended_data_struct xdata_mountinfo={0, 0, NULL, NULL, NULL, NULL};
-    struct epoll_extended_data_struct xdata_network={0, 0, NULL, NULL, NULL, NULL};
-
+    struct epoll_extended_data_struct xdata_socket=EPOLL_XDATA_INIT;
+    struct epoll_extended_data_struct xdata_mountinfo=EPOLL_XDATA_INIT;
 
     umask(0);
 
@@ -3557,7 +2541,7 @@ int main(int argc, char *argv[])
 
     /* parse commandline options and initialize the fuse options */
 
-    res=parse_arguments(argc, argv, &notifyfs_fuse_args);
+    res=parse_arguments(argc, argv, &global_fuse_args);
 
     if ( res<0 ) {
 
@@ -3565,7 +2549,6 @@ int main(int argc, char *argv[])
 	goto skipeverything;
 
     }
-
 
     //
     // init the name and inode hashtables
@@ -3580,9 +2563,10 @@ int main(int argc, char *argv[])
 
     }
 
-    //
-    // create the root inode and entry
-    //
+    /*
+     create the root inode and entry
+    */
+
     res=create_root();
 
     if ( res<0 ) {
@@ -3592,12 +2576,11 @@ int main(int argc, char *argv[])
 
     }
 
-    //
-    // set default options
-    //
+    /*
+     set default options
+    */
 
     logoutput("main: taking accessmode %i", notifyfs_options.accessmode);
-    logoutput("main: taking filesystems %i", notifyfs_options.filesystems);
     logoutput("main: taking testmode %i", notifyfs_options.testmode);
 
     loglevel=notifyfs_options.logging;
@@ -3606,22 +2589,6 @@ int main(int argc, char *argv[])
     notifyfs_options.attr_timeout=1.0;
     notifyfs_options.entry_timeout=1.0;
     notifyfs_options.negative_timeout=1.0;
-
-    if ( (notifyfs_chan = fuse_mount(notifyfs_options.mountpoint, &notifyfs_fuse_args)) == NULL) {
-
-        logoutput("Error mounting and setting up a channel.");
-        goto out;
-
-    }
-
-    notifyfs_session=fuse_lowlevel_new(&notifyfs_fuse_args, &notifyfs_oper, sizeof(notifyfs_oper), NULL);
-
-    if ( notifyfs_session == NULL ) {
-
-        logoutput("Error starting a new session.");
-        goto out;
-
-    }
 
     res = fuse_daemonize(0);
 
@@ -3632,11 +2599,13 @@ int main(int argc, char *argv[])
 
     }
 
-    fuse_session_add_chan(notifyfs_session, notifyfs_chan);
+    /* read fstab */
 
-    epoll_fd=init_mainloop();
+    read_fstab();
 
-    if ( epoll_fd<=0 ) {
+    epoll_fd=init_eventloop(NULL, 1, 0);
+
+    if ( epoll_fd<0 ) {
 
         logoutput("Error creating epoll fd, error: %i.", epoll_fd);
         goto out;
@@ -3661,104 +2630,10 @@ int main(int argc, char *argv[])
 
     }
 
-    /* add socket to epoll for reading */
-
-    epoll_xdata=add_to_epoll(socket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_socket_fd, NULL, &xdata_socket);
-
-    if ( ! epoll_xdata ) {
-
-        logoutput("Error adding socket fd to mainloop.");
-        goto out;
-
-    } else {
-
-        logoutput("socket fd %i added to epoll", socket_fd);
-
-	add_xdata_to_list(epoll_xdata);
-
-    }
-
     notifyfs_options.socket_fd=socket_fd;
-
-    /* assign the message callbacks */
-
-    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_CLIENT, &handle_client_message);
-    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_FSEVENT, &handle_fsevent_message);
-    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_REPLY, &handle_reply_message);
-    assign_message_callback_server(NOTIFYFS_MESSAGE_TYPE_MOUNTINFO_REQ, &handle_mountinfo_request);
-
-    /* listen to the network */
-
-    if ( notifyfs_options.listennetwork==1 ) {
-
-	networksocket_fd=create_networksocket(notifyfs_options.networkport);
-
-	if ( networksocket_fd<=0 ) {
-
-    	    logoutput("Error creating networksocket fd: %i.", networksocket_fd);
-    	    goto out;
-
-	}
-
-	/* add socket to epoll for reading */
-
-	epoll_xdata=add_to_epoll(networksocket_fd, EPOLLIN, TYPE_FD_SOCKET, &handle_data_on_networksocket_fd, NULL, &xdata_network);
-
-	if ( ! epoll_xdata ) {
-
-    	    logoutput("Error adding networksocket fd to mainloop.");
-    	    goto out;
-
-	} else {
-
-    	    logoutput("networksocket fd %i added to epoll", networksocket_fd);
-
-	    add_xdata_to_list(epoll_xdata);
-
-	}
-
-	notifyfs_options.networksocket_fd=networksocket_fd;
-
-    }
-
+    assign_socket_callback(client_socketfd_callback);
 
     /*
-    *    add a inotify instance to epoll : default backend 
-    *
-    */
-
-    /* create the inotify instance */
-
-    inotify_fd=inotify_init();
-
-    if ( inotify_fd<=0 ) {
-
-        logoutput("Error creating inotify fd: %i.", errno);
-        goto out;
-
-    }
-
-    /* add inotify to epoll */
-
-    epoll_xdata=add_to_epoll(inotify_fd, EPOLLIN | EPOLLPRI, TYPE_FD_INOTIFY, &handle_data_on_inotify_fd, NULL, &xdata_inotify);
-
-    if ( ! epoll_xdata ) {
-
-        logoutput("error adding inotify fd to mainloop.");
-        goto out;
-
-    } else {
-
-        logoutput("inotify fd %i added to epoll", inotify_fd);
-
-	add_xdata_to_list(epoll_xdata);
-
-    }
-
-    notifyfs_options.inotify_fd=inotify_fd;
-
-
-    /* 
     *     add mount info 
     */
 
@@ -3771,7 +2646,7 @@ int main(int argc, char *argv[])
 
     }
 
-    epoll_xdata=add_to_epoll(mountinfo_fd, EPOLLERR, TYPE_FD_INOTIFY, &handle_data_on_mountinfo_fd, NULL, &xdata_mountinfo);
+    epoll_xdata=add_to_epoll(mountinfo_fd, EPOLLERR, TYPE_FD_INOTIFY, process_mountinfo_event, NULL, &xdata_mountinfo, NULL);
 
     if ( ! epoll_xdata ) {
 
@@ -3782,67 +2657,27 @@ int main(int argc, char *argv[])
 
         logoutput("mountinfo fd %i added to epoll", mountinfo_fd);
 
-	add_xdata_to_list(epoll_xdata);
+	add_xdata_to_list(epoll_xdata, NULL);
 
     }
 
-    res=start_mountmonitor(&threadid_mountmonitor, &update_notifyfs);
+    register_mountinfo_callback(MOUNTINFO_CB_ONUPDATE, &update_notifyfs);
 
-    if ( res<0 ) {
-
-        logoutput("error (%i) starting mountmonitor thread", res);
-
-    } else {
-
-        logoutput("thread for mountmonitor started");
-
-    }
-
-
-    /* signal the mountmonitor to do the initial reading of the mounttable */
-
-    signal_mountmonitor(1);
-
-    /* if configured add a network socket */
-
-    // if ( notifyfs_options.listennetwork==1 ) {
-
+    process_mountinfo(NULL);
 
     /* add the fuse channel(=fd) to the mainloop */
 
-    res=addfusechannelstomainloop(notifyfs_session, notifyfs_options.mountpoint);
+    res=initialize_fuse(notifyfs_options.mountpoint);
 
-    /* handle error here */
+    if (res<0) goto out;
 
-    res=startfusethreads();
+    start_workerthreads();
 
-    /* handle error again */
-
-    res=epoll_mainloop();
+    res=start_epoll_eventloop(NULL);
 
     out:
 
-    terminatefuse(NULL);
-
-    if ( xdata_inotify.fd>0 ) {
-
-	res=remove_xdata_from_epoll(&xdata_inotify, 0);
-	close(xdata_inotify.fd);
-	xdata_inotify.fd=0;
-	notifyfs_options.inotify_fd=0;
-	remove_xdata_from_list(&xdata_inotify);
-
-    }
-
-    if ( xdata_network.fd>0 ) {
-
-	res=remove_xdata_from_epoll(&xdata_network, 0);
-	close(xdata_network.fd);
-	xdata_network.fd=0;
-	notifyfs_options.networksocket_fd=0;
-	remove_xdata_from_list(&xdata_network);
-
-    }
+    finish_fuse();
 
     if ( xdata_socket.fd>0 ) {
 
@@ -3850,7 +2685,7 @@ int main(int argc, char *argv[])
 	close(xdata_socket.fd);
 	xdata_socket.fd=0;
 	notifyfs_options.socket_fd=0;
-	remove_xdata_from_list(&xdata_socket);
+	remove_xdata_from_list(&xdata_socket, 0, NULL);
 
     }
 
@@ -3861,17 +2696,14 @@ int main(int argc, char *argv[])
 	res=remove_xdata_from_epoll(&xdata_mountinfo, 0);
 	close(xdata_mountinfo.fd);
 	xdata_mountinfo.fd=0;
-	remove_xdata_from_list(&xdata_mountinfo);
+	remove_xdata_from_list(&xdata_mountinfo, 0, NULL);
 
     }
 
     /* remove any remaining xdata from mainloop */
 
-    destroy_mainloop();
-
-    if ( threadid_mountmonitor ) pthread_cancel(threadid_mountmonitor);
-
-    fuse_opt_free_args(&notifyfs_fuse_args);
+    destroy_eventloop(NULL);
+    fuse_opt_free_args(&global_fuse_args);
 
     skipeverything:
 

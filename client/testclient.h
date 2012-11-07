@@ -16,12 +16,14 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef NETWORKUTILS_H
-#define NETWORKUTILS_H
 
+#ifndef NOTIFYFS_MAIN_H
+#define NOTIFYFS_MAIN_H
 
-// Prototypes
+#include <fuse/fuse_lowlevel.h>
 
-char *get_ipv4address(const char *host, const char *service);
+typedef char pathstring[PATH_MAX+1];
+typedef char smallpathstring[SMALL_PATH_MAX+1];
+
 
 #endif
