@@ -17,13 +17,13 @@
 
 */
 
-#ifndef MOUNTINFO_MONITOR_H
-#define MOUNTINFO_MONITOR_H
+#ifndef FUSE_WORKSPACE_HANDLELOCKINFOEVENTS_H
+#define FUSE_WORKSPACE_HANDLELOCKINFOEVENTS_H
 
-#define MOUNTINFO_FILE "/proc/self/mountinfo"
 
-void read_fstab();
-void handle_change_mounttable();
-unsigned char device_found_in_fstab(char *device);
+// Prototypes
+
+int process_lockinfo_event(int fd, void *data, uint32_t events);
+void init_handlelockinfoevent(struct workerthreads_queue_struct *workerthreads_queue);
 
 #endif

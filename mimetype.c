@@ -39,65 +39,47 @@
 #include <sys/un.h>
 #include <pthread.h>
 
+#include    <magic.h>
+
 #define LOG_LOGAREA LOG_LOGAREA_MESSAGE
 
 #include "logging.h"
-#include "message.h"
+#include "notifyfs.h"
 #include "utils.h"
 
+static magic_t notifyfs_magic_set=NULL;
 
-uint64_t uniquectr=0;
-pthread_mutex_t uniquectr_mutex=PTHREAD_MUTEX_INITIALIZER;
-
-uint64_t new_uniquectr()
+int open_mimetype_database()
 {
-
-    pthread_mutex_lock(&uniquectr_mutex);
-    uniquectr++;
-    pthread_mutex_unlock(&uniquectr_mutex);
-
-    return uniquectr;
-}
-
-
-/* function to send a raw message */
-
-int send_message(int fd, struct notifyfs_message_body *message, void *data, int len)
-{
-    struct msghdr msg;
-    struct iovec io_vector[2];
     int nreturn=0;
 
-    msg.msg_controllen=0;
-    msg.msg_control=NULL;
+    notifyfs_magic_set=magic_open(MAGIC_ERROR|MAGIC_MIME);
 
-    msg.msg_name=NULL;
-    msg.msg_namelen=0;
+    if (notifyfs_magic_set) {
 
-    io_vector[0].iov_base=(void *) message;
-    io_vector[0].iov_len=sizeof(struct notifyfs_message_body);
+	if (magic_load(notifyfs_magic_set, NULL)==-1) nreturn=-1;
 
-    io_vector[1].iov_base=data;
-    io_vector[1].iov_len=len;
+    } else {
 
-    msg.msg_iov=io_vector;
-    msg.msg_iovlen=2;
-
-    /* the actual sending */
-
-    nreturn=sendmsg(fd, &msg, 0);
-
-    if ( nreturn==-1 ) {
-
-	nreturn=-errno;
+	nreturn=-1;
 
     }
 
-    logoutput("send_message: return %i", nreturn);
+}
 
-    out:
+const char *get_mimetype(const char *file)
+{
 
-    return nreturn;
+    if(notifyfs_magic_set) return magic_file(notifyfs_magic_set, file);
+
+    return NULL;
 
 }
 
+
+void close_mimetype_database()
+{
+    magic_close(notifyfs_magic_set);
+
+    notifyfs_magic_set=NULL;
+}

@@ -120,6 +120,15 @@ int check_access(fuse_req_t req, struct stat *st, int mask)
     int nreturn=0, res;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
+    if (ctx->uid==0) {
+
+	nreturn=1;
+	goto out;
+
+    }
+
+
+
     /* deny execute and write on everything but directories */
 
     if ( ! S_ISDIR(st->st_mode)) {

@@ -1,6 +1,6 @@
 /*
 
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -22,15 +22,8 @@
 
 // Prototypes
 
-void del_watch_backend(struct effective_watch_struct *effective_watch);
-void set_watch_backend(struct effective_watch_struct *effective_watch, int newmask, unsigned char lockset);
-
-void changestate(struct call_info_struct *call_info, unsigned char typeaction);
-void process_notifyfs_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent);
-
-void update_notifyfs(unsigned char firstrun);
+void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent);
+struct notifyfs_fsevent_struct *create_fsevent(struct notifyfs_entry_struct *entry);
+void init_changestate(struct workerthreads_queue_struct *workerthreads_queue);
 
 #endif
-
-
-

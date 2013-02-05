@@ -51,25 +51,23 @@
 #include "logging.h"
 #include "epoll-utils.h"
 #include "workerthreads.h"
-#include "mountinfo-monitor.h"
-#include "handlemountinfoevent.h"
+#include "lock-monitor.h"
+#include "handlelockinfoevent.h"
 
 static struct workerthreads_queue_struct *global_workerthreads_queue=NULL;
 
-static void process_mountinfo(void *data)
+static void process_lockinfo(void *data)
 {
 
-    /* call the function handle_change_mounttable to read the changes */
-
-    handle_change_mounttable();
+    parse_changes_locks();
 
 }
 
 /*
- * process an event the mountinfo
+ * process an event the locks
  */
 
-int process_mountinfo_event(int fd, void *data, uint32_t events)
+int process_lockinfo_event(int fd, void *data, uint32_t events)
 {
     int nreturn=0;
 
@@ -89,7 +87,7 @@ int process_mountinfo_event(int fd, void *data, uint32_t events)
 
 	/* assign the right callbacks and data */
 
-	workerthread->processevent_cb=process_mountinfo;
+	workerthread->processevent_cb=process_lockinfo;
 	workerthread->data=NULL;
 
 	/* send signal to start */
@@ -98,9 +96,7 @@ int process_mountinfo_event(int fd, void *data, uint32_t events)
 
     } else {
 
-	/* called without a valid fd (at init) */
-
-	process_mountinfo(NULL);
+	process_lockinfo(NULL);
 
     }
 
@@ -110,7 +106,7 @@ int process_mountinfo_event(int fd, void *data, uint32_t events)
 
 }
 
-void init_handlemountinfoevent(struct workerthreads_queue_struct *workerthreads_queue)
+void init_handlelockinfoevent(struct workerthreads_queue_struct *workerthreads_queue)
 {
 
     global_workerthreads_queue=workerthreads_queue;

@@ -20,39 +20,7 @@
 #ifndef NOTIFYFS_MAIN_H
 #define NOTIFYFS_MAIN_H
 
-#include <fuse/fuse_lowlevel.h>
+#define NOTIFYFS_REMOTESERVERS_FILE_DEFAULT	"/etc/notifyfs/servers"
 
-typedef char pathstring[PATH_MAX+1];
-typedef char smallpathstring[SMALL_PATH_MAX+1];
-
-struct notifyfs_options_struct {
-     char socket[UNIX_PATH_MAX];
-     pathstring mountpoint;
-     unsigned char logging;
-     int logarea;
-     unsigned char accessmode;
-     unsigned char testmode;
-     int socket_fd;
-     int inotify_fd;
-     pathstring pidfile;
-     double attr_timeout;
-     double entry_timeout;
-     double negative_timeout;
-};
-
-struct notifyfs_generic_fh_struct {
-    struct notifyfs_entry_struct *entry;
-    int fd;
-    void *data;
-};
-
-struct notifyfs_generic_dirp_struct {
-    struct notifyfs_generic_fh_struct generic_fh;
-    struct notifyfs_entry_struct *entry;
-    struct stat st;
-    off_t upperfs_offset;
-    off_t underfs_offset;
-    struct call_info_struct *call_info;
-};
 
 #endif

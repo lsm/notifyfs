@@ -20,31 +20,39 @@
 #ifndef NOTIFYFS_PATH_RESOLUTION_H
 #define NOTIFYFS_PATH_RESOLUTION_H
 
+typedef char pathstring[PATH_MAX+1];
+
 #define NOTIFYFS_PATH_NONE      0
 #define NOTIFYFS_PATH_FORCE     1
 #define NOTIFYFS_PATH_BACKEND   2
 
 struct call_info_struct {
     struct notifyfs_entry_struct *entry;
-    struct notifyfs_entry_struct *entry2remove;
-    struct effective_watch_struct *effective_watch;
+    struct watch_struct *watch;
     pthread_t threadid;
     char *path;
     unsigned char freepath;
-    struct call_info_struct *next;
-    struct call_info_struct *prev;
-    struct mount_entry_struct *mount_entry;
+    int mount;
     const struct fuse_ctx *ctx;
+};
+
+struct notifyfs_generic_fh_struct {
+    struct notifyfs_entry_struct *entry;
+    int fd;
+    void *data;
+};
+
+struct notifyfs_generic_dirp_struct {
+    struct notifyfs_generic_fh_struct generic_fh;
+    struct notifyfs_entry_struct *entry;
+    struct stat st;
+    off_t upperfs_offset;
 };
 
 // Prototypes
 
 int determine_path(struct call_info_struct *call_info, unsigned char flags);
-
-struct call_info_struct *get_call_info(struct notifyfs_entry_struct *entry);
 void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_struct *entry);
-void remove_call_info(struct call_info_struct *call_info);
-
-void create_notifyfs_path(struct call_info_struct *call_info);
+void create_notifyfs_path(struct call_info_struct *call_info, struct stat *buff_st);
 
 #endif

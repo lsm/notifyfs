@@ -23,7 +23,7 @@
 
 // Prototypes
 
-void process_mountinfo(void *data);
 int process_mountinfo_event(int fd, void *data, uint32_t events);
+void init_handlemountinfoevent(struct workerthreads_queue_struct *workerthreads_queue);
 
 #endif

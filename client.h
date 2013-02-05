@@ -25,13 +25,11 @@
 #define NOTIFYFS_CLIENTSTATUS_SLEEP     3
 
 struct client_struct {
-    int fd;
+    unsigned char type;
     char buff0[sizeof(struct notifyfs_message_body)];
     char recvbuff[NOTIFYFS_SERVER_RECVBUFFERSIZE];
-    char sendbuff[NOTIFYFS_SERVER_SENDBUFFERSIZE];
     size_t buff0size;
     size_t recvbuffsize;
-    size_t sendbuffsize;
     pid_t pid;
     pid_t tid;
     uid_t uid;
@@ -42,37 +40,22 @@ struct client_struct {
     pthread_cond_t cond;
     unsigned char lock;
     unsigned char status;
-    unsigned char messagemask;
-    struct watch_struct *watches;
-};
-
-struct command_list_struct {
-    char *path;
-    char *name;
-    unsigned char typeentry;
-    int maxentries;
-};
-
-struct clientcommand_struct {
-    uint64_t unique;
-    struct client_struct *client;
-    unsigned char type;
-    union {
-	struct command_list_struct list;
-    } command;
+    void *clientwatches;
+    struct notifyfs_connection_struct *connection;
 };
 
 // Prototypes
 
+struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid_t gid, unsigned char type);
 struct client_struct *lookup_client(pid_t pid, unsigned char lockset);
+void remove_client(struct client_struct *client);
 
 int lock_clientslist();
 int unlock_clientslist();
-struct client_struct *get_clientslist();
+
+struct client_struct *get_next_client(struct client_struct *client);
 
 void lock_client(struct client_struct *client);
 void unlock_client(struct client_struct *client);
-
-int client_socketfd_callback(int fd, pid_t pid, uid_t uid, gid_t gid);
 
 #endif

@@ -52,6 +52,7 @@
 #include "entry-management.h"
 #include "path-resolution.h"
 #include "xattr.h"
+#include "options.h"
 
 
 extern struct notifyfs_options_struct notifyfs_options;
@@ -60,7 +61,7 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 {
     int nvalue, nreturn=-ENOATTR;
 
-    if ( isrootinode(call_info->entry->inode)==1 ) {
+    if ( isrootentry(call_info->entry)==1 ) {
 
 	// setting system values only on root entry
 
@@ -179,7 +180,7 @@ void getxattr4workspace(struct call_info_struct *call_info, const char *name, st
 
     logoutput2("getxattr4workspace, name: %s, size: %i", name, xattr_workspace->size);
 
-    if ( isrootinode(call_info->entry->inode)==1 ) {
+    if ( isrootentry(call_info->entry)==1 ) {
 
 	// only the system related
 
@@ -316,7 +317,7 @@ int listxattr4workspace(struct call_info_struct *call_info, char *list, size_t s
 
     // system related attributes, only available on root
 
-    if ( isrootinode(call_info->entry->inode)==1 ) {
+    if ( isrootentry(call_info->entry)==1 ) {
 
 	// level of logging
 

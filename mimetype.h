@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -16,15 +16,15 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef TESTAPP_USERMENU_H
-#define TESTAPP_USERMENU_H
+#ifndef NOTIFYFS_MIMETYPE_H
+#define NOTIFYFS_MIMETYPE_H
+
 
 
 // Prototypes
 
-int start_showmenu_thread(pthread_t *pthreadid);
+int open_mimetype_database();
+const char *get_mimetype(const char *file);
+void close_mimetype_database();
 
 #endif
-
-
-

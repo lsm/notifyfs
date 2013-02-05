@@ -46,12 +46,13 @@
 #include <fuse/fuse_lowlevel.h>
 
 #include "logging.h"
-#include "notifyfs.h"
+#include "notifyfs-io.h"
 #include "entry-management.h"
 #include "path-resolution.h"
 #include "watches.h"
 #include "mountinfo.h"
 #include "message.h"
+#include "utils.h"
 
 unsigned char call_info_lock;
 pthread_mutex_t call_info_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -66,7 +67,7 @@ struct pathinfo_struct {
 	size_t maxsize;
 	char *pathstart;
 	size_t len;
-	struct mount_entry_struct *mount_entry;
+	int mount;
 };
 
 
@@ -84,9 +85,7 @@ static int addtopath(struct pathinfo_struct *pathinfo, char *path)
     int len=strlen(path), nreturn=0;
     unsigned char addslash=0;
 
-    logoutput("addtopath: add path %s", path);
-
-    /* see it fits */
+    /* add a slash or not */
 
     if ( pathinfo->len>0 && *(path+len-1) != '/' ) {
 
@@ -98,6 +97,8 @@ static int addtopath(struct pathinfo_struct *pathinfo, char *path)
 	pathinfo->len+=len;
 
     }
+
+    /* see it fits */
 
     if ( pathinfo->len>pathinfo->maxsize ) {
 
@@ -136,64 +137,9 @@ static int addtopath(struct pathinfo_struct *pathinfo, char *path)
 static int processextrapathinfo(struct notifyfs_entry_struct *entry, struct pathinfo_struct *pathinfo)
 {
     int nreturn=0;
-    /* check for an effective watch attached, this will speed things up */
-
-    if ( entry->inode ) {
-
-	/* first: look for an effective watch, is has a path set relative to the mount entry, and 
-           this mount entry has a mountpoint  */
-
-	if (entry->inode->effective_watch ) {
-	    struct effective_watch_struct *effective_watch=entry->inode->effective_watch;
-
-	    if ( effective_watch->mount_entry) {
-		struct mount_entry_struct *mount_entry=effective_watch->mount_entry;
-
-		pathinfo->mount_entry=mount_entry;
-
-		if ( entry==(struct notifyfs_entry_struct *) mount_entry->data0 ) {
-
-		    /* watch is on mountpoint */
-
-		    logoutput("determine_path: mount_entry found, add path %s", mount_entry->mountpoint);
-
-		    nreturn=addtopath(pathinfo, mount_entry->mountpoint);
-		    goto out;
-
-		} else {
-
-		    logoutput("determine_path: effective_watch and mount_entry found, add path %s/%s", mount_entry->mountpoint, effective_watch->path);
-
-		    nreturn=addtopath(pathinfo, effective_watch->path);
-		    if ( nreturn<0 ) goto out;
-
-		    nreturn=addtopath(pathinfo, mount_entry->mountpoint);
-		    goto out;
 
 
-		}
-
-	    }
-
-	}
-
-    }
-
-    /* second: check there is a mount entry */
-
-    if ( entry->mount_entry ) {
-	struct mount_entry_struct *mount_entry=entry->mount_entry;
-
-	pathinfo->mount_entry=mount_entry;
-
-	logoutput("determine_path: mount_entry found, add path %s", mount_entry->mountpoint);
-
-	nreturn=addtopath(pathinfo, mount_entry->mountpoint);
-	goto out;
-
-    }
-
-    /* third: check it's root */
+    /* second: check it's root */
 
     if ( isrootentry(entry) ) {
 
@@ -210,56 +156,54 @@ static int processextrapathinfo(struct notifyfs_entry_struct *entry, struct path
 
 }
 
-
-
 int determine_path(struct call_info_struct *call_info, unsigned char flags)
 {
-    char *pathstart=NULL;
+    char *pathstart=NULL, *name;
     int nreturn=0;
     struct notifyfs_entry_struct *entry=call_info->entry;
     pathstring path;
     struct pathinfo_struct pathinfo;
-
-    logoutput("determine_path, name: %s", entry->name);
 
     pathinfo.path=path;
     pathinfo.maxsize=sizeof(pathstring);
     pathinfo.len=0;
     pathinfo.pathstart = pathinfo.path + pathinfo.maxsize - 1;
     *(pathinfo.pathstart) = '\0';
-    pathinfo.mount_entry=NULL;
+    pathinfo.mount=-1;
 
-    if ( entry->status==ENTRY_STATUS_REMOVED && ! (flags & NOTIFYFS_PATH_FORCE) ) {
+    if ( isrootentry(entry) ) {
 
-        nreturn=-ENOENT;
-        goto error;
+        pathinfo.pathstart--;
+        *(pathinfo.pathstart)='/';
+	pathinfo.len++;
+	nreturn=1;
+	goto out;
 
     }
 
-    /* check for extra pathinfo available */
+    if (entry->mount>0) pathinfo.mount=entry->mount;
 
-    nreturn=processextrapathinfo(entry, &pathinfo);
-    if ( nreturn!=0 ) goto out;
+    name=get_data(entry->name);
 
-    nreturn=addtopath(&pathinfo, entry->name);
+    nreturn=addtopath(&pathinfo, name);
 
-    while (entry->parent) {
+    while (entry->parent>=0) {
 
-	entry=entry->parent;
+	entry=get_entry(entry->parent);
 
-        if ( entry->status==ENTRY_STATUS_REMOVED && ! (flags & NOTIFYFS_PATH_FORCE) ) {
+	if ( isrootentry(entry) ) {
 
-            nreturn=-ENOENT;
-            goto error;
+    	    pathinfo.pathstart--;
+    	    *(pathinfo.pathstart)='/';
+	    pathinfo.len++;
+	    break;
 
-        }
+	}
 
-	/* check for extra pathinfo available */
+	if (entry->mount>0 && pathinfo.mount==-1) pathinfo.mount=entry->mount;
 
-	nreturn=processextrapathinfo(entry, &pathinfo);
-	if ( nreturn!=0 ) goto out;
-
-	nreturn=addtopath(&pathinfo, entry->name);
+	name=get_data(entry->name);
+	nreturn=addtopath(&pathinfo, name);
 	if ( nreturn<0 ) goto error;
 
     }
@@ -280,15 +224,7 @@ int determine_path(struct call_info_struct *call_info, unsigned char flags)
 
 	}
 
-	if ( pathinfo.mount_entry ) {
-
-	    call_info->mount_entry=pathinfo.mount_entry;
-
-	} else {
-
-	    call_info->mount_entry=get_rootmount();
-
-	}
+	call_info->mount=pathinfo.mount;
 
 	/* create a path just big enough */
 
@@ -301,7 +237,17 @@ int determine_path(struct call_info_struct *call_info, unsigned char flags)
 
 	    call_info->freepath=1;
 
-    	    logoutput("result after memcpy: %s", call_info->path);
+	    if (call_info->mount>=0) {
+		struct notifyfs_mount_struct *mount=get_mount(call_info->mount);
+
+    		logoutput("determine_path: at mount %s, result after memcpy: %s", mount->filesystem, call_info->path);
+
+	    } else {
+
+    		logoutput("determine_path: at rootmount, result after memcpy: %s", call_info->path);
+
+	    }
+
 
 	} else {
 
@@ -319,98 +265,19 @@ int determine_path(struct call_info_struct *call_info, unsigned char flags)
 
 }
 
-struct call_info_struct *create_call_info()
-{
-    struct call_info_struct *call_info=NULL;
-
-
-    call_info=malloc(sizeof(struct call_info_struct));
-
-
-    return call_info;
-
-}
-
-void add_call_info_to_list(struct call_info_struct *call_info)
-{
-    int res;
-
-    /* add to list */
-
-    res=pthread_mutex_lock(&call_info_mutex);
-
-    if ( call_info_list ) call_info_list->prev=call_info;
-    call_info->next=call_info_list;
-    call_info->prev=NULL;
-    call_info_list=call_info;
-
-    res=pthread_mutex_unlock(&call_info_mutex);
-
-}
-
 void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_struct *entry)
 {
 
     call_info->threadid=pthread_self();
     call_info->entry=entry;
-    call_info->entry2remove=entry;
-    call_info->effective_watch=NULL;
+    call_info->watch=NULL;
     call_info->path=NULL;
     call_info->freepath=0;
-    call_info->next=NULL;
-    call_info->prev=NULL;
-    call_info->mount_entry=NULL;
+    call_info->mount=-1;
     call_info->ctx=NULL;
 
 }
 
-struct call_info_struct *get_call_info(struct notifyfs_entry_struct *entry)
-{
-    int res;
-    struct call_info_struct *call_info=NULL;
-
-    res=pthread_mutex_lock(&call_info_unused_mutex);
-
-    if (call_info_unused) {
-
-        call_info=call_info_unused;
-        call_info_unused=call_info->next;
-
-    } else {
-
-        call_info=create_call_info();
-
-    }
-
-    res=pthread_mutex_unlock(&call_info_unused_mutex);
-
-    if (call_info) init_call_info(call_info, entry);
-
-    out:
-
-    return call_info;
-
-}
-
-void remove_call_info(struct call_info_struct *call_info)
-{
-    int res=0;
-
-    if (call_info->freepath==1) free(call_info->path);
-    call_info->freepath=0;
-
-    /* move to unused list */
-
-    res=pthread_mutex_lock(&call_info_unused_mutex);
-
-    if (call_info_unused) call_info_unused->prev=call_info;
-    call_info->next=call_info_unused;
-    call_info_unused=call_info;
-    call_info->prev=NULL;
-
-    res=pthread_mutex_unlock(&call_info_unused_mutex);
-
-}
 
 /* function which creates a path in notifyfs 
 
@@ -419,24 +286,28 @@ void remove_call_info(struct call_info_struct *call_info)
 
 */
 
-void create_notifyfs_path(struct call_info_struct *call_info)
+void create_notifyfs_path(struct call_info_struct *call_info, struct stat *buff_st)
 {
-    char *path, *slash, *name;
-    struct notifyfs_inode_struct *pinode; 
-    struct notifyfs_entry_struct *pentry, *entry;
+    char *path, *slash;
+    struct notifyfs_entry_struct *entry, *parent;
+    struct notifyfs_inode_struct *inode;
+    struct notifyfs_attr_struct *attr;
     int res;
     char tmppath[strlen(call_info->path)+1];
     struct stat st;
+    struct timespec current_time;
+    unsigned char entrycreated=0;
 
-    pentry=get_rootentry();
-    pinode=pentry->inode;
+    get_current_time(&current_time);
+
+    parent=get_rootentry();
     entry=NULL;
 
     call_info->entry=NULL;
-    call_info->entry2remove=NULL;
-    call_info->effective_watch=NULL;
+    call_info->watch=NULL;
 
-    call_info->mount_entry=get_rootmount();
+    call_info->mount=parent->mount;
+
     call_info->ctx=NULL;
 
     strcpy(tmppath, call_info->path);
@@ -470,61 +341,90 @@ void create_notifyfs_path(struct call_info_struct *call_info)
 
         if ( slash ) *slash='\0';
 
-        name=path;
+	entrycreated=0;
 
-        if ( name ) {
+	inode=get_inode(parent->inode);
 
-            entry=find_entry(pinode->ino, name);
+        entry=find_entry_by_entry(parent, path);
 
-            if ( ! entry ) {
+        if ( ! entry ) {
 
-        	/* check the stat */
+    	    /* check the stat */
 
-        	res=lstat(tmppath, &st);
+    	    if (lstat(tmppath, &st)==-1) {
 
-        	if ( res==-1 ) {
+		logoutput("create_notifyfs_path: error %i at %s", errno, tmppath);
 
-            	    /* what to do here?? the path does not exist */
-            	    entry=NULL;
-            	    break;
+		/* additional action.. */
 
-        	}
+            	/* what to do here?? the path does not exist */
 
-                entry=create_entry(pentry, name, NULL);
+            	entry=NULL;
+            	break;
 
-                if (entry) {
+    	    }
 
-                    assign_inode(entry);
+	    entry=create_entry(parent, path);
 
-		    if ( entry->inode ) {
+            if (entry) {
 
-                	/*  is there a function to signal kernel an inode and entry are created 
-                    	    like fuse_lowlevel_notify_new_inode */
+                assign_inode(entry);
 
-                	add_to_inode_hash_table(entry->inode);
-                	add_to_name_hash_table(entry);
+		inode=get_inode(entry->inode);
 
-                	copy_stat(&(entry->inode->st), &st);
+		if (inode) {
 
-		    } else {
+            	    add_to_name_hash_table(entry);
 
-			remove_entry(entry);
-			entry=NULL;
-			break;
+		    attr=assign_attr(&st, inode);
+
+		    if (attr) {
+
+			attr->ctim.tv_sec=st.st_ctim.tv_sec;
+			attr->ctim.tv_nsec=st.st_ctim.tv_nsec;
+
+			if (S_ISDIR(attr->cached_st.st_mode)) {
+
+			    attr->mtim.tv_sec=0;
+			    attr->mtim.tv_nsec=0;
+
+			} else {
+
+			    attr->mtim.tv_sec=st.st_mtim.tv_sec;
+			    attr->mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+			}
+
+			attr->atim.tv_sec=current_time.tv_sec;
+			attr->atim.tv_nsec=current_time.tv_nsec;
 
 		    }
 
-                } else {
+		    entrycreated=1;
 
-                    break;
+		} else {
 
-                }
+		    remove_entry(entry);
+		    entry=NULL;
+		    break;
+
+		}
+
+            } else {
+
+                break;
 
             }
 
-	    if (entry->mount_entry) call_info->mount_entry=entry->mount_entry;
-
         }
+
+	if (entry->mount>=0) {
+
+	    logoutput("create_notifyfs_path: got mountindex %i on %s", entry->mount, tmppath);
+
+	    call_info->mount=entry->mount;
+
+	}
 
         if ( ! slash ) {
 
@@ -532,17 +432,49 @@ void create_notifyfs_path(struct call_info_struct *call_info)
 
         } else {
 
-	    /* shift */
-
             /* make slash a slash again (was turned into a \0) */
+
             *slash='/';
             path=slash+1;
-            pentry=entry;
-            pinode=pentry->inode;
+            parent=entry;
 
         }
 
     }
+
+    if (entry) {
+
+	if (buff_st) {
+
+	    if (entrycreated==0) {
+
+		if (lstat(tmppath, &st)==-1) {
+
+		    if (errno==ENOENT) {
+
+			logoutput("create_notifyfs_path: error %i at %s", errno, tmppath);
+
+			/* additional action.. */
+
+		    }
+
+            	    /* what to do here?? the path does not exist */
+
+            	    entry=NULL;
+		    goto out;
+
+		}
+
+	    }
+
+	    copy_stat(buff_st, &st);
+	    copy_stat_times(buff_st, &st);
+
+	}
+
+    }
+
+    out:
 
     call_info->entry=entry;
 

@@ -20,10 +20,26 @@
 #define INOTIFY_EVENT_SIZE (sizeof(struct inotify_event))
 #define INOTIFY_BUFF_LEN (1024 * (INOTIFY_EVENT_SIZE + 16))
 
+#define INOTIFY_WATCH_LOOKUP_WD			1
+#define INOTIFY_WATCH_LOOKUP_WATCH		2
+
 extern struct notifyfs_options_struct notifyfs_options;
-extern void changestate(struct call_info_struct *call_info, unsigned char typeaction);
-int inotify_fd=0;
-struct epoll_extended_data_struct xdata_inotify;
+// extern void changestate(struct call_info_struct *call_info);
+
+static int inotify_fd=0;
+static struct epoll_extended_data_struct xdata_inotify;
+
+struct inotify_watch_struct {
+	int wd;
+	struct watch_struct *watch;
+	int mask;
+	int mask_final;
+	struct inotify_watch_struct *next;
+	struct inotify_watch_struct *prev;
+};
+
+struct inotify_watch_struct *inotify_watches=NULL;
+pthread_mutex_t inotify_watches_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct INTEXTMAP {
                 const char *name;
@@ -93,6 +109,211 @@ int print_mask(unsigned int mask, char *string, size_t size)
 
 }
 
+static struct inotify_watch_struct *create_inotify_watch()
+{
+    struct inotify_watch_struct *inotify_watch=NULL;
+
+    inotify_watch=malloc(sizeof(struct inotify_watch_struct));
+
+    if (inotify_watch) {
+
+	inotify_watch->wd=0;
+	inotify_watch->watch=NULL;
+	inotify_watch->mask=0;
+	inotify_watch->mask_final=0;
+	inotify_watch->next=NULL;
+	inotify_watch->prev=NULL;
+
+	pthread_mutex_lock(&inotify_watches_mutex);
+
+	/* add at start */
+
+	if(inotify_watches) inotify_watches->prev=inotify_watch;
+	inotify_watch->next=inotify_watches;
+	inotify_watches=inotify_watch;
+
+	pthread_mutex_unlock(&inotify_watches_mutex);
+
+    }
+
+    return inotify_watch;
+
+}
+
+static void remove_inotify_watch(struct inotify_watch_struct *inotify_watch)
+{
+
+    pthread_mutex_lock(&inotify_watches_mutex);
+
+    if (inotify_watch->next) inotify_watch->next->prev=inotify_watch->prev;
+    if (inotify_watch->prev) inotify_watch->prev->next=inotify_watch->next;
+    if (inotify_watches==inotify_watch) inotify_watches=inotify_watch->next;
+
+    pthread_mutex_unlock(&inotify_watches_mutex);
+
+    free(inotify_watch);
+
+}
+
+/* lookup inotify watch using wd */
+
+static struct inotify_watch_struct *lookup_inotify_watch_wd(int wd)
+{
+    struct inotify_watch_struct *inotify_watch=NULL;
+
+    pthread_mutex_lock(&inotify_watches_mutex);
+
+    inotify_watch=inotify_watches;
+
+    while(inotify_watch) {
+
+	if (inotify_watch->wd==wd) break;
+
+	inotify_watch=inotify_watch->next;
+
+    }
+
+    pthread_mutex_unlock(&inotify_watches_mutex);
+
+    return inotify_watch;
+
+}
+
+/* lookup inotify watch using watch */
+
+static struct inotify_watch_struct *lookup_inotify_watch_watch(struct watch_struct *watch)
+{
+    struct inotify_watch_struct *inotify_watch=NULL;
+
+    pthread_mutex_lock(&inotify_watches_mutex);
+
+    inotify_watch=inotify_watches;
+
+    while(inotify_watch) {
+
+	if (inotify_watch->watch==watch) break;
+
+	inotify_watch=inotify_watch->next;
+
+    }
+
+    pthread_mutex_unlock(&inotify_watches_mutex);
+
+    return inotify_watch;
+
+}
+
+
+
+/* translate a fsevent mask to inotify mask \
+    since fsevent describes an event different and in more detail
+    this will lose some info 
+
+    when an event occurs, and the event has to be translated back
+    it's up to that procedure to get the right info
+*/
+
+static int translate_fseventmask_to_inotify(struct fseventmask_struct *fseventmask)
+{
+    int inotify_mask=0;
+
+    logoutput("translate_mask_fsevent_to_inotify");
+
+
+    if (fseventmask->attrib_event & NOTIFYFS_FSEVENT_ATTRIB_CA) {
+
+	/* normal attributes */
+
+	inotify_mask|=IN_ATTRIB;
+
+    }
+
+    if (fseventmask->xattr_event & NOTIFYFS_FSEVENT_XATTR_CA) {
+
+	/* under linux now: the only way to watch xattr with inotify is to watch the normal attributes */
+
+	inotify_mask|=IN_ATTRIB;
+
+    }
+
+    if (fseventmask->file_event & NOTIFYFS_FSEVENT_FILE_SIZE) {
+
+	inotify_mask|=IN_ATTRIB;
+
+    }
+
+    if (fseventmask->file_event & NOTIFYFS_FSEVENT_FILE_MODIFIED) {
+
+	inotify_mask|=IN_MODIFY;
+
+    }
+
+    if (fseventmask->file_event & NOTIFYFS_FSEVENT_FILE_OPEN) {
+
+	inotify_mask|=IN_OPEN;
+
+    }
+
+    if (fseventmask->file_event & NOTIFYFS_FSEVENT_FILE_READ) {
+
+	inotify_mask|=IN_ACCESS;
+
+    }
+
+    if (fseventmask->file_event & NOTIFYFS_FSEVENT_FILE_CLOSE_WRITE) {
+
+	inotify_mask|=IN_CLOSE_WRITE;
+
+    }
+
+    if (fseventmask->file_event & NOTIFYFS_FSEVENT_FILE_CLOSE_NOWRITE) {
+
+	inotify_mask|=IN_CLOSE_NOWRITE;
+
+    }
+
+    if (fseventmask->move_event & NOTIFYFS_FSEVENT_MOVE_CREATED) {
+
+	inotify_mask|=IN_CREATE;
+
+    }
+
+    if (fseventmask->move_event & NOTIFYFS_FSEVENT_MOVE_DELETED) {
+
+	inotify_mask|=(IN_DELETE | IN_DELETE_SELF);
+
+    }
+
+    if (fseventmask->move_event & NOTIFYFS_FSEVENT_MOVE_MOVED) {
+
+	inotify_mask|=IN_MOVE_SELF;
+
+    }
+
+    if (fseventmask->move_event & NOTIFYFS_FSEVENT_MOVE_MOVED_FROM) {
+
+	inotify_mask|=IN_MOVED_FROM;
+
+    }
+
+    if (fseventmask->move_event & NOTIFYFS_FSEVENT_MOVE_MOVED_TO) {
+
+	inotify_mask|=IN_MOVED_TO;
+
+    }
+
+    if (fseventmask->move_event & NOTIFYFS_FSEVENT_MOVE_NLINKS) {
+
+	inotify_mask|=IN_ATTRIB;
+
+    }
+
+    logoutput("translate_mask_fsevent_to_inotify: inotify mask %i", inotify_mask);
+
+    return inotify_mask;
+
+}
+
 /* function which set a os specific watch on the backend on path with mask mask
 
     NOTE:
@@ -104,69 +325,166 @@ int print_mask(unsigned int mask, char *string, size_t size)
 
 */
 
-void set_watch_backend_inotify(struct effective_watch_struct *effective_watch, char *path, int mask)
+void set_watch_backend_inotify(struct watch_struct *watch, char *path)
 {
-    int res;
+    int wd;
+    int inotify_mask, inotify_mask_final;
+    struct inotify_watch_struct *inotify_watch=NULL;
+    char maskstring[64];
 
-    logoutput("set_watch_backend_inotify: call inotify_add_watch on fd %i, path %s and mask %i", notifyfs_options.inotify_fd, path, mask);
+    logoutput("set_watch_backend_inotify");
 
-    res=inotify_add_watch(notifyfs_options.inotify_fd, path, mask);
+    /* first translate the fsevent mask into a inotify mask */
 
-    if ( res==-1 ) {
+    inotify_mask=translate_fseventmask_to_inotify(&watch->fseventmask);
 
-        logoutput("set_watch_backend_inotify: setting inotify watch gives error: %i", errno);
+    if (inotify_mask==0) {
 
-    } else {
+	/* fseventmask is not resulting in a os specific watch */
 
-	if ( effective_watch->inotify_id>0 ) {
+	return;
 
-	    /*	when inotify_add_watch is called on a path where a watch has already been set, 
-		the watch id should be the same, it's an update... 
-		only log when this is not the case */
+    }
 
-	    if ( res != effective_watch->inotify_id ) {
+    /* lookup the inotify watch, if it's ok then it does not exist already */
 
-		logoutput("set_watch_backend_inotify: warning: inotify watch returns a different id: %i versus %li", res, effective_watch->inotify_id);
+    inotify_watch=lookup_inotify_watch_watch(watch);
 
-	    }
+    if (inotify_watch) {
+
+	/* watch has been set before, check the mask */
+
+	if (inotify_watch->mask==inotify_mask) {
+
+	    logoutput("set_watch_backend_inotify: watch has been set before with the same mask: doing nothing");
+
+	    return;
 
 	}
 
-	logoutput("set_watch_backend_inotify: got inotify id %i", res);
+    }
 
-        effective_watch->inotify_id=(unsigned long) res;
+    if (! path) {
+	struct call_info_struct call_info;
+	struct notifyfs_entry_struct *entry;
+
+	/* path not set: construct it here */
+
+	entry=get_entry(watch->inode->alias);
+
+	init_call_info(&call_info, entry);
+
+	if (determine_path(&call_info, NOTIFYFS_PATH_NONE)<0) {
+
+	    logoutput("set_watch_backend_inotify: error");
+
+	    return;
+
+	}
+
+	path=call_info.path;
+
+    }
+
+    print_mask(inotify_mask, maskstring, 64);
+
+    logoutput("set_watch_backend_inotify: call inotify_add_watch on path %s and mask %i/%s", path, inotify_mask, maskstring);
+
+
+    /* add some sane flags and all events:
+    */
+
+    inotify_mask_final=inotify_mask | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_ALL_EVENTS;
+
+
+    if (inotify_watch) {
+
+	if (inotify_watch->mask_final==inotify_mask_final) {
+
+	    /* this will be probably always be true when the watch has been set before */
+
+	    logoutput("set_watch_backend_inotify: watch has been set before with the same mask: doing nothing");
+
+	    return;
+
+	}
+
+    }
+
+    wd=inotify_add_watch(inotify_fd, path, inotify_mask_final);
+
+    if ( wd==-1 ) {
+
+        logoutput("set_watch_backend_inotify: setting inotify watch gives error: %i", errno);
+
+	/* safe to return ?? */
+
+	return;
+
+    }
+
+    /* lookup the inotify watch, if it's ok then it does not exist already */
+
+    if (! inotify_watch) {
+
+	inotify_watch=create_inotify_watch();
+
+	if (inotify_watch) {
+
+	    inotify_watch->wd=wd;
+	    inotify_watch->watch=watch;
+	    inotify_watch->mask=inotify_mask;
+
+	}
+
+    } else {
+
+	inotify_watch->mask=inotify_mask;
+
+	if ( ! wd==inotify_watch->wd ) {
+
+	    /* this should not happen !! */
+
+	    logoutput("set_watch_backend_inotify: warning: inotify watch returns a different id: %i versus %i", wd, inotify_watch->wd);
+
+	}
 
     }
 
 }
 
-void change_watch_backend_inotify(struct effective_watch_struct *effective_watch, char *path, int mask)
+void change_watch_backend_inotify(struct watch_struct *watch, char *path)
 {
 
     /* with inotify the changing of an existing is the same call as the adding of a new watch */
 
-    set_watch_backend_inotify(effective_watch, path, mask);
+    set_watch_backend_inotify(watch, path);
 
 }
 
 
-void remove_watch_backend_inotify(struct effective_watch_struct *effective_watch)
+void remove_watch_backend_inotify(struct watch_struct *watch)
 {
     int res;
+    struct inotify_watch_struct *inotify_watch=NULL;
 
     logoutput("remove_watch_backend_inotify");
 
-    if ( effective_watch->inotify_id>0 ) {
+    /* lookup the inotify watch, if it's ok then it does not exist already */
 
-	res=inotify_rm_watch(notifyfs_options.inotify_fd, (int) effective_watch->inotify_id);
+    inotify_watch=lookup_inotify_watch_watch(watch);
+
+    if ( inotify_watch ) {
+
+	res=inotify_rm_watch(inotify_fd, inotify_watch->wd);
 
 	if ( res==-1 ) {
 
-    	    logoutput("remove_watch_backend_inotify: deleting inotify watch %li gives error: %i", effective_watch->backend_id, errno);
+    	    logoutput("remove_watch_backend_inotify: deleting inotify watch %i gives error: %i", inotify_watch->wd, errno);
 
 	} else {
 
-    	    effective_watch->inotify_id=0;
+	    remove_inotify_watch(inotify_watch);
 
 	}
 
@@ -181,119 +499,147 @@ void remove_watch_backend_inotify(struct effective_watch_struct *effective_watch
 struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i_event)
 {
     int res;
-    struct effective_watch_struct *effective_watch=NULL;
+    struct inotify_watch_struct *inotify_watch=NULL;
+    struct watch_struct *watch=NULL;
+    struct notifyfs_entry_struct *entry=NULL;
     struct notifyfs_fsevent_struct *notifyfs_fsevent=NULL;
+    unsigned char entrycreated=0;
+    struct fseventmask_struct *fseventmask;
 
     /* lookup watch using this wd */
 
     logoutput("evaluate_fsevent_inotify: received an inotify event on wd %i, mask %i", i_event->wd, i_event->mask);
 
-    effective_watch=lookup_watch(FSEVENT_BACKEND_METHOD_INOTIFY, i_event->wd);
+    if ( ! (i_event->mask && IN_ALL_EVENTS)) {
 
-    if (! effective_watch) {
+	logoutput("evaluate_fsevent_inotify: inotify event not interesting");
+	goto out;
+
+    }
+
+    /* first lookup the watch set by inotify */
+
+    inotify_watch=lookup_inotify_watch_wd(i_event->wd);
+
+    if (! inotify_watch) {
 
 	logoutput("evaluate_fsevent_inotify: error: inotify watch %i not found", i_event->wd);
 	goto out;
 
     }
 
-    if ( ! (i_event->mask && (IN_ACCESS | IN_ATTRIB | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_CREATE | IN_DELETE |
-		    IN_DELETE_SELF | IN_MODIFY | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_OPEN))) {
+    logoutput("evaluate_fsevent_inotify: inotify watch %i found", i_event->wd);
 
-	logoutput("evaluate_fsevent_inotify: received an inotify event on wd %i.", i_event->wd);
+    /* get the notifyfs watch */
 
-	goto out;
-
-    }
+    watch=inotify_watch->watch;
 
     notifyfs_fsevent=malloc(sizeof(struct notifyfs_fsevent_struct));
 
     if (! notifyfs_fsevent) {
 
 	logoutput("evaluate_fsevent_inotify: unable to allocate memory");
-
 	goto out;
 
     }
 
-    notifyfs_fsevent->group=NOTIFYFS_FSEVENT_NOTSET;
-    notifyfs_fsevent->type=0;
+    init_notifyfs_fsevent(notifyfs_fsevent);
 
-    if (i_event->name) {
+    fseventmask=&notifyfs_fsevent->fseventmask;
+
+    notifyfs_fsevent->watch=watch;
+
+    /* get the entry on which the event occurs */
+
+    if (i_event->len>0) {
+	char eventstring[32];
+
+	print_mask(i_event->mask, eventstring, 32);
+
+	logoutput("evaluate_fsevent_inotify: event on %s, mask %i/%s", i_event->name, i_event->mask, eventstring);
 
         /* something happens on an entry in the directory.. check it's in use
         by this fs, the find command will return NULL if it isn't 
 	    (do nothing with close, open and access) */
 
-	entry=find_entry(effective_watch->inode->ino, i_event->name);
+	entry=find_entry_by_ino(watch->inode->ino, i_event->name);
 
 	if (!entry) {
+	    struct notifyfs_entry_struct *parent=get_entry(watch->inode->alias);
 
-	    if ( i_event->mask & ( IN_ACCESS | IN_ATTRIB | IN_CLOSE_WRITE |
-		IN_CLOSE_NOWRITE | IN_CREATE | IN_MODIFY | IN_MOVED_TO | IN_OPEN)) {
+	    entry=create_entry(parent, i_event->name);
 
-		entry=create_entry_from_event(effective_watch, notifyfs_fsevent);
-		entry=create_entry(effective_watch->inode->alias, notifyfs_fsevent->name, NULL);
+	    if (entry) {
 
-		if (entry) {
+		assign_inode(entry);
 
-		    assign_inode(entry);
+		if (entry->inode>=0) {
+		    struct stat st;
+		    struct call_info_struct call_info;
 
-		    if (entry->inode) {
-			struct stat *st=&entry->inode->st;
+        	    init_call_info(&call_info, entry);
 
-			st->st_ino=entry->inode->ino;
+        	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+        	    if (res<0) goto out;
 
-			st->st_mode=0; /* mode zero means not synced with backend */
-			st->st_dev=0;
-			st->st_nlink=0;
-			st->st_uid=0;
-			st->st_gid=0;
-			st->st_rdev=0;
-			st->st_size=0;
-			st->st_blksize=0;
-			st->st_blocks=0;
+		    notifyfs_fsevent->path=call_info.path;
+		    notifyfs_fsevent->pathallocated=1;
 
-			st->st_atime=0;
-			st->st_mtime=0;
-			st->st_ctime=0;
+		    if (lstat(call_info.path, &st)==0) {
+			struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+			struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
-#ifdef  __USE_MISC
+			if (attr) {
 
-			/* time defined as timespec */
+			    copy_stat(&attr->cached_st, &st);
+			    copy_stat_times(&attr->cached_st, &st);
 
-			st->tv_nsec=0;
-			st->tv_nsec=0;
-			st->tv_nsec=0;
+			    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
+			    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
 
-#else
+			    if ( S_ISDIR(st.st_mode)) {
 
-			/* n sec defined as extra field */
+				/* directory no access yet */
 
-			st->st_atimensec=0;
-			st->st_mtimensec=0;
-			st->st_ctimensec=0;
+				attr->mtim.tv_sec=0;
+				attr->mtim.tv_nsec=0;
 
-#endif
+			    } else {
 
+				attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
+				attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
+
+			    }
+
+			}
+
+			/* add to different lookup tables */
 
 			add_to_name_hash_table(entry);
-			add_to_inode_hash_table(entry->inode);
 
-			add_entry_to_dir(entry);
+			entrycreated=1;
 
 		    } else {
 
+			/* do nothing here...entry did not exist in notifyfs 
+			    so it's safe to assume that no client is interested... */
+
+			logoutput("evaluate_fsevent_inotify: strange case.. event on %s but stat givies error %i", i_event->name, errno);
+
+			/* remove the entry again?? */
+
 			remove_entry(entry);
 			entry=NULL;
-
-			logoutput("evaluate_fsevent_inotify: unable to create entry");
 
 			goto out;
 
 		    }
 
+
 		} else {
+
+		    remove_entry(entry);
+		    entry=NULL;
 
 		    logoutput("evaluate_fsevent_inotify: unable to create entry");
 
@@ -306,11 +652,19 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 	}
 
     } else {
+	char eventstring[32];
+	char *name;
+
+	print_mask(i_event->mask, eventstring, 32);
 
 	/*  event on watch self
 	    do nothing with close, open and access*/
 
-	entry=effective_watch->inode->alias;
+	entry=get_entry(watch->inode->alias);
+
+	name=get_data(entry->name);
+
+	logoutput("evaluate_fsevent_inotify: event on %s, mask %i/%s", name, i_event->mask, eventstring);
 
     }
 
@@ -320,25 +674,17 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
 	/* file is read */
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_FILE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_FILE_READ;
-
+	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_READ;
 	i_event->mask-=IN_ACCESS;
-
-	goto out;
 
     }
 
     if ( i_event->mask & IN_OPEN ) {
 
-	/* file is open */
+	/* file is opened */
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_FILE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_FILE_OPEN;
-
+	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_OPEN;
 	i_event->mask-=IN_OPEN;
-
-	goto out;
 
     }
 
@@ -346,12 +692,8 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
 	/* file is closed after write */
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_FILE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_FILE_CLOSE_WRITE;
-
+	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_CLOSE_WRITE;
 	i_event->mask-=IN_CLOSE_WRITE;
-
-	goto out;
 
     }
 
@@ -359,12 +701,8 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
 	/* file is closed with no write */
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_FILE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_FILE_CLOSE_NOWRITE;
-
+	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_CLOSE_NOWRITE;
 	i_event->mask-=IN_CLOSE_NOWRITE;
-
-	goto out;
 
     }
 
@@ -372,140 +710,203 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
 	/* file is modified */
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_FILE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_FILE_FILE;
-
+	fseventmask->file_event=NOTIFYFS_FSEVENT_FILE_MODIFIED;
 	i_event->mask-=IN_MODIFY;
-
-	goto out;
 
     }
 
     if ( i_event->mask & IN_ATTRIB ) {
-	struct call_info_struct call_info;
-	struct stat st;
 
-	/* test out what it's 
-	    three possibities: 
-	    mode, owner, group: META_ATTRIB
-	    size: FILE
-	    xattr: META_XATTR
-	*/
+	if (entrycreated==1) {
 
-	/* stat not defined: get it here */
+	    /* something happened on the attributes, but since there is no cache available (it's created)
+		it's not possible to determine what exactly */
 
-    	init_call_info(&call_info, entry);
+	    fseventmask->attrib_event=NOTIFYFS_FSEVENT_ATTR_NOTSET;
+	    i_event->mask-=IN_ATTRIB;
 
-    	res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-    	if (res<0) goto out;
+	} else {
+	    struct call_info_struct call_info;
+	    struct stat st;
 
-	res=lstat(call_info.path, &st);
+	    /* stat not defined: get it here */
 
-	if ( res==-1 ) {
+    	    init_call_info(&call_info, entry);
 
-	    /* strange case: message that entry does exist, but stat gives error... */
+    	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
+    	    if (res<0) goto out;
 
-	    mask-=IN_ATTRIB;
+	    if (! notifyfs_fsevent->path) {
 
-	    if ( i_event->name ) {
-
-		mask|=IN_DELETE;
-
-	    } else {
-
-		mask|=IN_DELETE_SELF;
+		notifyfs_fsevent->path=call_info.path;
+		notifyfs_fsevent->pathallocated=1;
 
 	    }
 
-	} else {
-	    struct stat *cached_st=&(entry->inode->st);
+	    if (lstat(call_info.path, &st)==-1) {
 
-	    if (st->st_mode==0) {
+		/* strange case: i_event about entry, but stat gives error... */
 
-		/* stat not yet set in notifyfs, sp nothing to compare... what now ?? 
-		    leave it for to be a meta 
-		    it can also be a file change....*/
+		logoutput("evaluate_fsevent_inotify: strange case.. event on %s but stat gives error %i", call_info.path, errno);
 
-		notifyfs_fsevent->group=NOTIFYFS_FSEVENT_META;
-		notifyfs_fsevent->type=NOTIFYFS_FSEVENT_META_NOTSET;
+		i_event->mask-=IN_ATTRIB;
 
-		copy_stat(cached_st, &st);
+		if ( i_event->name ) {
 
-	    } else {
+		    i_event->mask|=IN_DELETE;
 
-		/* mode, owner and group belong to group META */
+		} else {
 
-		if (cached_st->st_mode!=st->st_mode || cached_st->st_uid!=st->st_uid || cached_st->st_gid!=st->st_gid) {
-
-		    notifyfs_fsevent->group=NOTIFYFS_FSEVENT_META;
-
-		    if (cached_st->st_mode!=st->st_mode) {
-
-			notifyfs_fsevent->type|=NOTIFYFS_FSEVENT_META_ATTRIB_MODE;
-			cached_st->st_mode=st->st_mode;
-
-		    }
-
-		    if (cached_st->st_uid!=st->st_uid) {
-
-			notifyfs_fsevent->type|=NOTIFYFS_FSEVENT_META_ATTRIB_OWNER;
-			cached_st->st_uid=st->st_uid;
-
-		    }
-
-		    if (cached_st->st_gid!=st->st_gid) {
-
-			notifyfs_fsevent->type|=NOTIFYFS_FSEVENT_META_ATTRIB_GROUP;
-			cached_st->st_gid!=st->st_gid;
-
-		    }
-
-		    i_event->mask-=IN_ATTRIB;
-
-		    goto out
+		    i_event->mask|=IN_DELETE_SELF;
 
 		}
 
-		/* nlinks belongs to group FS */
+	    } else {
+		struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+		struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
-		if (cached_st->st_nlink!=st->st_nlink) {
+		logoutput("evaluate_fsevent_inotify: testing and comparing the attributes");
 
-		    notifyfs_fsevent->group=NOTIFYFS_FSEVENT_FS;
-		    notifyfs_fsevent->type|=NOTIFYFS_FSEVENT_FS_NLINKS;
+		if (attr->cached_st.st_mode!=st.st_mode) {
 
-		    cached_st->st_nlink=st->st_nlink;
+		    fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_MODE;
+		    attr->cached_st.st_mode=st.st_mode;
 
-		    i_event->mask-=IN_ATTRIB;
+		    if (i_event->mask & IN_ATTRIB) i_event->mask-=IN_ATTRIB;
 
-		    goto out;
+		}
+
+		if (attr->cached_st.st_uid!=st.st_uid) {
+
+		    fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_OWNER;
+		    attr->cached_st.st_uid=st.st_uid;
+
+		    if (i_event->mask & IN_ATTRIB) i_event->mask-=IN_ATTRIB;
+
+		}
+
+		if (attr->cached_st.st_gid!=st.st_gid) {
+
+		    fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_GROUP;
+		    attr->cached_st.st_gid=st.st_gid;
+
+		    if (i_event->mask & IN_ATTRIB) i_event->mask-=IN_ATTRIB;
+
+		}
+
+		/* nlinks belongs to group MOVE */
+
+		if (attr->cached_st.st_nlink!=st.st_nlink) {
+
+		    fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_NLINKS;
+		    attr->cached_st.st_nlink=st.st_nlink;
+
+		    if (i_event->mask & IN_ATTRIB) i_event->mask-=IN_ATTRIB;
 
 		}
 
 		/* size belongs to group FILE */
 
-		if (cached_st->st_size!=st->st_size) {
+		if (attr->cached_st.st_size!=st.st_size) {
 
-		    notifyfs_fsevent->group=NOTIFYFS_FSEVENT_FILE;
-		    notifyfs_fsevent->type|=NOTIFYFS_FSEVENT_FILE_SIZE;
+		    fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_SIZE;
+		    attr->cached_st.st_size=st.st_size;
 
-		    cached_st->st_size=st->st_size;
-
-		    i_event->mask-=IN_ATTRIB;
-
-		    goto out;
+		    if (i_event->mask & IN_ATTRIB) i_event->mask-=IN_ATTRIB;
 
 		}
 
-		/* when here the change must be in xattr */
+		/* not yet obvious what happened: xattr or contents changed in directory??
 
-		logoutput("evaluate_fsevent_inotify: IN_ATTRIB: probably xattr, but no test here yet...");
+		    with linux when adding or removing an entry, the timestamp st_mtime is changed of the parent directory
 
-		notifyfs_fsevent->group=NOTIFYFS_FSEVENT_META;
-		notifyfs_fsevent->type|=NOTIFYFS_FSEVENT_META_XATTR_NOTSET;
+		    when changing the xattr, the timestamp st_ctime is changed
 
-		i_event->mask-=IN_ATTRIB;
+		    when using an utility like touch, the timestamps st_atime and possibly st_mtime is changed 
+		*/
 
-		goto out;
+		/* check the mtime */
+
+		if (attr->cached_st.st_mtim.tv_sec<st.st_mtim.tv_sec || (attr->cached_st.st_mtim.tv_sec==st.st_mtim.tv_sec && attr->cached_st.st_mtim.tv_nsec<st.st_mtim.tv_nsec)) {
+
+		    /* first for check the change in a directory 
+			other changes */
+
+		    if ( S_ISDIR(st.st_mode) ) {
+
+			if (i_event->mask & IN_ATTRIB) {
+
+			    /* probably an entry created or deleted 
+				test futher .... when inotify watch has been set on the parent, and in this entry - which is a directory -
+				an entry is created or removed */
+
+			    logoutput("evaluate_fsevent_inotify: IN_ATTRIB: modify timestamp changed, entry created or removed...");
+
+			    i_event->mask-=IN_ATTRIB;
+
+			    /* howto process futher ?? */
+
+			}
+
+		    } else {
+
+			/* not a directory, and mtime is changed.... the event should be picked up before 
+			    maybe make this configurable...
+			    default: ignore this
+			*/
+
+			if (i_event->mask & IN_ATTRIB) i_event->mask-=IN_ATTRIB;
+
+		    }
+
+		    attr->cached_st.st_mtim.tv_sec=st.st_mtim.tv_sec;
+		    attr->cached_st.st_mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+		}
+
+		/* check the ctime */
+
+		if (attr->cached_st.st_ctim.tv_sec<st.st_ctim.tv_sec || (attr->cached_st.st_ctim.tv_sec==st.st_ctim.tv_sec && attr->cached_st.st_ctim.tv_nsec<st.st_ctim.tv_nsec)) {
+
+		    /* check for the xattr */
+
+		    if (i_event->mask & IN_ATTRIB) {
+
+			/* probably something with xattr 
+			    what changed exactly is todo .... */
+
+			logoutput("evaluate_fsevent_inotify: IN_ATTRIB: change timestamp changed, probably xattr, but no test here yet...");
+
+			fseventmask->xattr_event|=NOTIFYFS_FSEVENT_XATTR_NOTSET;
+
+			i_event->mask-=IN_ATTRIB;
+
+		    }
+
+		    attr->cached_st.st_ctim.tv_sec=st.st_ctim.tv_sec;
+		    attr->cached_st.st_ctim.tv_nsec=st.st_ctim.tv_nsec;
+
+
+		}
+
+		/* check for utilities like touch, which change only the timestamps */
+
+		/* check the atime */
+
+		if (attr->cached_st.st_atim.tv_sec<st.st_atim.tv_sec || (attr->cached_st.st_atim.tv_sec==st.st_atim.tv_sec && attr->cached_st.st_atim.tv_nsec<st.st_atim.tv_nsec)) {
+
+		    if (i_event->mask & IN_ATTRIB) {
+
+			logoutput("evaluate_fsevent_inotify: IN_ATTRIB: access timestamp changed, no event detected");
+
+			i_event->mask-=IN_ATTRIB;
+
+		    }
+
+		    attr->cached_st.st_atim.tv_sec=st.st_atim.tv_sec;
+		    attr->cached_st.st_atim.tv_nsec=st.st_atim.tv_nsec;
+
+		}
 
 	    }
 
@@ -515,34 +916,22 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
     if ( i_event->mask & IN_DELETE_SELF ) {
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_MOVE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_MOVE_DELETED;
-
+	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
 	i_event->mask-=IN_DELETE_SELF;
-
-	goto out;
 
     }
 
     if ( i_event->mask & IN_DELETE ) {
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_MOVE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_MOVE_DELETED;
-
+	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
 	i_event->mask-=IN_DELETE;
-
-	goto out;
 
     }
 
     if ( i_event->mask & IN_MOVE_SELF ) {
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_MOVE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_MOVE_MOVED;
-
+	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_MOVED;
 	i_event->mask-=IN_MOVE_SELF;
-
-	goto out;
 
     }
 
@@ -550,34 +939,22 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
     if ( i_event->mask & IN_MOVED_FROM ) {
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_MOVE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_MOVE_MOVED_FROM;
-
+	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_MOVED_FROM;
 	i_event->mask-=IN_MOVED_FROM;
-
-	goto out;
 
     }
 
     if ( i_event->mask & IN_MOVED_TO ) {
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_MOVE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_MOVE_DELETED;
-
+	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_MOVED_TO;
 	i_event->mask-=IN_DELETE_SELF;
-
-	goto out;
 
     }
 
     if ( i_event->mask & IN_CREATE ) {
 
-	notifyfs_fsevent->group=NOTIFYFS_FSEVENT_MOVE;
-	notifyfs_fsevent->type=NOTIFYFS_FSEVENT_MOVE_CREATED;
-
+	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_CREATED;
 	i_event->mask-=IN_CREATE;
-
-	goto out;
 
     }
 
@@ -596,7 +973,7 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
 
     logoutput("handle_data_on_inotify_fd");
 
-    if ( events & EPOLLIN ) {
+    //if ( events & EPOLLIN ) {
         int lenread=0;
         char buff[INOTIFY_BUFF_LEN];
 
@@ -609,7 +986,6 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
         } else {
             int i=0, res;
             struct inotify_event *i_event=NULL;
-	    struct notifyfs_fsevent_struct *notifyfs_event=NULL;
 
             while(i<lenread) {
 
@@ -626,14 +1002,25 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
 
                 }
 
+		if ( i_event->mask & IN_ISDIR && i_event->mask &(IN_OPEN | IN_CLOSE_NOWRITE | IN_IGNORED)) {
+
+		    /* explicit ignore the reading of directories */
+
+		    goto next;
+
+		}
+
 		while (i_event->mask>0) {
-		    unint32_t oldmask=i_event->mask;
+		    uint32_t oldmask=i_event->mask;
+		    struct notifyfs_fsevent_struct *notifyfs_fsevent=NULL;
 
 		    /* translate the inotify event in a general notifyfs fs event */
 
 		    notifyfs_fsevent=evaluate_fsevent_inotify(i_event);
 
-		    if (! notifyfs_event) {
+		    if (! notifyfs_fsevent) {
+
+			logoutput("handle_data_on_inotify_fd: no notifyfs_fsevent... break");
 
 			break;
 
@@ -643,7 +1030,7 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
 
 			logoutput("handle_data_on_inotify_fd: received notifyfs_fsevent");
 
-			process_notifyfs_fsevent(notifyfs_fsevent);
+			queue_fsevent(notifyfs_fsevent);
 
 		    }
 
@@ -661,7 +1048,7 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
 
         }
 
-    }
+    //}
 
 }
 
@@ -681,18 +1068,18 @@ void initialize_inotify()
     if ( inotify_fd<=0 ) {
 
         logoutput("Error creating inotify fd: %i.", errno);
-        goto out;
+        return;
 
     }
 
     /* add inotify to the main eventloop */
 
-    epoll_xdata=add_to_epoll(inotify_fd, EPOLLIN | EPOLLPRI, TYPE_FD_INOTIFY, &handle_data_on_inotify_fd, NULL, &xdata_inotify, NULL);
+    epoll_xdata=add_to_epoll(inotify_fd, EPOLLIN | EPOLLPRI, &handle_data_on_inotify_fd, NULL, &xdata_inotify, NULL);
 
     if ( ! epoll_xdata ) {
 
         logoutput("error adding inotify fd to mainloop.");
-        goto out;
+        return;
 
     } else {
 
@@ -702,19 +1089,19 @@ void initialize_inotify()
 
     }
 
-    notifyfs_options.inotify_fd=inotify_fd;
-
 }
 
 void close_inotify()
+{
 
     if ( xdata_inotify.fd>0 ) {
 
-	res=remove_xdata_from_epoll(&xdata_inotify, 0);
+	remove_xdata_from_epoll(&xdata_inotify);
 	close(xdata_inotify.fd);
 	xdata_inotify.fd=0;
-	notifyfs_options.inotify_fd=0;
-	remove_xdata_from_list(&xdata_inotify, 0, NULL);
+	remove_xdata_from_list(&xdata_inotify, 0);
+
+	inotify_fd=0;
 
     }
 

@@ -19,12 +19,29 @@
 #ifndef NOTIFYFS_OPTIONS_H
 #define NOTIFYFS_OPTIONS_H
 
+struct notifyfs_options_struct {
+    pathstring socket;
+    char *mountpoint;
+    pathstring pidfile;
+    char *conffile;
+    char *remoteserversfile;
+    unsigned char logging;
+    int logarea;
+    unsigned char accessmode;
+    unsigned char testmode;
+    unsigned char forwardlocal;
+    unsigned char forwardnetwork;
+    unsigned char listennetwork;
+    unsigned char hidesystemfiles;
+    int networkport;
+    double attr_timeout;
+    double entry_timeout;
+    double negative_timeout;
+};
 
 // Prototypes
 
 int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args);
+int read_global_settings_from_file(char *path);
 
 #endif
-
-
-

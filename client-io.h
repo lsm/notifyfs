@@ -19,8 +19,6 @@
 #ifndef NOTIFYFS_CLIENT_IO_H
 #define NOTIFYFS_CLIENT_IO_H
 
-#define NOTIFYFS_CLIENTCOMMAND_LIST	1
-
 /* define the different buffer sizes:
 
 - when receiving a message from the server it can be two paths (mountpoint and mountsource), or a list of entries
@@ -34,16 +32,8 @@
 #define NOTIFYFS_SERVER_RECVBUFFERSIZE 	NOTIFYFS_CLIENT_SENDBUFFERSIZE
 #define NOTIFYFS_SERVER_SENDBUFFERSIZE 	NOTIFYFS_CLIENT_RECVBUFFERSIZE
 
-struct client_messageentry_struct {
-    int mode;
-    uid_t uid;
-    gid_t gid;
-    size_t size;
-    struct timespec ctime;
-    struct timespec mtime;
-    struct timespec atime;
-    int len;
-    char name[];
-};
+#define NOTIFYFS_CLIENTTYPE_NONE	0
+#define NOTIFYFS_CLIENTTYPE_APPLICATION	1
+#define NOTIFYFS_CLIENTTYPE_FILESYSTEM	2
 
 #endif

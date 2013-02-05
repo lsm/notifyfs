@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -30,6 +30,7 @@
 
 #include <inttypes.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/param.h>
@@ -47,19 +48,27 @@
 
 #define LOG_LOGAREA LOG_LOGAREA_WATCHES
 
-#define WATCHES_HASHTABLE1_SIZE          1024
+#define WATCHES_TABLESIZE          1024
 
 #include <fuse/fuse_lowlevel.h>
 
 #include "logging.h"
 #include "epoll-utils.h"
-#include "notifyfs.h"
+#include "notifyfs-io.h"
+
+#include "workerthreads.h"
+
 #include "entry-management.h"
 #include "path-resolution.h"
+#include "options.h"
 #include "mountinfo.h"
+#include "message.h"
+#include "client-io.h"
 #include "client.h"
 #include "watches.h"
+#include "changestate.h"
 #include "utils.h"
+#include "networkutils.h"
 
 #ifdef HAVE_INOTIFY
 #include "watches-backend-inotify.c"
@@ -67,495 +76,153 @@
 #include "watches-backend-inotify-notsup.c"
 #endif
 
-struct eff_watch_list_struct {
-    struct effective_watch_struct *first;
-    struct effective_watch_struct *last;
-};
+struct watch_struct *first_watch;
+struct watch_struct *last_watch;
+struct watch_struct *watch_table[WATCHES_TABLESIZE];
 
-struct effective_watch_struct **eff_watch_hashtable1;
-
-unsigned long long watchctr = 1;
+unsigned long watchctr = 1;
+struct watch_struct *watch_list=NULL;
 pthread_mutex_t watchctr_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-struct eff_watch_list_struct eff_watches_list;
-pthread_mutex_t effective_watches_mutex=PTHREAD_MUTEX_INITIALIZER;
-
-struct effective_watch_struct *effective_watches_unused=NULL;
-pthread_mutex_t effective_watches_unused_mutex=PTHREAD_MUTEX_INITIALIZER;
-
-int init_watch_hashtables()
+static int check_pathlen(struct notifyfs_entry_struct *entry)
 {
-    int nreturn=0;
-    int i;
+    int len=1;
+    char *name;
 
-    eff_watch_hashtable1=calloc(WATCHES_HASHTABLE1_SIZE, sizeof(struct effective_watch_struct *));
+    while(entry) {
 
-    if ( ! eff_watch_hashtable1 ) {
+	/* add the lenght of entry->name plus a slash for every name */
+
+	name=get_data(entry->name);
+
+	len+=strlen(name)+1;
+
+	entry=get_entry(entry->parent);
+
+	if (isrootentry(entry)==1) break;
+
+    }
+
+    return len;
+
+}
+
+static char *determine_path_custom(struct notifyfs_entry_struct *entry)
+{
+    char *pos;
+    int nreturn=0, len;
+    char *name;
+    char *path;
+
+    if (isrootentry(entry)==1) {
+
+	nreturn=3;
+
+    } else {
+
+	nreturn=check_pathlen(entry);
+	if (nreturn<0) goto out;
+
+    }
+
+    path=malloc(nreturn);
+
+    if ( ! path) {
 
 	nreturn=-ENOMEM;
-
-    } else {
-
-	for (i=0;i<WATCHES_HASHTABLE1_SIZE;i++) {
-
-	    eff_watch_hashtable1[i]=NULL;
-
-	}
+	goto out;
 
     }
 
-    return nreturn;
+    pos=path+nreturn-1;
+    *pos='\0';
 
-}
+    while (entry) {
 
-/* here some function to lookup the eff watch, given the mount entry */
+	name=get_data(entry->name);
 
-void add_watch_to_hashtable1(struct effective_watch_struct *eff_watch, unsigned long long id)
-{
-    int hash=id%WATCHES_HASHTABLE1_SIZE;
+	len=strlen(name);
+	pos-=len;
 
-    if ( eff_watch_hashtable1[hash] ) eff_watch_hashtable1[hash]->prev_hash1=eff_watch;
-    eff_watch->next_hash1=eff_watch_hashtable1[hash];
-    eff_watch_hashtable1[hash]=eff_watch;
+	memcpy(pos, name, len);
 
-}
+	pos--;
+	*pos='/';
 
-void remove_watch_from_hashtable1(struct effective_watch_struct *eff_watch, unsigned long long id)
-{
-    int hash=id%WATCHES_HASHTABLE1_SIZE;
+	entry=get_entry(entry->parent);
 
-    if ( eff_watch_hashtable1[hash]==eff_watch ) {
-
-	eff_watch_hashtable1[hash]=eff_watch->next_hash1;
-
-    }
-
-    if ( eff_watch->next_hash1 ) eff_watch->next_hash1->prev_hash1=eff_watch->prev_hash1;
-    if ( eff_watch->prev_hash1 ) eff_watch->prev_hash1->next_hash1=eff_watch->next_hash1;
-
-}
-
-struct effective_watch_struct *get_next_eff_watch_hash1(struct effective_watch_struct *effective_watch, unsigned long long id)
-{
-    if ( effective_watch ) {
-	int hash=id%WATCHES_HASHTABLE1_SIZE;
-
-	effective_watch=eff_watch_hashtable1[hash];
-
-    } else {
-
-	effective_watch=effective_watch->next_hash1;
-
-    }
-
-    return effective_watch;
-
-}
-
-struct effective_watch_struct *get_next_effective_watch(struct effective_watch_struct *effective_watch)
-{
-    if ( ! effective_watch ) {
-
-	effective_watch=eff_watches_list.first;
-
-    } else {
-
-	effective_watch=effective_watch->next;
-
-    }
-
-    return effective_watch;
-
-}
-
-/* function to set the path for the effective watch 
-   this is the path relative to the mount point of the 
-   fs it's on
-*/
-
-int set_mount_entry_effective_watch(struct call_info_struct *call_info, struct effective_watch_struct *effective_watch)
-{
-    struct mount_entry_struct *mount_entry=NULL;
-    char *path;
-    int len, nreturn=0;
-
-    if ( call_info->mount_entry ) {
-	int len, res;
-
-	mount_entry=call_info->mount_entry;
-
-    } else {
-
-	if ( call_info->path ) {
-	    struct notifyfs_entry_struct *entry=call_info->entry;
-
-	    /* walk back to root */
-
-	    checkentry:
-
-	    if ( isrootentry(entry) ) {
-
-		mount_entry=get_rootmount();
-
-	    } else {
-
-		if ( entry->mount_entry ) {
-
-		    mount_entry=entry->mount_entry;
-
-		} else {
-
-		    entry=entry->parent;
-		    goto checkentry;
-
-		}
-
-	    }
-
-	} else {
-	    int res=determine_path(call_info, NOTIFYFS_PATH_FORCE);
-
-	    if (res<0) {
-
-		nreturn=res;
-		goto out;
-
-	    }
-
-	    mount_entry=call_info->mount_entry;
-
-	}
-
-    }
-
-    effective_watch->mount_entry=mount_entry;
-    len=strlen(mount_entry->mountpoint);
-
-    if ( strlen(call_info->path)>len ) {
-
-	/* here call_info->path is a real subdirectory of mount_entry->mountpoint */
-
-	if ( *(call_info->path+len)=='/' ) len++;
-
-	effective_watch->path=strdup(call_info->path+len);
-
-	if ( ! effective_watch->path ) {
-
-	    nreturn=-ENOMEM;
-
-	}
+	if (! entry || isrootentry(entry)==1) break;
 
     }
 
     out:
 
-    return nreturn;
+    return path;
 
 }
 
 
-
-/* function to get a new (global) watch id 
-   by just increasing the global watch counter 
-   this watch counter is used to identify effective_watches,
-   and to communicate with backends, other than inotify (inotify supplies a id itself)
-*/
-
-unsigned long new_watchid()
+void lock_watch(struct watch_struct *watch)
 {
-    int res;
-
-    res=pthread_mutex_lock(&watchctr_mutex);
-
-    watchctr++;
-
-    res=pthread_mutex_unlock(&watchctr_mutex);
-
-    return watchctr;
+    pthread_mutex_lock(&watch->mutex);
 }
 
-struct effective_watch_struct *get_effective_watch()
+void unlock_watch(struct watch_struct *watch)
 {
-    struct effective_watch_struct *effective_watch=NULL;
-    int res;
-    unsigned char fromunused=0;
+    pthread_mutex_unlock(&watch->mutex);
+}
 
-    /* try pthread_mutex_trylock here... no waiting */
 
-    res=pthread_mutex_trylock(&effective_watches_unused_mutex);
+void init_watch_hashtables()
+{
+    int i;
 
-    if ( res==0 ) {
+    for (i=0;i<WATCHES_TABLESIZE;i++) {
 
-	fromunused=1;
-
-	if ( effective_watches_unused ) {
-
-	    effective_watch=effective_watches_unused;
-	    effective_watches_unused=effective_watch->next;
-
-	} else {
-
-	    fromunused=0;
-
-	}
-
-	res=pthread_mutex_unlock(&effective_watches_unused_mutex);
+	watch_table[i]=NULL;
 
     }
 
-    if ( fromunused==0 ) effective_watch=malloc(sizeof(struct effective_watch_struct));
-
-    if ( effective_watch ) {
-
-	if ( fromunused==1 ) res=pthread_mutex_lock(&effective_watch->lock_mutex);
-
-        effective_watch->mask=0;
-        effective_watch->inode=NULL;
-        effective_watch->next=NULL;
-        effective_watch->prev=NULL;
-
-	if ( fromunused==0 ) {
-
-    	    pthread_mutex_init(&effective_watch->lock_mutex, NULL);
-    	    pthread_cond_init(&effective_watch->lock_condition, NULL);
-
-	}
-
-        effective_watch->lock=0;
-        effective_watch->nrwatches=0;
-        effective_watch->watches=NULL;
-        effective_watch->backend=NULL;
-        effective_watch->typebackend=0;
-        effective_watch->id=0;
-        effective_watch->backend_id=0;
-        effective_watch->inotify_id=0;
-        effective_watch->backendset=0;
-        effective_watch->path=NULL;
-	effective_watch->laststat=0;
-
-	if ( fromunused==1 ) res=pthread_mutex_unlock(&effective_watch->lock_mutex);
-
-    }
-
-    return effective_watch;
-
 }
 
-int lock_effective_watches()
+/* here some function to lookup the eff watch, given the mount entry */
+
+void add_watch_to_table(struct watch_struct *watch)
 {
-    return pthread_mutex_lock(&effective_watches_mutex);
+    int hash=watch->inode->ino%WATCHES_TABLESIZE;
+
+    if ( watch_table[hash] ) watch_table[hash]->prev_hash=watch;
+    watch->next_hash=watch_table[hash];
+    watch_table[hash]=watch;
 
 }
 
-int unlock_effective_watches()
+void remove_watch_from_table(struct watch_struct *watch)
 {
-    return pthread_mutex_unlock(&effective_watches_mutex);
+    int hash=watch->inode->ino%WATCHES_TABLESIZE;
+
+    if ( watch_table[hash]==watch ) watch_table[hash]=watch->next_hash;
+    if ( watch->next_hash ) watch->next_hash->prev_hash=watch->prev_hash;
+    if ( watch->prev_hash ) watch->prev_hash->next_hash=watch->next_hash;
 
 }
 
-/* add effective watch to list
-   */
+/* simple lookup function of watch */
 
-void add_effective_watch_to_list(struct effective_watch_struct *effective_watch)
-{
-    int res;
-    struct effective_watch_struct *tmp_effective_watch;
-
-    if ( effective_watch->path ) {
-
-	logoutput("add_effective_watch_to_list: %s", effective_watch->path);
-
-    } else {
-
-	logoutput("add_effective_watch_to_list: unknown path");
-
-    }
-
-    res=pthread_mutex_lock(&effective_watches_mutex);
-
-    if ( ! eff_watches_list.first ) {
-
-	eff_watches_list.first=effective_watch;
-	effective_watch->prev=NULL;
-
-    }
-
-    if ( ! eff_watches_list.last ) {
-
-	eff_watches_list.last=effective_watch;
-	effective_watch->next=NULL;
-
-    } else {
-
-	/* add it at tail */
-
-	eff_watches_list.last->next=effective_watch;
-	effective_watch->prev=eff_watches_list.last;
-	eff_watches_list.last=effective_watch;
-
-    }
-
-    res=pthread_mutex_unlock(&effective_watches_mutex);
-
-}
-
-
-void remove_effective_watch_from_list(struct effective_watch_struct *effective_watch, unsigned char lockset)
-{
-    int res;
-
-    if ( lockset==0 ) res=pthread_mutex_lock(&effective_watches_mutex);
-
-    if ( eff_watches_list.first==effective_watch ) eff_watches_list.first=effective_watch->next;
-    if ( eff_watches_list.last==effective_watch ) eff_watches_list.last=effective_watch->prev;
-
-    if ( effective_watch->next ) effective_watch->next->prev=effective_watch->prev;
-    if ( effective_watch->prev ) effective_watch->prev->next=effective_watch->next;
-
-    if ( lockset==0 ) res=pthread_mutex_unlock(&effective_watches_mutex);
-
-}
-
-void move_effective_watch_to_unused(struct effective_watch_struct *effective_watch)
-{
-
-    int res;
-
-    res=pthread_mutex_lock(&effective_watches_unused_mutex);
-
-    effective_watch->prev=NULL;
-    effective_watch->next=NULL;
-
-    if ( effective_watches_unused ) effective_watches_unused->prev=effective_watch;
-
-    effective_watch->next=effective_watches_unused;
-    effective_watches_unused=effective_watch;
-
-    res=pthread_mutex_unlock(&effective_watches_unused_mutex);
-
-}
-
-struct effective_watch_struct *lookup_watch(unsigned char type, unsigned long id)
-{
-    struct effective_watch_struct *effective_watch=NULL;
-    int res;
-
-    res=pthread_mutex_lock(&effective_watches_mutex);
-
-    effective_watch=eff_watches_list.first;
-
-    if ( type==FSEVENT_BACKEND_METHOD_INOTIFY ) {
-
-	logoutput("lookup_watch id %i for inotify", id);
-
-	while (effective_watch) {
-
-    	    if ( effective_watch->inotify_id==id ) break;
-
-    	    effective_watch=effective_watch->next;
-
-	}
-
-    } else if ( type!=FSEVENT_BACKEND_METHOD_NOTSET ) {
-
-	logoutput("lookup_watch id %i for backend %i", type, id);
-
-	while (effective_watch) {
-
-    	    if ( effective_watch->backend_id==id && effective_watch->typebackend==type ) break;
-
-    	    effective_watch=effective_watch->next;
-
-	}
-
-    } else {
-
-	while (effective_watch) {
-
-    	    if ( effective_watch->id==id ) break;
-
-    	    effective_watch=effective_watch->next;
-
-	}
-
-    }
-
-    res=pthread_mutex_unlock(&effective_watches_mutex);
-
-    if ( effective_watch ) {
-
-	logoutput("lookup_watch: watch found");
-
-    } else {
-
-	logoutput("lookup_watch: watch not found");
-
-    }
-
-    return effective_watch;
-
-}
-
-int lock_effective_watch(struct effective_watch_struct *effective_watch)
-{
-    int res;
-
-    res=pthread_mutex_lock(&effective_watch->lock_mutex);
-
-    if ( effective_watch->lock==1 ) {
-
-    	while (effective_watch->lock==1) {
-
-    	    res=pthread_cond_wait(&effective_watch->lock_condition, &effective_watch->lock_mutex);
-
-    	}
-
-    }
-
-    effective_watch->lock=1;
-
-    res=pthread_mutex_unlock(&effective_watch->lock_mutex);
-
-    return res;
-
-}
-
-int unlock_effective_watch(struct effective_watch_struct *effective_watch)
-{
-    int res;
-
-    res=pthread_mutex_lock(&effective_watch->lock_mutex);
-    effective_watch->lock=0;
-    res=pthread_cond_broadcast(&effective_watch->lock_condition);
-    res=pthread_mutex_unlock(&effective_watch->lock_mutex);
-
-    return res;
-
-}
-
-void init_effective_watches()
-{
-
-    eff_watches_list.first=NULL;
-    eff_watches_list.last=NULL;
-
-}
-
-struct watch_struct *get_watch()
+struct watch_struct *lookup_watch(struct notifyfs_inode_struct *inode)
 {
     struct watch_struct *watch=NULL;
+    int hash=inode->ino%WATCHES_TABLESIZE;
 
-    watch=malloc(sizeof(struct watch_struct));
+    /* lookup using the ino */
 
-    if ( watch ) {
+    watch=watch_table[hash];
 
-        watch->mask=0;
-        watch->effective_watch=NULL;
-        watch->client=NULL;
-        watch->next_per_watch=NULL;
-        watch->prev_per_watch=NULL;
-        watch->next_per_client=NULL;
-        watch->prev_per_client=NULL;
+    while(watch) {
+
+	if (watch->inode==inode) break;
+
+	watch=watch->next_hash;
 
     }
 
@@ -563,176 +230,627 @@ struct watch_struct *get_watch()
 
 }
 
-/* calculate the effective mask by "adding" all individual masks of watches 
-   as a by product set the number of watches */
-
-int calculate_effmask(struct effective_watch_struct *effective_watch, unsigned char lockset)
+void add_watch_to_list(struct watch_struct *watch)
 {
-    int effmask=0, res;
 
-    if ( effective_watch ) {
-        struct watch_struct *watch=NULL;
-        int nrwatches=0;
+    pthread_mutex_lock(&watchctr_mutex);
 
-        if ( lockset==0 ) res=lock_effective_watch(effective_watch);
+    if (watch_list) watch_list->prev=watch;
+    watch->next=watch_list;
+    watch->prev=NULL;
+    watch_list=watch;
 
-        watch=effective_watch->watches;
+    watchctr++;
 
-        while(watch) {
+    watch->ctr=watchctr;
 
-            effmask=effmask | watch->mask;
-            nrwatches++;
-            watch=watch->next_per_watch;
-
-        }
-
-        effective_watch->mask=effmask;
-        effective_watch->nrwatches=nrwatches;
-
-        if ( lockset==0 ) res=unlock_effective_watch(effective_watch);;
-
-    }
-
-    return effmask;
+    pthread_mutex_unlock(&watchctr_mutex);
 
 }
 
-/* function to look for effective watches somewhere in a subdirectory of entry
+void remove_watch_from_list(struct watch_struct *watch)
+{
+
+    pthread_mutex_lock(&watchctr_mutex);
+
+    if (watch->next) watch->next->prev=watch->prev;
+    if (watch->prev) watch->prev->next=watch->next;
+
+    if (watch_list==watch) watch_list=watch->next;
+
+    pthread_mutex_unlock(&watchctr_mutex);
+
+}
+
+void set_watch_backend_os_specific(struct watch_struct *watch, char *path)
+{
+    set_watch_backend_inotify(watch, path);
+}
+
+void change_watch_backend_os_specific(struct watch_struct *watch, char *path)
+{
+    change_watch_backend_inotify(watch, path);
+}
+
+void remove_watch_backend_os_specific(struct watch_struct *watch)
+{
+    remove_watch_backend_inotify(watch);
+}
+
+struct clientwatch_struct *lookup_clientwatch(struct watch_struct *watch, struct client_struct *client)
+{
+    struct clientwatch_struct *clientwatch=NULL;
+
+    pthread_mutex_lock(&watch->mutex);
+
+    /* lookup client watch */
+
+    clientwatch=watch->clientwatches;
+
+    while(clientwatch) {
+
+	if (clientwatch->client==client) break;
+
+	clientwatch=clientwatch->next_per_watch;
+
+    }
+
+    pthread_mutex_unlock(&watch->mutex);
+
+    return clientwatch;
+
+}
+
+void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
+{
+
+    fsevent->status=0;
+
+    fsevent->fseventmask.attrib_event=0;
+    fsevent->fseventmask.xattr_event=0;
+    fsevent->fseventmask.file_event=0;
+    fsevent->fseventmask.move_event=0;
+    fsevent->fseventmask.fs_event=0;
+
+    fsevent->entry=NULL;
+    fsevent->path=NULL;
+    fsevent->pathallocated=0;
+
+    fsevent->detect_time.tv_sec=0;
+    fsevent->detect_time.tv_nsec=0;
+    fsevent->process_time.tv_sec=0;
+    fsevent->process_time.tv_nsec=0;
+
+    fsevent->lock_entry=NULL;
+    fsevent->watch=NULL;
+    fsevent->mount_entry=NULL;
+
+    fsevent->next=NULL;
+    fsevent->prev=NULL;
+
+}
+
+void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
+{
+
+    if (fsevent->pathallocated==1) {
+
+	if (fsevent->path) {
+
+	    free(fsevent->path);
+	    fsevent->path=NULL;
+
+	}
+
+	fsevent->pathallocated=0;
+
+    }
+
+    free(fsevent);
+
+}
+
+unsigned char compare_fseventmasks(struct fseventmask_struct *maska, struct fseventmask_struct *maskb)
+{
+    unsigned char differ=0;
+
+    if (maska->attrib_event != maskb->attrib_event) {
+
+	differ=1;
+	goto out;
+
+    }
+
+    if (maska->xattr_event != maskb->xattr_event) {
+
+	differ=1;
+	goto out;
+
+    }
+
+    if (maska->file_event != maskb->file_event) {
+
+	differ=1;
+	goto out;
+
+    }
+
+    if (maska->move_event != maskb->move_event) {
+
+	differ=1;
+	goto out;
+
+    }
+
+    if (maska->fs_event != maskb->fs_event) {
+
+	differ=1;
+
+    }
+
+    out:
+
+    return differ;
+
+}
+
+/* merge two fsevent masks */
+
+unsigned char merge_fseventmasks(struct fseventmask_struct *maska, struct fseventmask_struct *maskb)
+{
+    unsigned char differ=0;
+
+    if (compare_fseventmasks(maska, maskb)==1) {
+	struct fseventmask_struct maskc;
+
+	maskc.attrib_event = maska->attrib_event | maskb->attrib_event;
+	maskc.xattr_event = maska->xattr_event | maskb->xattr_event;
+	maskc.file_event = maska->file_event | maskb->file_event;
+	maskc.move_event = maska->move_event | maskb->move_event;
+	maskc.fs_event = maska->fs_event | maskb->fs_event;
+
+	if (compare_fseventmasks(maska, &maskc)==1) {
+
+	    maska->attrib_event = maskc.attrib_event;
+	    maska->xattr_event = maskc.xattr_event;
+	    maska->file_event = maskc.file_event;
+	    maska->move_event = maskc.move_event;
+	    maska->fs_event = maskc.fs_event;
+
+	    differ=1;
+
+	}
+
+    }
+
+    return differ;
+
+}
+
+/* replace one fseventmask by another */
+
+void replace_fseventmask(struct fseventmask_struct *maska, struct fseventmask_struct *maskb)
+{
+
+    maska->attrib_event = maskb->attrib_event;
+    maska->xattr_event = maskb->xattr_event;
+    maska->file_event = maskb->file_event;
+    maska->move_event = maskb->move_event;
+    maska->fs_event = maskb->fs_event;
+
+}
+
+void send_setwatch_message_remote(struct notifyfs_server_struct *notifyfs_server, struct watch_struct *watch, char *path)
+{
+
+    logoutput("send_setwatch_message_remote: todo");
+
+}
+
+/*
+    function to test a mount has a backend, and if so, forward the watch to that backend
+
+    the path on the remote host depends on the "root" of what has been shared (smb) or exported (nfs)
+
+    for example a nfs export from 192.168.0.2:/usr/share
+    is mounted at /data for example
+
+    now if a watch is set on /data/some/dir/to/watch, the corresponding path on 192.168.0.2 is
+    /usr/share/some/dir/to/watch
+
+    this is simple for nfs, it's a bit difficult for smb: the "rootpath" of the share is in
+    netbioslanguage, and is not a directory. For example:
+    the source of a mount is //mainserver/public, so the "share" name is public. For this 
+    host it's impossible to detect what directory/path this share is build with. So, it sends
+    the share name to the notifyfs server on mainserver like:
+
+    cifs:/public/some/dir/to/watch
+
+    and let it to the notifyfs process on mainserver to find out what directory the share
+    public is on (by parsing the smb.conf file for example)
+
+    for sshfs this can be also very complicated
+
+    using sshfs like:
+
+    sshfs sbon@192.168.0.2:/ ~/mount -o allow_other
+
+    works ok, since it mounts the root (/) at ~/mount, but it's a bit more complicated when
+
+    sshfs sbon@192.168.0.2: ~/mount -o allow_other
+
+    will take the home directory on 192.168.0.2 of sbon as root.
+
+    Now this host is also not able to determine the home of sbon on 192.168.0.2. To handle this case
+
+    a template is send:
+
+    sshfs:sbon@%HOME%/some/dir/to/watch
 
 */
 
-int check_for_effective_watch(char *path)
+
+void forward_watch_backend(int mountindex, struct watch_struct *watch, char *path)
 {
-    int nreturn=0, res, nlen=strlen(path);
-    struct effective_watch_struct *effective_watch;
+    struct notifyfs_mount_struct *mount=get_mount(mountindex);
+    struct notifyfs_server_struct *notifyfs_server=get_mount_backend(mount);
 
-    res=pthread_mutex_lock(&effective_watches_mutex);
+    logoutput("forward_watch_backend");
 
-    effective_watch=eff_watches_list.first;
+    if (notifyfs_server) {
 
-    while (effective_watch) {
+	/* here to test allow errors */
 
-	if ( effective_watch->path ) {
+	if (notifyfs_server->status==NOTIFYFS_SERVERSTATUS_UP || notifyfs_server->status==NOTIFYFS_SERVERSTATUS_ERROR) {
+	    char *mountpoint=NULL;
+	    struct notifyfs_entry_struct *entry=NULL;
+	    logoutput("forward_watch_backend: remote server found");
 
-	    if ( strlen(effective_watch->path)>nlen && strncmp(effective_watch->path, path, nlen)==0 && strncmp(effective_watch->path+nlen,"/",1)==0 ) {
+	    /* path must be a subdirectory of mountpoint of mount */
 
-		/* there is a watch in a subdirectory */
+	    entry=get_entry(mount->entry);
 
-		nreturn=1;
-		break;
+	    mountpoint=determine_path_custom(entry);
+
+	    if (mountpoint) {
+
+		if (issubdirectory(path, mountpoint, 1)==1) {
+		    int lenpath=strlen(path);
+		    int lenmountpoint=strlen(mountpoint);
+
+		    if (lenpath==lenmountpoint) {
+			pathstring url;
+
+			/* send a watch on the root of remote backend */
+
+			/* determine what to send ?? 
+			    test the filesystem
+			*/
+
+			determine_remotepath(mount, "/", url, sizeof(pathstring));
+
+		    } else {
+			pathstring url;
+
+			determine_remotepath(mount, path+lenmountpoint, url, sizeof(pathstring));
+
+		    }
+
+		}
 
 	    }
 
 	}
 
-	effective_watch=effective_watch->next;
-
     }
-
-    res=pthread_mutex_unlock(&effective_watches_mutex);
-
-    return nreturn;
 
 }
 
-/* add a new client watch to the effective watch */
 
-int add_new_client_watch(struct effective_watch_struct *effective_watch, int mask, int client_watch_id, struct client_struct *client)
+struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct client_struct *client, char *path, int mountindex)
 {
-    int nreturn=0;
-    struct watch_struct *watch;
+    struct clientwatch_struct *clientwatch=NULL;
+    struct watch_struct *watch=NULL;
+    int new_fsevent_mask, new_type;
+    unsigned char watchcreated=0, fseventmask_changed=0;
 
-    watch=get_watch();
+    if (path) {
+
+	logoutput("add_clientwatch: on %s client watch id %i, %i:%i:%i:%i", path, id, fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
+
+    } else {
+
+	logoutput("add_clientwatch: on UNKNOWN client watch id %i, %i:%i:%i:%i", id, fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
+
+    }
+
+    watch=lookup_watch(inode);
 
     if ( ! watch ) {
 
-        nreturn=-ENOMEM;
-        goto out;
+	logoutput("add_clientwatch: no watch found, creating one");
+
+	watch=malloc(sizeof(struct watch_struct));
+
+	if (watch) {
+
+	    watch->ctr=0;
+	    watch->inode=inode;
+
+	    watch->fseventmask.attrib_event=0;
+	    watch->fseventmask.xattr_event=0;
+	    watch->fseventmask.file_event=0;
+	    watch->fseventmask.move_event=0;
+	    watch->fseventmask.fs_event=0;
+
+	    watch->nrwatches=0;
+	    watch->clientwatches=NULL;
+
+	    pthread_mutex_init(&watch->mutex, NULL);
+	    pthread_cond_init(&watch->cond, NULL);
+
+	    watch->lock=0;
+
+	    watch->next_hash=NULL;
+	    watch->prev_hash=NULL;
+
+	    watch->next=NULL;
+	    watch->prev=NULL;
+
+	    watch->mount=mountindex;
+	    watch->backend=NULL;
+
+	    add_watch_to_table(watch);
+	    add_watch_to_list(watch);
+
+	    watchcreated=1;
+
+	} else {
+
+	    logoutput("add_clientwatch: unable to allocate a watch");
+	    goto out;
+
+	}
 
     }
 
-    /* add to effective watch */
+    pthread_mutex_lock(&watch->mutex);
 
-    watch->effective_watch=effective_watch;
-    if ( effective_watch->watches ) effective_watch->watches->prev_per_watch=watch;
-    watch->next_per_watch=effective_watch->watches;
-    effective_watch->watches=watch;
+    /* lookup client watch */
 
-    /* add to client */
+    clientwatch=watch->clientwatches;
 
-    watch->client=client;
-    if ( client->watches ) client->watches->prev_per_client=watch;
-    watch->next_per_client=client->watches;
-    client->watches=watch;
+    while(clientwatch) {
 
-    watch->mask=mask;
-    watch->client_watch_id=client_watch_id;
+	if (clientwatch->client==client) break;
+
+	clientwatch=clientwatch->next_per_watch;
+
+    }
+
+    if ( ! clientwatch) {
+
+	logoutput("add_clientwatch: no clientwatch found, creating one");
+
+	clientwatch=malloc(sizeof(struct clientwatch_struct));
+
+	if (clientwatch) {
+
+	    clientwatch->fseventmask.attrib_event=fseventmask->attrib_event;
+	    clientwatch->fseventmask.xattr_event=fseventmask->xattr_event;
+	    clientwatch->fseventmask.file_event=fseventmask->file_event;
+	    clientwatch->fseventmask.move_event=fseventmask->move_event;
+	    clientwatch->fseventmask.fs_event=fseventmask->fs_event;
+
+	    clientwatch->watch=watch;
+	    clientwatch->client=client;
+
+	    clientwatch->client_watch_id=id;
+
+	    /* add it to list per watch */
+
+	    if (watch->clientwatches) watch->clientwatches->prev_per_watch=clientwatch;
+	    clientwatch->next_per_watch=watch->clientwatches;
+	    clientwatch->prev_per_watch=NULL;
+	    watch->clientwatches=clientwatch;
+
+	    /* add it to list per client */
+
+	    pthread_mutex_lock(&client->mutex);
+
+	    if (client->clientwatches) ((struct clientwatch_struct *) client->clientwatches)->prev_per_client=clientwatch;
+	    clientwatch->next_per_client=(struct clientwatch_struct *) client->clientwatches;
+	    clientwatch->prev_per_client=NULL;
+	    client->clientwatches=(void *) clientwatch;
+
+	    pthread_mutex_unlock(&client->mutex);
+
+	} else {
+
+	    logoutput("add_clientwatch: unable to allocate a clientwatch");
+	    goto unlock;
+
+	}
+
+    } else {
+
+	/* replace existing mask: todo maybe also merge */
+
+	clientwatch->fseventmask.attrib_event=fseventmask->attrib_event;
+	clientwatch->fseventmask.xattr_event=fseventmask->xattr_event;
+	clientwatch->fseventmask.file_event=fseventmask->file_event;
+	clientwatch->fseventmask.move_event=fseventmask->move_event;
+	clientwatch->fseventmask.fs_event=fseventmask->fs_event;
+
+    }
+
+    /* test there is a new mask */
+
+    if ( merge_fseventmasks(&watch->fseventmask, fseventmask)==1) {
+	struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+
+	if ( S_ISDIR(attr->cached_st.st_mode)) {
+	    unsigned char fullsync=0;
+	    struct stat st;
+
+	    /* check the directory is up to date */
+
+	    if (lstat(path, &st)==0) {
+
+		if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec)) fullsync=1;
+
+	    } else {
+
+		logoutput("add_clientwatch: error %i setting watch on %s", errno, path);
+
+		/* TODO: add action to react on this event */
+
+	    }
+
+	    if (fullsync==1) {
+		struct notifyfs_entry_struct *parent=get_entry(inode->alias);
+		struct timespec rightnow;
+		int res;
+
+		get_current_time(&rightnow);
+
+		/* a full sync, because this directory is not in cache yet, or no watch and the contents has changed */
+
+		res=sync_directory_full(path, parent, &rightnow);
+
+		if (res==-ENOENT) {
+
+		    logoutput("add_clientwatch: error %i setting watch on %s", res, path);
+
+		    /* additional action required: check what happened, why is this enoent?? */
+
+		} else if (res==-ENOTDIR) {
+
+		    logoutput("add_clientwatch: error %i setting watch on %s", res, path);
+
+		    /* additional action required: correct the fs..*/
+
+		} else if (res<0) {
+
+		    logoutput("add_clientwatch: error %i setting watch on %s", res, path);
+
+		} else {
+
+		    attr->mtim.tv_sec=st.st_mtim.tv_sec;
+		    attr->mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+		    remove_old_entries(parent, &rightnow);
+
+		}
+
+	    } else {
+		struct notifyfs_entry_struct *parent=get_entry(inode->alias);
+		struct timespec rightnow;
+
+		get_current_time(&rightnow);
+
+		sync_directory_simple(path, parent, &rightnow);
+
+	    }
+
+	}
+
+	set_watch_backend_os_specific(watch, path);
+
+	/* test it's on a network or fuse fs */
+
+	if (mountindex>=0) forward_watch_backend(mountindex, watch, path);
+
+    }
+
+    unlock:
+
+    pthread_mutex_unlock(&watch->mutex);
 
     out:
 
-    return nreturn;
+    return clientwatch;
 
 }
 
-/* remove a client watch from the effective watch */
+/* remove a clientwatch */
 
-void remove_client_watch_from_inode(struct watch_struct *watch)
+void remove_clientwatch_from_watch(struct clientwatch_struct *clientwatch)
 {
-    struct effective_watch_struct *effective_watch=watch->effective_watch;
+    struct watch_struct *watch=clientwatch->watch;
 
-    if ( effective_watch ) {
+    /* detach from watch */
 
-	if ( effective_watch->watches==watch ) effective_watch->watches=watch->next_per_watch;
+    pthread_mutex_lock(&watch->mutex);
+
+    if (clientwatch->prev_per_watch) clientwatch->prev_per_watch->next_per_watch=clientwatch->next_per_watch;
+    if (clientwatch->next_per_watch) clientwatch->next_per_watch->prev_per_watch=clientwatch->prev_per_watch;
+
+    if (watch->clientwatches==clientwatch) watch->clientwatches=clientwatch->next_per_watch;
+
+    clientwatch->prev_per_watch=NULL;
+    clientwatch->next_per_watch=NULL;
+
+    watch->nrwatches--;
+
+    if (watch->nrwatches<=0) {
+
+	logoutput("remove_clientwatch_from_watch: no more watches left");
+
+	/* TODO: additional action.. */
+
+	remove_watch_backend_os_specific(watch);
+
+	watch->fseventmask.attrib_event=0;
+	watch->fseventmask.xattr_event=0;
+	watch->fseventmask.file_event=0;
+	watch->fseventmask.move_event=0;
+	watch->fseventmask.fs_event=0;
+
+	/* just leave it hanging around for now.. */
 
     }
 
-    if ( watch->prev_per_watch ) watch->prev_per_watch->next_per_watch=watch->next_per_watch;
-    if ( watch->next_per_watch ) watch->next_per_watch->prev_per_watch=watch->prev_per_watch;
-
-    watch->prev_per_watch=NULL;
-    watch->next_per_watch=NULL;
-    watch->effective_watch=NULL;
-
-    effective_watch->nrwatches--;
+    pthread_mutex_unlock(&watch->mutex);
 
 }
 
-void remove_client_watch_from_client(struct watch_struct *watch)
+void remove_clientwatch_from_client(struct clientwatch_struct *clientwatch)
 {
-    struct client_struct *client=watch->client;
+    struct client_struct *client=clientwatch->client;
 
-    /* from client */
+    if (clientwatch->prev_per_client) clientwatch->prev_per_client->next_per_client=clientwatch->next_per_client;
+    if (clientwatch->next_per_client) clientwatch->next_per_client->prev_per_client=clientwatch->prev_per_client;
 
-    if ( client ) {
+    if (client->clientwatches==(void *) clientwatch) client->clientwatches=(void *) clientwatch->next_per_client;
 
-	if ( client->watches==watch ) client->watches=watch->next_per_client;
+    clientwatch->prev_per_client=NULL;
+    clientwatch->next_per_client=NULL;
+
+}
+
+void remove_clientwatches(struct client_struct *client)
+{
+    struct clientwatch_struct *clientwatch;
+
+    lock_client(client);
+
+    clientwatch=(struct clientwatch_struct *) client->clientwatches;
+
+    while(clientwatch) {
+
+	remove_clientwatch_from_watch(clientwatch);
+	remove_clientwatch_from_client(clientwatch);
+
+	clientwatch=(struct clientwatch_struct *) client->clientwatches;
 
     }
 
-    if ( watch->prev_per_client ) watch->prev_per_client->next_per_client=watch->next_per_client;
-    if ( watch->next_per_client ) watch->next_per_client->prev_per_client=watch->prev_per_client;
-
-    watch->prev_per_client=NULL;
-    watch->next_per_client=NULL;
-    watch->client=NULL;
+    unlock_client(client);
 
 }
 
-void set_watch_backend_os_specific(struct effective_watch_struct *effective_watch, char *path, int mask)
-{
-    int res=set_watch_backend_inotify(effective_watch, path, mask);
-}
 
-void change_watch_backend_os_specific(struct effective_watch_struct *effective_watch, char *path, int mask)
-{
-    int res=change_watch_backend_inotify(effective_watch, path, mask);
-}
-
-
-void remove_watch_backend_os_specific(struct effective_watch_struct *effective_watch)
-{
-    remove_watch_backend_inotify(effective_watch);
-}
 
 void initialize_fsnotify_backends()
 {
@@ -743,3 +861,297 @@ void close_fsnotify_backends()
 {
     close_inotify();
 }
+
+int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time)
+{
+    DIR *dp=NULL;
+    int nreturn=0;
+
+    logoutput("sync_directory_full");
+
+    dp=opendir(path);
+
+    if ( dp ) {
+	int lenpath=strlen(path);
+	struct notifyfs_entry_struct *entry, *next_entry;
+	struct notifyfs_inode_struct *parent_inode, *inode;
+	struct notifyfs_attr_struct *attr;
+	struct dirent *de;
+	char *name;
+	int res, lenname=0;
+	struct stat st;
+	char tmppath[lenpath+256];
+	unsigned char attrcreated=0;
+
+	memcpy(tmppath, path, lenpath);
+	*(tmppath+lenpath)='/';
+
+	parent_inode=get_inode(parent->inode);
+
+	while((de=readdir(dp))) {
+
+	    /* here check the entry exist... */
+
+	    name=de->d_name;
+
+	    if ( strcmp(name, ".")==0 ) {
+
+		continue;
+
+	    } else if ( strcmp(name, "..")==0 ) {
+
+		continue;
+
+	    }
+
+	    lenname=strlen(name);
+
+	    /* add this entry to the base path */
+
+	    memcpy(tmppath+lenpath+1, name, lenname);
+	    *(tmppath+lenpath+1+lenname)='\0';
+
+	    /* read the stat */
+
+	    res=lstat(tmppath, &st);
+
+	    /* huh?? */
+
+	    if ( res==-1 ) {
+
+		continue;
+
+		/* here additional action: lookup the entry and if exist: a delete */
+
+	    }
+
+	    entry=find_entry_raw(parent, parent_inode, name, 1, create_entry);
+
+	    if ( entry ) {
+
+		if (entry->inode==-1) assign_inode(entry);
+
+		if (entry->inode>=0) {
+
+		    nreturn++;
+
+		    inode=get_inode(entry->inode);
+
+		    if (inode->attr>=0) {
+
+			attr=get_attr(inode->attr);
+			attrcreated=0;
+
+			copy_stat(&attr->cached_st, &st);
+			copy_stat_times(&attr->cached_st, &st);
+
+		    } else {
+
+			attr=assign_attr(&st, inode);
+			attrcreated=1;
+
+		    }
+
+		    if (attr) {
+
+			attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
+			attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
+
+			if (attrcreated==1) {
+
+			    if ( S_ISDIR(st.st_mode)) {
+
+				/* directory no access yet */
+
+				attr->mtim.tv_sec=0;
+				attr->mtim.tv_nsec=0;
+
+			    } else {
+
+				attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
+				attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
+
+			    }
+
+			}
+
+			attr->atim.tv_sec=sync_time->tv_sec;
+			attr->atim.tv_nsec=sync_time->tv_nsec;
+
+		    } else {
+
+			logoutput("sync_directory_full: error: attr not found. ");
+
+			remove_entry(entry);
+
+			/* ignore this (memory) error */
+
+			continue;
+
+		    }
+
+		} else {
+
+		    continue;
+
+		}
+
+	    }
+
+	}
+
+
+	closedir(dp);
+
+    } else {
+
+	nreturn=-errno;
+
+	logoutput("sync_directory: error %i opening directory..", errno);
+
+    }
+
+    return nreturn;
+
+}
+
+void remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time)
+{
+    struct notifyfs_entry_struct *entry, *next_entry;
+    struct notifyfs_inode_struct *inode, *parent_inode;
+    struct notifyfs_attr_struct *attr;
+
+    logoutput("remove_old_entries");
+
+    parent_inode=get_inode(parent->inode);
+
+    entry=get_next_entry(parent, NULL);
+
+    while (entry) {
+
+	inode=get_inode(entry->inode);
+	attr=get_attr(inode->attr);
+
+	next_entry=get_next_entry(parent, entry);
+
+	if (attr) {
+
+	    /* if stime is less then parent entry access it's is gone */
+
+	    if (attr->atim.tv_sec<sync_time->tv_sec ||(attr->atim.tv_sec==sync_time->tv_sec && attr->atim.tv_nsec<sync_time->tv_nsec) ) {
+		char *name=get_data(entry->name);
+
+		logoutput("remove_old_entries: remove %s", name);
+
+		remove_entry_from_name_hash(entry);
+		remove_entry(entry);
+
+		/* TODO:
+		correct the fs & signals */
+
+	    }
+
+	} else {
+
+	    remove_entry_from_name_hash(entry);
+	    remove_entry(entry);
+
+	}
+
+	entry=next_entry;
+
+    }
+
+}
+
+void sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time)
+{
+    struct notifyfs_entry_struct *entry, *next_entry;
+    struct notifyfs_inode_struct *inode, *parent_inode;
+    struct notifyfs_attr_struct *attr;
+    char *name;
+    int lenpath=strlen(path), lenname;
+    char tmppath[lenpath+256];
+    struct stat st;
+
+    memcpy(tmppath, path, lenpath);
+    *(tmppath+lenpath)='/';
+
+    logoutput("sync_directory_simple");
+
+    parent_inode=get_inode(parent->inode);
+
+    entry=get_next_entry(parent, NULL);
+
+    while (entry) {
+
+	inode=get_inode(entry->inode);
+	attr=get_attr(inode->attr);
+
+	name=get_data(entry->name);
+
+	lenname=strlen(name);
+
+	/* add this entry to the base path */
+
+	memcpy(tmppath+lenpath+1, name, lenname);
+	*(tmppath+lenpath+1+lenname)='\0';
+
+	/* read the stat */
+
+	if (stat(tmppath, &st)==-1) {
+
+	    /* when entry does not exist, take action.. */
+
+	    if (errno==ENOENT) {
+
+		next_entry=get_next_entry(parent, entry);
+
+		remove_entry_from_name_hash(entry);
+		remove_entry(entry);
+
+		/* TODO: here send messages .... */
+
+	    }
+
+	} else {
+
+	    attr=get_attr(inode->attr);
+
+	    if (!attr) {
+
+		attr=assign_attr(&st, inode);
+
+		if (attr) {
+
+		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
+		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
+
+		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
+		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
+
+		    attr->atim.tv_sec=sync_time->tv_sec;
+		    attr->atim.tv_nsec=sync_time->tv_nsec;
+
+		}
+
+	    } else {
+
+		copy_stat(&attr->cached_st, &st);
+		copy_stat_times(&attr->cached_st, &st);
+
+		/* TODO: here compare the mtim and ctim to get an event */
+
+		attr->atim.tv_sec=sync_time->tv_sec;
+		attr->atim.tv_nsec=sync_time->tv_nsec;
+
+	    }
+
+	}
+
+	entry=get_next_entry(parent, entry);
+
+    }
+
+}
+

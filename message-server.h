@@ -17,13 +17,15 @@
 
 */
 
-#ifndef NOTIFYFS_MAIN_H
-#define NOTIFYFS_MAIN_H
+#ifndef NOTIFYFS_MESSAGE_SERVER_H
+#define NOTIFYFS_MESSAGE_SERVER_H
 
-#include <fuse/fuse_lowlevel.h>
 
-typedef char pathstring[PATH_MAX+1];
-typedef char smallpathstring[SMALL_PATH_MAX+1];
+// Prototypes
 
+void send_reply_message(int fd, uint64_t unique, int error, void *buffer, size_t size);
+void send_delwatch_message(int fd, uint64_t unique, unsigned long client_watch_id);
+void send_changewatch_message(int fd, uint64_t unique, unsigned long client_watch_id, unsigned char action);
+void send_fsevent_message(int fd, uint64_t unique, unsigned long client_watch_id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time);
 
 #endif

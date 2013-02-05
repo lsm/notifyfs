@@ -33,10 +33,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/param.h>
-#include <sys/epoll.h>
-#include <sys/inotify.h>
 
 #include <pthread.h>
+#include <fcntl.h>
+
 
 #ifndef ENOATTR
 #define ENOATTR ENODATA        /* No such attribute */
@@ -46,504 +46,99 @@
 
 #include <fuse/fuse_lowlevel.h>
 #include "logging.h"
-#include "notifyfs.h"
+#include "notifyfs-io.h"
+#include "utils.h"
 #include "entry-management.h"
 
-#ifdef SIZE_INODE_HASHTABLE
-static size_t id_table_size=SIZE_INODE_HASHTABLE;
-#else
-static size_t id_table_size=32768;
-#endif
 
-#ifdef SIZE_NAME_HASHTABLE
-static size_t name_table_size=SIZE_NAME_HASHTABLE;
-#else
-static size_t name_table_size=32768;
-#endif
+static unsigned long long inoctr = FUSE_ROOT_ID;
+static pthread_mutex_t inoctr_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-#define DIRECTORYINDEX_SIZE			100
+struct notifyfs_inode_struct *rootinode=NULL;
+struct notifyfs_entry_struct *rootentry=NULL;
 
-#define NAMEINDEX_ROOT1				91
-#define NAMEINDEX_ROOT2				8281
-#define NAMEINDEX_ROOT3				753571
+static int free_entries=-1;
+static pthread_mutex_t free_entries_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-struct nameindex_struct {
-    struct notifyfs_entry_struct *entry;
-    int count;
-};
+static int free_attributes=-1;
+static pthread_mutex_t free_attributes_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-struct directory_struct {
-    struct nameindex_struct nameindex[NAMEINDEX_ROOT1];
-    int count;
-};
+static int free_mounts=-1;
+static pthread_mutex_t free_mounts_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-struct notifyfs_inode_struct **inode_hash_table;
-struct directory_struct directory_table[DIRECTORYINDEX_SIZE];
-
-pthread_mutex_t inodectrmutex=PTHREAD_MUTEX_INITIALIZER;
-unsigned long long inoctr = FUSE_ROOT_ID;
-
-struct notifyfs_inode_struct rootinode;
-struct notifyfs_entry_struct rootentry;
-unsigned char rootcreated=0;
-
-
-int init_hashtables()
+struct notifyfs_mount_struct *create_mount(char *fs, char *mountsource, char *superoptions, struct notifyfs_entry_struct *entry)
 {
-    int nreturn=0, i, j;
+    struct notifyfs_mount_struct *mount=NULL;
 
-    inode_hash_table = calloc(id_table_size, sizeof(struct notifyfs_inode_struct *));
+    pthread_mutex_lock(&free_mounts_mutex);
 
-    if ( ! inode_hash_table ) {
+    if (free_mounts>=0) {
 
-	nreturn=-ENOMEM;
-	goto error;
+	mount=get_mount(free_mounts);
 
-    }
+	if (mount->next>=0) {
+	    struct notifyfs_mount_struct *next=get_mount(mount->next);
 
-    for (i=1;i<=DIRECTORYINDEX_SIZE;i++) {
-
-	directory_table[i-1].count=0;
-
-	for (j=1;j<=NAMEINDEX_ROOT1;j++) {
-
-	    directory_table[i-1].nameindex[j-1].entry=NULL;
-	    directory_table[i-1].nameindex[j-1].count=0;
+	    next->prev=mount->prev;
 
 	}
 
-    }
+	if (mount->prev>=0) {
+	    struct notifyfs_mount_struct *prev=get_mount(mount->prev);
 
-    return 0;
-
-    error:
-
-    if ( inode_hash_table) free(inode_hash_table);
-
-    return nreturn;
-
-}
-
-static size_t inode_2_hash(fuse_ino_t ino)
-{
-    return ino % id_table_size;
-}
-
-
-void add_to_inode_hash_table(struct notifyfs_inode_struct *inode)
-{
-    size_t idh = inode_2_hash(inode->ino);
-
-    inode->id_next = inode_hash_table[idh];
-    inode_hash_table[idh] = inode;
-}
-
-
-void add_to_name_hash_table(struct notifyfs_entry_struct *entry)
-{
-    int nameindex_value=0, res;
-    int lenname=strlen(entry->name);
-    char *name=entry->name;
-    unsigned char firstletter=*(name)-32;
-    unsigned char secondletter=0;
-    unsigned char thirdletter=0;
-    unsigned char fourthletter=0;
-    int inoindex=0;
-    struct nameindex_struct *nameindex=NULL;
-    struct notifyfs_entry_struct *next_entry, *keep_entry=NULL;
-
-    if ( ! entry->parent ) {
-
-	logoutput("add_to_name_hash_table: %s has no parent", entry->name);
-
-	return;
-
-    }
-
-    inoindex=entry->parent->inode->ino % DIRECTORYINDEX_SIZE;
-
-    nameindex=&(directory_table[inoindex].nameindex[firstletter]);
-
-    /* get the first four letters 
-
-    it's possible that the name is not that long 
-    in any case the first letter is always defined 
-    */
-
-    if (lenname>=4) {
-
-	secondletter=*(name+1)-32;
-	thirdletter=*(name+2)-32;
-	fourthletter=*(name+3)-32;
-
-    } else if (lenname==3) {
-
-	secondletter=*(name+1)-32;
-	thirdletter=*(name+2)-32;
-
-    } else if (lenname==2) {
-
-	secondletter=*(name+1)-32;
-
-    }
-
-    nameindex_value=secondletter * NAMEINDEX_ROOT2 + thirdletter * NAMEINDEX_ROOT1 + fourthletter;
-    entry->nameindex_value=nameindex_value;
-
-    next_entry=nameindex->entry;
-
-    while (next_entry) {
-
-	keep_entry=next_entry;
-
-	if (nameindex_value==next_entry->nameindex_value) {
-
-	    /* look futher, indexvalue is the same, but the name may differ */
-
-	    while (next_entry) {
-
-		keep_entry=next_entry;
-
-		res=strcmp(next_entry->name, entry->name);
-
-		if (res>=0) {
-
-		    if (res==0) {
-
-			logoutput("add_to_name_hash_table: %s already present!", entry->name);
-			return;
-
-		    }
-
-		    goto insert;
-
-		}
-
-		next_entry=next_entry->name_next;
-
-	    }
-
-	    break;
-
-	} else if (nameindex_value<next_entry->nameindex_value) {
-
-	    /* index value bigger, so the name is also "bigger": the right next value is found */
-
-	    break;
+	    prev->next=mount->next;
 
 	}
 
-	next_entry=next_entry->name_next;
+	free_mounts=mount->next;
 
     }
 
-    insert:
+    pthread_mutex_unlock(&free_mounts_mutex);
 
-    if (next_entry) {
+    if (! mount) mount=notifyfs_malloc_mount();
 
-	/* a next entry is found */
+    if (mount) {
 
-	nameindex->count++;
-	directory_table[inoindex].count++;
+	logoutput("create_mount: new mount fs %s, backend %s", fs, mountsource);
 
-	entry->name_next=next_entry;
+	mount->entry=entry->index;
+	entry->mount=mount->index;
+	mount->rootentry=-1;
+	mount->major=0;
+	mount->minor=0;
 
-	if (next_entry==nameindex->entry) {
+	snprintf(mount->filesystem, 32, "%s", fs);
+	snprintf(mount->mountsource, 64, "%s", mountsource);
+	snprintf(mount->superoptions, 256, "%s", superoptions);
 
-	    nameindex->entry=entry;
-	    entry->name_prev=NULL;
-
-	} else {
-
-	    entry->name_prev=next_entry->name_prev;
-	    next_entry->name_prev->name_next=entry;
-
-	}
-
-	next_entry->name_prev=entry;
-
-    } else if (keep_entry) {
-
-	/* next entry is empty, but a "prev" entry is found 
-	probably at end of list
-	*/
-
-	nameindex->count++;
-	directory_table[inoindex].count++;
-
-	keep_entry->name_next=entry;
-	entry->name_prev=keep_entry;
-
-	entry->name_next=NULL;
-
-    } else {
-
-	/* no next and prev, probably empty */
-
-	nameindex->count++;
-	directory_table[inoindex].count++;
-
-	nameindex->entry=entry;
-
-	entry->name_next=NULL;
-	entry->name_prev=NULL;
+	mount->mode=0;
+	mount->next=-1;
+	mount->prev=-1;
 
     }
+
+    return mount;
 
 }
 
-void remove_entry_from_name_hash(struct notifyfs_entry_struct *entry)
+void remove_mount(struct notifyfs_mount_struct *mount)
 {
-    struct notifyfs_entry_struct *next=entry->name_next;
-    struct notifyfs_entry_struct *prev=entry->name_prev;
-    unsigned char firstletter=*(entry->name)-32;
-    int inoindex=0;
-    struct nameindex_struct *nameindex=NULL;
 
-    if ( ! entry->parent ) return;
+    pthread_mutex_lock(&free_mounts_mutex);
 
-    inoindex=entry->parent->inode->ino % DIRECTORYINDEX_SIZE;
+    if (free_mounts>=0) {
+	struct notifyfs_mount_struct *first_mount=get_mount(free_mounts);
 
-    nameindex=&(directory_table[inoindex].nameindex[firstletter]);
-
-    if (entry==nameindex->entry) nameindex->entry=next;
-    if (next) next->name_prev=prev;
-    if (prev) prev->name_next=next;
-
-    entry->name_prev=NULL;
-    entry->name_next=NULL;
-
-    nameindex->count--;
-    directory_table[inoindex].count--;
-
-}
-
-struct notifyfs_inode_struct *find_inode(fuse_ino_t ino)
-{
-    struct notifyfs_inode_struct *tmpinode = inode_hash_table[inode_2_hash(ino)];
-
-    while (tmpinode && tmpinode->ino != ino) tmpinode = tmpinode->id_next;
-
-    return tmpinode;
-
-}
-
-struct notifyfs_entry_struct *find_entry_raw(struct notifyfs_entry_struct *parent, const char *name, unsigned char exact)
-{
-    int nameindex_value=0, lenname=strlen(name);
-    unsigned char firstletter=*(name)-32;
-    unsigned char secondletter=0;
-    unsigned char thirdletter=0;
-    unsigned char fourthletter=0;
-    int inoindex=parent->inode->ino % DIRECTORYINDEX_SIZE;
-    struct nameindex_struct *nameindex=&(directory_table[inoindex].nameindex[firstletter]);
-    struct notifyfs_entry_struct *entry=NULL;
-
-    if (directory_table[inoindex].count==0) goto out;
-    if (nameindex->count==0) goto out;
-
-    if (lenname>=4) {
-
-	secondletter=*(name+1)-32;
-	thirdletter=*(name+2)-32;
-	fourthletter=*(name+3)-32;
-
-    } else if (lenname==3) {
-
-	secondletter=*(name+1)-32;
-	thirdletter=*(name+2)-32;
-
-    } else if (lenname==2) {
-
-	secondletter=*(name+1)-32;
+	first_mount->prev=mount->index;
 
     }
 
-    nameindex_value=secondletter * NAMEINDEX_ROOT2 + thirdletter * NAMEINDEX_ROOT1 + fourthletter;
-    entry=nameindex->entry;
-
-    while (entry) {
-
-	if (nameindex_value>entry->nameindex_value) {
-
-	    /* before name */
-
-	    entry=entry->name_next;
-	    continue;
-
-	} else if (nameindex_value==entry->nameindex_value) {
-
-	    while (entry) {
-
-		/* index value (first 4 letters) is the same : compare full names */
-
-		if (entry->parent==parent) {
-
-		    if (strcmp(entry->name, name)==0) {
-
-			goto out;
-
-		    } else if (strcmp(entry->name, name)>0 && exact==0) {
-
-			goto out;
-
-		    }
-
-		}
-
-		entry=entry->name_next;
-
-		if (! entry) goto out;
-
-		if (nameindex_value<entry->nameindex_value) {
-
-		    if (exact==1) {
-
-			entry=NULL;
-			goto out;
-
-		    } else {
-
-			goto out;
-
-		    }
-
-		}
-
-	    }
-
-	} else if (nameindex_value<entry->nameindex_value) {
-
-	    /* past name */
-
-	    if (exact==1) {
-
-		entry=NULL;
-		break;
-
-	    } else {
-
-		break;
-
-	    }
-
-	}
-
-    }
-
-    out:
-
-    if (entry) {
-
-	logoutput("find_entry_raw: %s found", name);
-
-    } else {
-
-	logoutput("find_entry_raw: %s not found", name);
-
-    }
-
-    return entry;
-
-}
-
-struct notifyfs_entry_struct *find_entry(fuse_ino_t ino, const char *name)
-{
-    struct notifyfs_inode_struct *inode=find_inode(ino);
-
-    if (inode) {
-
-	if (inode->alias) return find_entry_raw(inode->alias, name, 1);
-
-    }
-
-    return NULL;
-
-}
-
-static struct notifyfs_entry_struct *lookup_first_entry(struct notifyfs_entry_struct *parent, unsigned char i)
-{
-    struct notifyfs_entry_struct *entry=NULL;
-    int inoindex=parent->inode->ino % DIRECTORYINDEX_SIZE;
-
-    while ( i<NAMEINDEX_ROOT1 && ! entry) {
-
-	if (directory_table[inoindex].nameindex[i].count>0) {
-
-	    entry=directory_table[inoindex].nameindex[i].entry;
-
-	    while (entry) {
-
-		if (entry->parent==parent) goto out;
-
-		entry=entry->name_next;
-
-
-	    }
-
-	}
-
-	i++;
-
-    }
-
-    out:
-
-    return entry;
-
-}
-
-/* function which does a lookup of the next entry with the same parent 
-    used for getting the contents of a directory */
-
-struct notifyfs_entry_struct *get_next_entry(struct notifyfs_entry_struct *parent, struct notifyfs_entry_struct *entry)
-{
-    int inoindex=parent->inode->ino % DIRECTORYINDEX_SIZE;
-
-    logoutput("get_next_entry");
-
-    if (directory_table[inoindex].count==0) return NULL;
-
-    if ( ! entry) {
-
-	entry=lookup_first_entry(parent, 0);
-
-    } else {
-	unsigned char i=*(entry->name)-32; /* remember the current row */
-
-	entry=entry->name_next;
-
-	/* next entry in the list must have the same parent */
-
-	while (entry) {
-
-	    if (entry->parent==parent) break;
-
-	    entry=entry->name_next;
-
-	}
-
-	if ( ! entry) {
-
-	    /* look in the first next tabel */
-
-	    entry=lookup_first_entry(parent, i+1);
-
-	}
-
-    }
-
-    if (entry) {
-
-	logoutput("get_next_entry: found %s", entry->name);
-
-    } else {
-
-	logoutput("get_next_entry: no entry found");
-
-    }
-
-    return entry;
+    mount->next=free_mounts;
+    mount->prev=-1;
+    free_mounts=mount->index;
+
+    pthread_mutex_unlock(&free_mounts_mutex);
 
 }
 
@@ -551,75 +146,94 @@ static struct notifyfs_inode_struct *create_inode()
 {
     struct notifyfs_inode_struct *inode=NULL;
 
-    pthread_mutex_lock(&inodectrmutex);
-
-    inode = malloc(sizeof(struct notifyfs_inode_struct));
+    inode = notifyfs_malloc_inode();
 
     if (inode) {
 
-	memset(inode, 0, sizeof(struct notifyfs_inode_struct));
-	inode->ino = inoctr;
-	inode->nlookup = 0;
-	inode->status=FSEVENT_INODE_STATUS_OK;
-	inode->lastaction=0;
-	inode->method=0;
-	inode->effective_watch=NULL;
+	pthread_mutex_lock(&inoctr_mutex);
 
+	inode->ino=inoctr;
 	inoctr++;
 
-    }
+	pthread_mutex_unlock(&inoctr_mutex);
 
-    pthread_mutex_unlock(&inodectrmutex);
+	inode->nlookup = 0;
+	inode->status=FSEVENT_INODE_STATUS_OK;
+
+    }
 
     return inode;
 
 }
 
-static void init_entry(struct notifyfs_entry_struct *entry)
+struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent, const char *newname)
 {
-    entry->inode=NULL;
-    entry->name=NULL;
+    struct notifyfs_entry_struct *entry=NULL;
 
-    entry->parent=NULL;
-    entry->mount_entry=NULL;
+    logoutput("create_entry: name %s", newname);
 
-    // to maintain a table overall
-    entry->name_next=NULL;
-    entry->name_prev=NULL;
+    pthread_mutex_lock(&free_entries_mutex);
 
-    entry->status=0;
+    if (free_entries>=0) {
 
-}
+	entry=get_entry(free_entries);
 
+	if (entry->name_next>=0) {
+	    struct notifyfs_entry_struct *next=NULL;
 
-struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent, const char *name, struct notifyfs_inode_struct *inode)
-{
-    struct notifyfs_entry_struct *entry;
+	    next=get_entry(entry->name_next);
+	    next->name_prev=entry->name_prev;
 
-    entry = malloc(sizeof(struct notifyfs_entry_struct));
+	}
+
+	if (entry->name_prev>=0) {
+	    struct notifyfs_entry_struct *prev=NULL;
+
+	    prev=get_entry(entry->name_prev);
+	    prev->name_next=entry->name_next;
+
+	}
+
+	free_entries=entry->name_next;
+
+    }
+
+    pthread_mutex_unlock(&free_entries_mutex);
+
+    if (! entry) entry = notifyfs_malloc_entry();
 
     if (entry) {
+	int lenname=strlen(newname);
 
-	memset(entry, 0, sizeof(struct notifyfs_entry_struct));
-	init_entry(entry);
+	entry->name=notifyfs_malloc_data(lenname+1);
 
-	entry->name = strdup(name);
+	if (entry->name==-1) {
 
-	if (!entry->name) {
-
-	    free(entry);
+	    remove_entry(entry);
 	    entry = NULL;
 
 	} else {
+	    char *name=get_data(entry->name);
 
-	    entry->parent = parent;
+	    memcpy(name, newname, lenname);
 
-	    if (inode != NULL) {
+	    logoutput("create_entry: created name %s", name);
 
-		entry->inode = inode;
-		inode->alias=entry;
+	    if (parent) {
+
+		entry->parent = parent->index;
+
+	    } else {
+
+		entry->parent=-1;
 
 	    }
+
+	    entry->inode=-1;
+	    entry->name_next=-1;
+	    entry->name_prev=-1;
+	    entry->mount=-1;
+	    entry->nameindex_value=0;
 
 	}
 
@@ -629,54 +243,125 @@ struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent,
 
 }
 
-void remove_entry(struct notifyfs_entry_struct *entry)
+struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_struct *inode)
 {
+    struct notifyfs_attr_struct *attr=NULL;
 
-    free(entry->name);
+    pthread_mutex_lock(&free_attributes_mutex);
 
-    if ( entry->inode ) {
+    if (free_attributes>=0) {
 
-	entry->inode->alias=NULL;
+	attr=get_attr(free_attributes);
+
+	if (attr->next>=0) {
+	    struct notifyfs_attr_struct *next=NULL;
+
+	    next=get_attr(attr->next);
+	    next->prev=attr->prev;
+
+	}
+
+	if (attr->prev>=0) {
+	    struct notifyfs_attr_struct *prev=NULL;
+
+	    prev=get_attr(attr->prev);
+	    prev->next=attr->next;
+
+	}
+
+	free_attributes=attr->next;
 
     }
 
-    free(entry);
+    pthread_mutex_unlock(&free_attributes_mutex);
+
+    if (! attr) attr=notifyfs_malloc_attr();
+
+    if (attr) {
+
+	inode->attr=attr->index;
+
+	if (st) {
+
+	    copy_stat(&attr->cached_st, st);
+	    copy_stat_times(&attr->cached_st, st);
+
+	}
+
+    }
+
+    return attr;
+
+}
+
+void remove_attr(struct notifyfs_attr_struct *attr)
+{
+
+    pthread_mutex_lock(&free_attributes_mutex);
+
+    if (free_attributes>=0) {
+	struct notifyfs_attr_struct *first_attr=get_attr(free_attributes);
+
+	first_attr->prev=attr->index;
+
+    }
+
+    attr->next=free_attributes;
+    attr->prev=-1;
+
+    free_attributes=attr->index;
+
+    pthread_mutex_unlock(&free_attributes_mutex);
+
+}
+
+
+void remove_entry(struct notifyfs_entry_struct *entry)
+{
+
+    if ( entry->inode>=0 ) {
+	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+
+	inode->alias=-1;
+
+	if (inode->attr>0) {
+	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+
+	    remove_attr(attr);
+
+	}
+
+    }
+
+    pthread_mutex_lock(&free_entries_mutex);
+
+    if (free_entries>=0) {
+	struct notifyfs_entry_struct *first_entry=get_entry(free_entries);
+
+	first_entry->name_prev=entry->index;
+
+    }
+
+    entry->name_next=free_entries;
+    entry->name_prev=-1;
+
+    free_entries=entry->index;
+
+    pthread_mutex_unlock(&free_entries_mutex);
 
 }
 
 void assign_inode(struct notifyfs_entry_struct *entry)
 {
+    struct notifyfs_inode_struct *inode=create_inode();
 
-    entry->inode=create_inode();
+    if (inode) {
 
-    if ( entry->inode ) {
-
-	entry->inode->alias=entry;
-
-    }
-
-}
-
-struct notifyfs_entry_struct *new_entry(fuse_ino_t parent, const char *name)
-{
-    struct notifyfs_entry_struct *entry;
-
-    entry = create_entry(find_inode(parent)->alias, name, NULL);
-
-    if ( entry ) {
-
-	assign_inode(entry);
-
-	if ( ! entry->inode ) {
-
-	    remove_entry(entry);
-	    entry=NULL;
-
-	}
+	entry->inode=inode->index;
+	inode->alias=entry->index;
 
     }
 
-    return entry;
 }
 
 unsigned long long get_inoctr()
@@ -684,47 +369,80 @@ unsigned long long get_inoctr()
     return inoctr;
 }
 
+/* lookup the inode in the inode array 
+    since there can be more than one arrays, which are in different shm chunks
+    it's the task to find the right array
+    the way to do this is to look at the modulo and the remainder
+    of the ino compared to the array size
+    note that the relation between index in array and ino is that
+    index starts at 0, and ino at FUSE_ROOT_ID, which is 1 normally
+*/
+
+struct notifyfs_inode_struct *find_inode(fuse_ino_t ino)
+{
+    struct notifyfs_inode_struct *inode=NULL;
+    int ctr=0;
+    int index=0;
+
+    index=ino-FUSE_ROOT_ID; /* correct the ino to fit with array index */
+
+    inode=get_inode(index);
+
+    return inode;
+
+}
+
+struct notifyfs_entry_struct *find_entry_by_ino(fuse_ino_t ino, const char *name)
+{
+    struct notifyfs_inode_struct *inode=find_inode(ino);
+
+    if (inode) {
+	struct notifyfs_entry_struct *parent;
+
+	parent=get_entry(inode->alias);
+
+	if (parent) {
+
+	    return find_entry_raw(parent, inode, name, 1, NULL);
+
+	}
+
+    }
+
+    return NULL;
+
+}
+
+struct notifyfs_entry_struct *find_entry_by_entry(struct notifyfs_entry_struct *parent, const char *name)
+{
+    struct notifyfs_inode_struct *inode=get_inode(parent->inode);
+
+    return find_entry_raw(parent, inode, name, 1, NULL);
+
+}
 
 /* create the root inode and entry */
 
 int create_root()
 {
     int nreturn=0;
+    char *name;
 
-    if ( rootcreated!=0 ) goto out;
+    if ( rootentry ) goto out;
 
-    /* rootentry */
+    /* rootentry (no parent) */
 
-    init_entry(&rootentry);
-
-    rootentry.name=strdup(".");
-
-    if ( ! rootentry.name ) {
-
-	nreturn=-ENOMEM;
-	goto out;
-
-    }
+    rootentry=create_entry(NULL, ".");
 
     /* rootinode */
 
-    pthread_mutex_lock(&inodectrmutex);
+    assign_inode(rootentry);
 
-    rootinode.ino = inoctr;
-    rootinode.nlookup = 0;
-    rootinode.status=FSEVENT_INODE_STATUS_OK;
+    rootinode=get_inode(rootentry->inode);
 
-    inoctr++;
+    name=get_data(rootentry->name);
 
-    pthread_mutex_unlock(&inodectrmutex);
-
-    /* create the mutual links */
-
-    rootentry.inode=&rootinode;
-    rootinode.alias=&rootentry;
-
-    add_to_inode_hash_table(&rootinode);
-    rootcreated=1;
+    logoutput("create_root: created rootentry %s with ino %li", name, rootinode->ino);
 
     out:
 
@@ -732,16 +450,31 @@ int create_root()
 
 }
 
+void assign_rootentry()
+{
+
+    rootentry=get_entry(0);
+
+    if (rootentry) {
+	char *name=get_data(rootentry->name);
+
+	logoutput("assign_rootentry: found root entry %s", name);
+
+    }
+
+}
+
+
 /* get the root inode */
 
 struct notifyfs_inode_struct *get_rootinode()
 {
-    return &rootinode;
+    return rootinode;
 }
 
 struct notifyfs_entry_struct *get_rootentry()
 {
-    return &rootentry;
+    return rootentry;
 }
 
 unsigned char isrootinode(struct notifyfs_inode_struct *inode)
@@ -754,6 +487,146 @@ unsigned char isrootinode(struct notifyfs_inode_struct *inode)
 unsigned char isrootentry(struct notifyfs_entry_struct *entry)
 {
 
-    return (entry==&rootentry) ? 1 : 0;
+    return (entry==rootentry) ? 1 : 0;
 
 }
+
+void copy_stat_to_notifyfs(struct stat *st, struct notifyfs_entry_struct *entry)
+{
+
+    if (entry->inode>=0) {
+	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+
+	if (inode->attr>=0) {
+	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+
+	    attr->cached_st.st_dev=st->st_dev;
+	    attr->cached_st.st_ino=st->st_ino;
+	    attr->cached_st.st_nlink=st->st_nlink;
+	    attr->cached_st.st_mode=st->st_mode;
+	    attr->cached_st.st_uid=st->st_uid;
+	    attr->cached_st.st_gid=st->st_gid;
+	    attr->cached_st.st_rdev=st->st_rdev;
+	    attr->cached_st.st_size=st->st_size;
+	    attr->cached_st.st_blksize=st->st_blksize;
+	    attr->cached_st.st_blocks=st->st_blocks;
+	    attr->cached_st.st_atim.tv_sec=st->st_atim.tv_sec;
+	    attr->cached_st.st_atim.tv_nsec=st->st_atim.tv_nsec;
+	    attr->cached_st.st_mtim.tv_sec=st->st_mtim.tv_sec;
+	    attr->cached_st.st_mtim.tv_nsec=st->st_mtim.tv_nsec;
+	    attr->cached_st.st_ctim.tv_sec=st->st_ctim.tv_sec;
+	    attr->cached_st.st_ctim.tv_nsec=st->st_ctim.tv_nsec;
+
+	}
+
+    }
+
+}
+
+void get_stat_from_cache(struct stat *st, struct notifyfs_entry_struct *entry)
+{
+
+    if (entry->inode>=0) {
+	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+
+	if (inode->attr>=0) {
+	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+
+	    st->st_dev=attr->cached_st.st_dev;
+	    st->st_ino=attr->cached_st.st_ino;
+	    st->st_mode=attr->cached_st.st_mode;
+	    st->st_nlink=attr->cached_st.st_nlink;
+	    st->st_uid=attr->cached_st.st_uid;
+	    st->st_gid=attr->cached_st.st_gid;
+	    st->st_rdev=attr->cached_st.st_rdev;
+	    st->st_size=attr->cached_st.st_size;
+	    st->st_blksize=attr->cached_st.st_blksize;
+	    st->st_blocks=attr->cached_st.st_blocks;
+	    st->st_atim.tv_sec=attr->cached_st.st_atim.tv_sec;
+	    st->st_atim.tv_nsec=attr->cached_st.st_atim.tv_nsec;
+	    st->st_mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
+	    st->st_mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
+	    st->st_ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
+	    st->st_ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
+
+	}
+
+    }
+
+}
+
+void get_stat_from_notifyfs(struct stat *st, struct notifyfs_entry_struct *entry)
+{
+
+    if (entry->inode>=0) {
+	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+
+	if (inode->attr>=0) {
+	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+
+	    st->st_dev=0;
+	    st->st_ino=inode->ino;
+	    st->st_mode=attr->cached_st.st_mode;
+	    st->st_nlink=attr->cached_st.st_nlink;
+	    st->st_uid=attr->cached_st.st_uid;
+	    st->st_gid=attr->cached_st.st_gid;
+	    st->st_rdev=attr->cached_st.st_rdev;
+	    st->st_size=attr->cached_st.st_size;
+
+	    st->st_atim.tv_sec=attr->atim.tv_sec;
+	    st->st_atim.tv_nsec=attr->atim.tv_nsec;
+	    st->st_mtim.tv_sec=attr->mtim.tv_sec;
+	    st->st_mtim.tv_nsec=attr->mtim.tv_nsec;
+	    st->st_ctim.tv_sec=attr->ctim.tv_sec;
+	    st->st_ctim.tv_nsec=attr->ctim.tv_nsec;
+
+	}
+
+    }
+
+}
+
+
+
+void notify_kernel_delete(struct fuse_chan *chan, struct notifyfs_entry_struct *entry)
+{
+    int res=0;
+    struct notifyfs_entry_struct *parent_entry;
+
+    parent_entry=get_entry(entry->parent);
+
+    if (parent_entry) {
+	struct notifyfs_inode_struct *inode;
+	struct notifyfs_inode_struct *parent_inode;
+	char *name;
+
+	inode=get_inode(entry->inode);
+	parent_inode=get_inode(parent_entry->inode);
+	name=get_data(entry->name);
+
+#if FUSE_VERSION >= 29
+
+	if (inode) {
+
+	    res=fuse_lowlevel_notify_delete(chan, parent_inode->ino, inode->ino, name, strlen(name));
+
+	}
+
+#else
+
+	res=-ENOSYS;
+
+#endif
+
+	if (res==-ENOSYS) {
+
+	    fuse_lowlevel_notify_inval_entry(chan, parent_inode->ino, name, strlen(name));
+
+	    if (inode) fuse_lowlevel_notify_inval_inode(chan, inode->ino, 0, 0);
+
+	}
+
+    }
+
+}
+

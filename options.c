@@ -36,10 +36,16 @@
 #include <sys/param.h>
 #include <getopt.h>
 
-#include "logging.h"
-#include "notifyfs.h"
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
+#include "logging.h"
+#include "notifyfs-io.h"
+#include "path-resolution.h"
 #include "options.h"
+#include "utils.h"
+
 
 extern struct notifyfs_options_struct notifyfs_options;
 
@@ -52,6 +58,11 @@ static void print_usage(const char *progname)
 	                "          [--accessmode=NR,]\n"
 	                "          [--testmode]\n"
 	                "          [--fuseoptions=STRING]\n"
+	                "          [--forwardlocal=0/1, default 0]\n"
+	                "          [--forwardnetwork=0/1, default 0]\n"
+	                "          [--listennetwork=0/1, default 0]\n"
+	                "          [--remoteserversfile=FILE, default /etc/notifyfs/servers]\n"
+	                "          [--networkport=NR, default 790]\n"
 	                "          --mountpoint=PATH\n", progname);
 
 }
@@ -81,11 +92,16 @@ static void print_help() {
 
     fprintf(stdout, "    --access=NUMBER            set accessmode (0=no check,1=root has access,2=check client)\n");
     fprintf(stdout, "    --testmode[=0/1]           enable testmode (1=testmode, 0=default)\n");
+    fprintf(stdout, "    --forwardlocal[=0/1]       try to forward a watch to a local fs like a fuse fs (0=default)\n");
+    fprintf(stdout, "    --forwardnetwork[=0/1]     try to forward a watch to a remote notifyfs server (0=default)\n");
+    fprintf(stdout, "    --listennetwork[=0/1]      listen on the network for forwarded watches (0=default)\n");
+    fprintf(stdout, "    --networkport              the networkport to listen to (790=default)\n");
+    fprintf(stdout, "    --remoteserversfile=FILE   file with ipv4 addresses of remote servers (default /etc/notifyfs/servers\n");
     fprintf(stdout, "    --fuseoptions=opt1,opt2,.. add extra options to fuse:\n");
-    fprintf(stdout, "      auto_unmount 	    auto unmount on process termination\n");
-    fprintf(stdout, "      nonempty 	    	    allow mounts over non-empty file/dir\n");
-    fprintf(stdout, "      fsname=NAME 	            set filesystem name\n");
-    fprintf(stdout, "      subtype=NAME 	    set filesystem type\n");
+    fprintf(stdout, "      auto_unmount             auto unmount on process termination\n");
+    fprintf(stdout, "      nonempty                 allow mounts over non-empty file/dir\n");
+    fprintf(stdout, "      fsname=NAME              set filesystem name\n");
+    fprintf(stdout, "      subtype=NAME             set filesystem type\n");
     fprintf(stdout, "\n");
 
 }
@@ -207,6 +223,100 @@ static int parsefuseoptions(struct fuse_args *notifyfs_fuse_args, char *fuseopti
 
 }
 
+static int parse_socket_path(char *path)
+{
+    int nreturn=0;
+    struct stat st;
+    struct sockaddr_un localsock;
+
+    if ( strlen(path) >= sizeof(localsock.sun_path) ) {
+
+	fprintf(stderr, "Length of socket %s is too big.\n", path);
+	nreturn=-1;
+	goto out;
+
+    }
+
+    if ( stat(path, &st)==0 ) {
+
+	/* does exist */
+
+	fprintf(stderr, "Socket %s does exist already, cannot continue.", path);
+	nreturn=-1;
+	goto out;
+
+
+    } else {
+	char *lastslash;
+
+	/* check the dirname, it must exist */
+
+	lastslash=strrchr(path, '/');
+
+	if ( lastslash ) {
+	    unsigned char lenname=strlen(path)+path-lastslash+1;
+	    char socketname[lenname];
+	    unsigned char lenpath=0;
+
+	    /* store the name in temporary string */
+	    memset(socketname, '\0', lenname);
+	    strcpy(socketname, lastslash+1);
+
+	    /* replace the slash temporarly by a null byte, making the string terminate here */
+
+	    *lastslash='\0';
+
+	    if ( strlen(path)==0 ) {
+
+		nreturn=-1;
+		fprintf(stderr, "Error:option --socket=%s cannot be parsed: path in root. Cannot continue.\n", path);
+		goto out;
+
+	    } else if ( ! realpath(path, notifyfs_options.socket) ) {
+
+		nreturn=-1;
+		fprintf(stderr, "Error:(%i) option --socket=%s cannot be parsed. Cannot continue.\n", errno, path);
+		goto out;
+
+	    }
+
+	    /* check the rare case it does not fit */
+
+	    lenpath=strlen(notifyfs_options.socket);
+
+	    if ( lenpath + 1 + lenname > sizeof(localsock.sun_path)) {
+
+		nreturn=-1;
+		fprintf(stderr, "Error: option --socket=%s cannot be parsed: path too long. Cannot continue.\n", path);
+		goto out;
+
+	    }
+
+	    *(notifyfs_options.socket+lenpath)='/';
+	    lenpath++;
+
+	    memcpy(notifyfs_options.socket+lenpath, socketname, lenname);
+
+	} else {
+
+	    /* no slash ???*/
+
+	    /* ignore, no relative paths */
+
+	    nreturn=-1;
+	    fprintf(stderr, "Error: option --socket=%s cannot be parsed: don't parse relative paths. Cannot continue.\n", path);
+	    goto out;
+
+	}
+
+    }
+
+    out:
+
+    return nreturn;
+
+}
+
 
 /* function to parse all the commandline arguments, and split the normal notifyfs arguments 
    and the arguments meant for fuse
@@ -223,6 +333,11 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 	{"testmode", 		optional_argument,      	0, 0},
 	{"accessmode", 		optional_argument,		0, 0},
 	{"socket", 		optional_argument,		0, 0},
+	{"listennetwork",	optional_argument,		0, 0},
+	{"forwardnetwork",	optional_argument,		0, 0},
+	{"forwardlocal",	optional_argument,		0, 0},
+	{"conffile",		optional_argument,		0, 0},
+	{"remoteserversfile",	optional_argument,		0, 0},
 	{"mountpoint", 		optional_argument,		0, 0},
 	{"fuseoptions", 	optional_argument, 		0, 0},
 	{0,0,0,0}
@@ -251,11 +366,37 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
     /* socket */
 
-    memset(notifyfs_options.socket, '\0', UNIX_PATH_MAX);
+    memset(notifyfs_options.socket, '\0', PATH_MAX);
+
+    /* pidfile */
+
+    memset(notifyfs_options.pidfile, '\0', PATH_MAX);
 
     /* mountpoint */
 
-    memset(notifyfs_options.mountpoint, '\0', PATH_MAX);
+    notifyfs_options.mountpoint=NULL;
+
+    /* conf file */
+
+    notifyfs_options.conffile=NULL;
+
+    /* file with remote servers */
+
+    notifyfs_options.remoteserversfile=NULL;
+
+    /* network port */
+
+    notifyfs_options.networkport=790;
+
+    /* forwarding */
+
+    notifyfs_options.forwardlocal=0;
+    notifyfs_options.forwardnetwork=0;
+    notifyfs_options.listennetwork=0;
+
+    /* hide system files */
+
+    notifyfs_options.hidesystemfiles=1;
 
     /* start the fuse options with the program name, just like the normal argv */
 
@@ -350,96 +491,51 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
 		    if ( optarg ) {
 
-			if ( strlen(optarg) >= UNIX_PATH_MAX ) {
-
-			    fprintf(stderr, "Length of socket %s is too big.\n", optarg);
-			    nreturn=-1;
-			    goto out;
-
-			}
-
-			if ( stat(optarg, &st)!=-1 ) {
-
-			    /* does exist */
-
-			    fprintf(stderr, "Socket %s does exist already, cannot continue.", notifyfs_options.socket);
-			    nreturn=-1;
-			    goto out;
-
-
-			} else {
-			    char *lastslash;
-
-			    /* check the dirname, it must exist */
-
-			    lastslash=strrchr(optarg, '/');
-
-			    if ( lastslash ) {
-				unsigned char lenname=strlen(optarg)+optarg-lastslash+1;
-				char socketname[lenname];
-				unsigned char lenpath=0;
-
-				/* store the name in temporary string */
-				memset(socketname, '\0', lenname);
-				strcpy(socketname, lastslash+1);
-
-				/* replace the slash temporarly by a null byte, making the string terminate here */
-
-				*lastslash='\0';
-
-				if ( strlen(optarg)==0 ) {
-
-				    nreturn=-1;
-				    fprintf(stderr, "Error:option --socket=%s cannot be parsed: path in root. Cannot continue.\n", optarg);
-				    goto out;
-
-				} else if ( ! realpath(optarg, notifyfs_options.socket) ) {
-
-				    nreturn=-1;
-				    fprintf(stderr, "Error:(%i) option --socket=%s cannot be parsed. Cannot continue.\n", errno, optarg);
-				    goto out;
-
-				}
-
-				/* check the rare case it does not fit */
-
-				lenpath=strlen(notifyfs_options.socket);
-
-				if ( lenpath + 1 + lenname > UNIX_PATH_MAX ) {
-
-				    nreturn=-1;
-				    fprintf(stderr, "Error: option --socket=%s cannot be parsed: path too long. Cannot continue.\n", optarg);
-				    goto out;
-
-				}
-
-				*(notifyfs_options.socket+lenpath)='/';
-				lenpath++;
-
-				memcpy(notifyfs_options.socket+lenpath, socketname, lenname);
-
-
-			    } else {
-
-				/* no slash ???*/
-
-				/* ignore, no relative paths */
-
-				nreturn=-1;
-				fprintf(stderr, "Error: option --socket=%s cannot be parsed: don't parse relative paths. Cannot continue.\n", optarg);
-				goto out;
-
-			    }
-
-			}
-
-			fprintf(stdout, "Taking socket %s.\n", notifyfs_options.socket);
+			parse_socket_path(optarg);
 
 		    } else {
 
 			fprintf(stderr, "Error: option --socket requires an argument. Abort.\n");
 			nreturn=-1;
 			goto out;
+
+		    }
+
+		} else if ( strcmp(long_options[long_options_index].name, "conffile")==0 ) {
+
+		    if ( optarg ) {
+
+			notifyfs_options.conffile=check_path(optarg);
+
+			if ( ! notifyfs_options.conffile ) {
+
+			    nreturn=-1;
+			    goto out;
+
+			}
+
+		    } else {
+
+			fprintf(stderr, "Warning: option --conffile requires an argument. Ignore.\n");
+
+		    }
+
+		} else if ( strcmp(long_options[long_options_index].name, "remoteserversfile")==0 ) {
+
+		    if ( optarg ) {
+
+			notifyfs_options.remoteserversfile=check_path(optarg);
+
+			if ( ! notifyfs_options.remoteserversfile ) {
+
+			    nreturn=-1;
+			    goto out;
+
+			}
+
+		    } else {
+
+			fprintf(stderr, "Warning: option --remoteserversfile requires an argument. Ignore.\n");
 
 		    }
 
@@ -467,7 +563,9 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
 		    if ( optarg ) {
 
-			if ( ! realpath(optarg, notifyfs_options.mountpoint)) {
+			notifyfs_options.mountpoint=check_path(optarg);
+
+			if ( ! notifyfs_options.conffile ) {
 
 			    nreturn=-1;
 			    fprintf(stderr, "Error:(%i) option --mountpoint=%s cannot be parsed. Cannot continue.\n", errno, optarg);
@@ -508,3 +606,166 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
 }
 
+int read_global_settings_from_file(char *path)
+{
+    FILE *fp;
+    char line[512];
+    char *sep, *option, *value;
+    int nreturn=0;
+
+    fp=fopen(path, "r");
+
+    if  ( !fp) {
+
+	nreturn=-errno;
+	goto out;
+
+    }
+
+    while( ! feof(fp)) {
+
+	if ( ! fgets(line, 512, fp)) continue;
+
+	sep=strchr(line, '\n');
+	if (sep) *sep='\0';
+
+	sep=strchr(line, '=');
+	if (!sep) continue;
+
+	*sep='\0';
+	option=line;
+	value=sep+1;
+
+	convert_to(option, UTILS_CONVERT_SKIPSPACE);
+	convert_to(option, UTILS_CONVERT_TOLOWER);
+
+
+	if ( strcmp(option, "general.logging")==0 ) {
+
+	    if ( notifyfs_options.logging ) {
+
+		logoutput("logging already set");
+		continue;
+
+	    }
+
+	    if (strlen(value)>0) {
+
+		notifyfs_options.logging=atoi(value);
+
+	    }
+
+	} else if ( strcmp(option, "general.logarea")==0 ) {
+
+	    if ( notifyfs_options.logarea ) {
+
+		logoutput("logarea already set");
+		continue;
+
+	    }
+
+	    if (strlen(value)>0) {
+
+		notifyfs_options.logarea=atoi(value);
+
+	    }
+
+	} else if ( strcmp(option, "local.socket")==0 ) {
+
+	    if ( strlen(notifyfs_options.socket)>0 ) {
+
+		logoutput("read_global_settings: socket already set (%s)", notifyfs_options.socket);
+		continue;
+
+	    } else {
+
+		if ( strlen(value)>0) {
+
+		    convert_to(value, UTILS_CONVERT_SKIPSPACE);
+
+		    parse_socket_path(value);
+
+		    logoutput("read_global_settings: socket set to %s", notifyfs_options.socket);
+
+		} else {
+
+		    logoutput("read_global_settings: error: option local.socket requires an argument. Abort.");
+		    nreturn=-1;
+		    goto out;
+
+		}
+
+	    }
+
+
+	} else if ( strcmp(option, "local.forward")==0 ) {
+
+	    if (strlen(value)>0) {
+
+		notifyfs_options.forwardlocal=(atoi(value)>0) ? 1 : 0;
+
+	    }
+
+	} else if ( strcmp(option, "network.forward")==0 ) {
+
+	    if (strlen(value)>0) {
+
+		notifyfs_options.forwardnetwork=(atoi(value)>0) ? 1 : 0;
+
+	    }
+
+	} else if ( strcmp(option, "network.listen")==0 ) {
+
+	    if (strlen(value)>0) {
+
+		notifyfs_options.listennetwork=(atoi(value)>0) ? 1 : 0;
+
+	    }
+
+	} else if ( strcmp(option, "network.port")==0 ) {
+
+	    if (strlen(value)>0) {
+
+		notifyfs_options.networkport=atoi(value);
+
+	    }
+
+	} else if ( strcmp(option, "network.serversfile")==0 ) {
+
+	    if (notifyfs_options.remoteserversfile) {
+
+		logoutput("read_global_settings: remoteserversfile already set");
+		continue;
+
+	    } else {
+
+		if (strlen(value)>0) {
+
+		    notifyfs_options.remoteserversfile=check_path(value);
+
+		    if ( ! notifyfs_options.remoteserversfile ) {
+
+			nreturn=-1;
+			goto out;
+
+		    }
+
+		} else {
+
+		    logoutput("Warning: option serversfile requires an argument. Ignore.");
+
+		}
+
+	    }
+
+	}
+
+    }
+
+    out:
+
+    if (fp) fclose(fp);
+
+    return nreturn;
+
+}

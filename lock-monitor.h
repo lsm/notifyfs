@@ -17,13 +17,28 @@
 
 */
 
-#ifndef FUSE_WORKSPACE_HANDLEFUSEEVENTS_H
-#define FUSE_WORKSPACE_HANDLEFUSEEVENTS_H
+#ifndef LOCK_MONITOR_H
+#define LOCK_MONITOR_H
 
+struct lock_entry_struct {
+    int major;
+    int minor;
+    unsigned long long ino;
+    unsigned char mandatory;
+    unsigned char kind;
+    unsigned char type;
+    pid_t pid;
+    off_t start;
+    off_t end;
+    struct timespec detect_time;
+    struct lock_entry_struct *next;
+    struct lock_entry_struct *prev;
+    struct lock_entry_struct *time_next;
+    struct lock_entry_struct *time_prev;
+    void *entry;
+};
 
-// Prototypes
-
-int initialize_fuse(char *mountpoint);
-void finish_fuse();
+int open_locksfile();
+void parse_changes_locks();
 
 #endif

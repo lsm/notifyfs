@@ -17,7 +17,7 @@
 
 */
 
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 30
 #define _REENTRANT
 #define _GNU_SOURCE
 #define _XOPEN_SOURCE 500
@@ -41,14 +41,9 @@
 #endif
 
 #ifndef SIZE_INODE_HASHTABLE
-#define SIZE_INODE_HASHTABLE 32768;
+#define SIZE_INODE_HASHTABLE 32768
 #endif
 
-#ifndef SIZE_NAME_HASHTABLE
-#define SIZE_NAME_HASHTABLE 32768;
-#endif
-
-#define SMALL_PATH_MAX  	64
 #define LINE_MAXLEN 		64
 #define UNIX_PATH_MAX           108
 
