@@ -394,7 +394,15 @@ void set_watch_backend_inotify(struct watch_struct *watch, char *path)
     /* add some sane flags and all events:
     */
 
+#ifdef IN_EXCL_UNLINK
+
     inotify_mask_final=inotify_mask | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_ALL_EVENTS;
+
+#else
+
+    inotify_mask_final=inotify_mask | IN_DONT_FOLLOW | IN_ALL_EVENTS;
+
+#endif
 
 
     if (inotify_watch) {

@@ -47,6 +47,10 @@ struct notifyfs_server_struct {
 
 // Prototypes
 
+void init_notifyfs_server(struct notifyfs_server_struct *notifyfs_server);
+struct notifyfs_server_struct *create_notifyfs_server();
+struct notifyfs_server_struct *compare_notifyfs_servers(int fd);
+
 struct notifyfs_server_struct *get_mount_backend(struct notifyfs_mount_struct *mount);
 
 void set_mount_backend(struct notifyfs_mount_struct *mount);

@@ -492,7 +492,7 @@ static struct notifyfs_server_struct *lookup_notifyfsserver_peripv4(char *ipv4ad
 
 }
 
-static void init_notifyfs_server(struct notifyfs_server_struct *notifyfs_server)
+void init_notifyfs_server(struct notifyfs_server_struct *notifyfs_server)
 {
 
     notifyfs_server->type=NOTIFYFS_SERVERTYPE_NOTSET;
@@ -535,13 +535,22 @@ void init_networkutils()
 }
 
 
-static struct notifyfs_server_struct *create_notifyfs_server()
+struct notifyfs_server_struct *create_notifyfs_server()
 {
     struct notifyfs_server_struct *notifyfs_server=NULL;
 
-    notifyfs_server=malloc(sizeof(struct notifyfs_server_struct));
+    /* get server from list */
 
-    if (notifyfs_server) init_notifyfs_server(notifyfs_server);
+    pthread_mutex_lock(&servers_list_mutex);
+
+    if (servers_ctr<32) {
+
+	notifyfs_server=&notifyfs_servers_list[servers_ctr];
+	servers_ctr++;
+
+    }
+
+    pthread_mutex_unlock(&servers_list_mutex);
 
     return notifyfs_server;
 
@@ -555,6 +564,62 @@ static int process_message_from_backend(struct notifyfs_connection_struct *conne
     return receive_message(connection->fd, connection->data, events, is_remote(connection));
 
 }
+
+struct notifyfs_server_struct *compare_notifyfs_servers(int fd)
+{
+    struct sockaddr_in sock0;
+    socklen_t len0=sizeof(struct sockaddr_in);
+    struct notifyfs_server_struct *notifyfs_server=NULL;
+
+    if (getpeername(fd, (struct sockaddr *) &sock0, &len0)==0) {
+	int i;
+
+	pthread_mutex_lock(&servers_list_mutex);
+
+	for (i=0;i<servers_ctr;i++) {
+
+	    notifyfs_server=&notifyfs_servers_list[i];
+
+	    if (notifyfs_server->type==NOTIFYFS_SERVERTYPE_NETWORK) {
+		struct notifyfs_connection_struct *connection=notifyfs_server->connection;
+
+		if (connection) {
+		    struct sockaddr_in sock1;
+		    socklen_t len1=sizeof(struct sockaddr_in);
+
+		    if (getpeername(connection->fd, (struct sockaddr *) &sock1, &len1)==0) {
+
+			/* here compare both connections 
+			    if they are the same: return -1
+			*/
+
+			if (sock0.sin_addr.s_addr==sock1.sin_addr.s_addr) break;
+
+		    }
+
+		} else if (notifyfs_server->data) {
+
+		    /* if connection the server data remains, is not removed.. just set a flag it's down/error 
+			the ipv4 address is stored in data, compare that */
+
+		    if (strcmp((char *) notifyfs_server->data, inet_ntoa(sock0.sin_addr))==0) break;
+
+		}
+
+	    }
+
+	    notifyfs_server=NULL;
+
+	}
+
+	pthread_mutex_unlock(&servers_list_mutex);
+
+    }
+
+    return notifyfs_server;
+
+}
+
 
 struct notifyfs_server_struct *get_mount_backend(struct notifyfs_mount_struct *mount)
 {
@@ -719,17 +784,7 @@ void connect_remote_notifyfs_server(char *ipv4address)
 
     /* get server from list */
 
-    pthread_mutex_lock(&servers_list_mutex);
-
-    if (servers_ctr<32) {
-
-	notifyfs_server=&notifyfs_servers_list[servers_ctr];
-	servers_ctr++;
-
-    }
-
-    pthread_mutex_unlock(&servers_list_mutex);
-
+    notifyfs_server=create_notifyfs_server();
 
     if ( notifyfs_server) {
 	struct notifyfs_connection_struct *connection=NULL;

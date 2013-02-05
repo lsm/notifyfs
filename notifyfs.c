@@ -3103,6 +3103,71 @@ int add_localclient(struct notifyfs_connection_struct *connection, uint32_t even
 
 }
 
+int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t events)
+{
+    int nreturn=0;
+
+    /* what to match against the connection ?? */
+
+    if (is_remote(connection)==1) {
+
+	/* here look for a notifyfs server */
+
+	/* check in the existing notifyfs servers */
+	/* if it exists: deny the connection */
+
+	/* what to compare ???
+
+	    compare the peername ??
+
+	*/
+
+	struct notifyfs_server_struct *notifyfs_server=compare_notifyfs_servers(connection->fd);
+
+	if (notifyfs_server) {
+
+	    if (notifyfs_server->connection) {
+
+		/* there is already a connection to the same host */
+
+		nreturn=-1;
+
+	    } else {
+
+		/* there is already a reference to this server, but no connection, so use the new one */
+
+		notifyfs_server->connection=connection;
+		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
+		get_current_time(&notifyfs_server->connect_time);
+		notifyfs_server->error=0;
+
+	    }
+
+	} else {
+
+	    /* get a new notifyfs server */
+
+	    notifyfs_server=create_notifyfs_server();
+
+	    if (notifyfs_server) {
+
+		init_notifyfs_server(notifyfs_server);
+
+		notifyfs_server->connection=connection;
+		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
+		notifyfs_server->type=NOTIFYFS_SERVERTYPE_NETWORK;
+		get_current_time(&notifyfs_server->connect_time);
+
+	    }
+
+	}
+
+    }
+
+    return nreturn;
+
+}
+
 struct fuse_lowlevel_ops notifyfs_oper = {
     .init	= notifyfs_init,
     .destroy	= notifyfs_destroy,
