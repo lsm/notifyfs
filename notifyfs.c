@@ -3025,23 +3025,44 @@ int process_client_event(struct notifyfs_connection_struct *connection, uint32_t
 {
 
     if (events & ( EPOLLHUP | EPOLLRDHUP ) ) {
-	struct client_struct *client;
 
-	close(connection->fd);
-	connection->fd=0;
+	if (is_remote(connection)==0) {
+	    struct client_struct *client;
 
-	client=(struct client_struct *) connection->data;
+	    close(connection->fd);
+	    connection->fd=0;
 
-	if (client) {
+	    client=(struct client_struct *) connection->data;
 
-	    logoutput("process_client_event: hangup of client %i, remove watches", client->pid);
+	    if (client) {
 
-	    /* here clear all clients watches */
+		logoutput("process_client_event: hangup of client %i, remove watches", client->pid);
 
-	    client->connection=NULL;
+		/* here clear all clients watches */
 
-	    remove_clientwatches(client);
-	    remove_client(client);
+		client->connection=NULL;
+
+		remove_clientwatches(client);
+		remove_client(client);
+
+	    }
+
+	} else {
+	    struct notifyfs_server_struct *notifyfs_server=(struct notifyfs_server_struct *) connection->data;
+
+	    close(connection->fd);
+	    connection->fd=0;
+
+	    /* remote server hangup */
+
+	    if (notifyfs_server) {
+
+		logoutput("process_client_event: hangup of remote server");
+
+		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_DOWN;
+		notifyfs_server->connection=NULL;
+
+	    }
 
 	}
 
@@ -3140,6 +3161,7 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
 		get_current_time(&notifyfs_server->connect_time);
 		notifyfs_server->error=0;
+		connection->data=(void *) notifyfs_server;
 
 	    }
 
@@ -3157,6 +3179,7 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
 		notifyfs_server->type=NOTIFYFS_SERVERTYPE_NETWORK;
 		get_current_time(&notifyfs_server->connect_time);
+		connection->data=(void *) notifyfs_server;
 
 	    }
 
