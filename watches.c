@@ -419,10 +419,35 @@ void replace_fseventmask(struct fseventmask_struct *maska, struct fseventmask_st
 
 }
 
-void send_setwatch_message_remote(struct notifyfs_server_struct *notifyfs_server, struct watch_struct *watch, char *path)
+void send_setwatch_message_remote(struct notifyfs_server_struct *notifyfs_server, struct watch_struct *watch, char *url)
 {
+    struct notifyfs_message_body message;
+    int lenpath, count=0;
+    struct notifyfs_connection_struct *connection=notifyfs_server->connection;
 
-    logoutput("send_setwatch_message_remote: todo");
+    if (! connection) {
+
+	logoutput("send_watch_message_remote: remote server no connection");
+	return;
+
+    }
+
+    message.type=NOTIFYFS_MESSAGE_TYPE_SETWATCH;
+
+    /* fill the buffer with path and name (of entry ) */
+
+    message.body.setwatch_message.watch_id=watch->ctr;
+    message.body.setwatch_message.unique=new_uniquectr();
+
+    message.body.setwatch_message.fseventmask.attrib_event=watch->fseventmask.attrib_event;
+    message.body.setwatch_message.fseventmask.xattr_event=watch->fseventmask.xattr_event;
+    message.body.setwatch_message.fseventmask.file_event=watch->fseventmask.file_event;
+    message.body.setwatch_message.fseventmask.file_event=watch->fseventmask.move_event;
+    message.body.setwatch_message.fseventmask.fs_event=0;
+
+    logoutput("send_watch_message_remote: ctr %li", message.body.setwatch_message.unique);
+
+    send_message(connection->fd, &message, (void *) url, strlen(url)+1);
 
 }
 
@@ -508,10 +533,14 @@ static void forward_watch_backend(int mountindex, struct watch_struct *watch, ch
 
 			determine_remotepath(mount, "/", url, sizeof(pathstring));
 
+			send_setwatch_message_remote(notifyfs_server, watch, url);
+
 		    } else {
 			pathstring url;
 
 			determine_remotepath(mount, path+lenmountpoint, url, sizeof(pathstring));
+
+			send_setwatch_message_remote(notifyfs_server, watch, url);
 
 		    }
 

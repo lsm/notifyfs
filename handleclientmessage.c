@@ -274,7 +274,7 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 
 	}
 
-	logoutput("process_command_setwatch: errror creating path %s", call_info.path);
+	logoutput("process_command_setwatch: error creating path %s", call_info.path);
 
 	/* here correct the fs 
 	    and send an error

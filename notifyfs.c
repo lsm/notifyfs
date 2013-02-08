@@ -3170,6 +3170,7 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 		get_current_time(&notifyfs_server->connect_time);
 		notifyfs_server->error=0;
 		connection->data=(void *) notifyfs_server;
+		connection->process_event=process_client_event;
 
 	    }
 
@@ -3188,6 +3189,7 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 		notifyfs_server->type=NOTIFYFS_SERVERTYPE_NETWORK;
 		get_current_time(&notifyfs_server->connect_time);
 		connection->data=(void *) notifyfs_server;
+		connection->process_event=process_client_event;
 
 	    }
 
