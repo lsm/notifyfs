@@ -253,7 +253,10 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
     logoutput("process_command_setwatch");
 
     init_call_info(&call_info, NULL);
+
+
     call_info.path=command_setwatch->path;
+
 
     /* make sure the path does exist (and lookup the entry) */
 
@@ -755,9 +758,17 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 	    clientcommand->command.setwatch.path=NULL;
 	    clientcommand->command.setwatch.pathallocated=0;
 
-	    /* path is first part of buffer */
+	    if (remote==0) {
 
-	    clientcommand->command.setwatch.path=strdup((char *) buff);
+		/* path is first part of buffer */
+
+		clientcommand->command.setwatch.path=strdup((char *) buff);
+
+	    } else {
+
+		clientcommand->command.setwatch.path=process_notifyfsurl((char *) buff);
+
+	    }
 
 	    if ( ! clientcommand->command.setwatch.path) {
 

@@ -1150,3 +1150,143 @@ void determine_remotepath(struct notifyfs_mount_struct *mount, char *path, char 
     logoutput("determine_remotepath: notifyfs url %s", notifyfs_url);
 
 }
+
+char *process_notifyfsurl(char *url)
+{
+    int lenpath;
+    char *path=NULL;
+
+    if (strlen(url)>0) {
+
+	if (strncmp(url, "sshfs", 5)==0) {
+	    char *sep0;
+	    char *user=NULL;
+
+	    sep0=strchr(url, ':');
+
+	    if (sep0) {
+		char *sep1;
+
+		sep0++;
+
+		sep1=strchr(sep0, '@');
+
+		if (sep1) {
+
+		    /* when there is a @, the first part is a user */
+
+		    *sep1='\0';
+		    user=sep0;
+		    sep1++;
+
+		} else {
+
+		    sep1=sep0;
+
+		}
+
+		if (strncmp(sep1, "%HOME%", 6)==0) {
+
+		    if (!user) {
+
+			logoutput("process_notifyfsurl: HOME set in url, but user not set");
+
+			goto out;
+
+		    } else if (strlen(user)>0) {
+			struct passwd *pwd;
+
+			errno=0;
+
+			pwd=getpwnam(user);
+
+			if (pwd) {
+			    int len0=strlen(pwd->pw_dir);
+			    int len1=strlen(sep1);
+
+			    lenpath=len0+1;
+
+			    if (len1>0) lenpath+=len1;
+
+			    path=malloc(lenpath);
+
+			    if (path) {
+
+				memcpy(path, pwd->pw_dir, len0);
+				sep1+=6; /* len of %HOME */
+
+				if (len1>0) {
+
+				    memcpy(path+len0, sep1, len1);
+				    *(path+len0+len1)='\0';
+
+				} else {
+
+				    *(path+len0)='\0';
+
+				}
+
+			    } else {
+
+				logoutput("process_notifyfsurl: unable to allocate memory for path");
+				goto out;
+
+			    }
+
+			} else {
+
+			    if (errno>0) {
+
+				logoutput("process_notifyfsurl: error %i reading user properties %s", errno, user);
+
+			    } else {
+
+				logoutput("process_notifyfsurl: user %s not found", user);
+
+			    }
+
+			    goto out;
+
+			}
+
+		    }
+
+		} else {
+		    int len1=strlen(sep1);
+
+		    if (len1>0) {
+
+			path=malloc(len1+1);
+
+			if (path) {
+
+			    memcpy(path, sep1, len1);
+			    *(path+len1)='\0';
+
+			} else {
+
+			    logoutput("process_notifyfsurl: unable to allocate memory for path");
+			    goto out;
+
+			}
+
+		    } else {
+
+			logoutput("process_notifyfsurl: url does not contain a path");
+
+		    }
+
+		}
+
+	    }
+
+	}
+
+    }
+
+    out:
+
+    return path;
+
+}
+

@@ -65,5 +65,6 @@ void read_remote_servers(char *path);
 void init_networkutils();
 
 void determine_remotepath(struct notifyfs_mount_struct *mount, char *path, char *notifyfs_url, int len);
+char *process_notifyfsurl(char *url);
 
 #endif
