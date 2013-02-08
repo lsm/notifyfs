@@ -26,10 +26,6 @@
 
 struct client_struct {
     unsigned char type;
-    char buff0[sizeof(struct notifyfs_message_body)];
-    char recvbuff[NOTIFYFS_SERVER_RECVBUFFERSIZE];
-    size_t buff0size;
-    size_t recvbuffsize;
     pid_t pid;
     pid_t tid;
     uid_t uid;
@@ -37,8 +33,6 @@ struct client_struct {
     struct client_struct *next;
     struct client_struct *prev;
     pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    unsigned char lock;
     unsigned char status;
     void *clientwatches;
     struct notifyfs_connection_struct *connection;

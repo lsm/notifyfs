@@ -503,9 +503,22 @@ void init_notifyfs_server(struct notifyfs_server_struct *notifyfs_server)
     notifyfs_server->connect_time.tv_sec=0;
     notifyfs_server->connect_time.tv_nsec=0;
 
+    pthread_mutex_init(&notifyfs_server->mutex, NULL);
+
     notifyfs_server->connection=NULL;
 
 }
+
+void lock_notifyfs_server(struct notifyfs_server_struct *notifyfs_server)
+{
+    int res=pthread_mutex_lock(&notifyfs_server->mutex);
+}
+
+void unlock_notifyfs_server(struct notifyfs_server_struct *notifyfs_server)
+{
+    int res=pthread_mutex_unlock(&notifyfs_server->mutex);
+}
+
 
 void init_networkutils()
 {

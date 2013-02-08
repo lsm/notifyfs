@@ -43,6 +43,7 @@
 #include "entry-management.h"
 #include "path-resolution.h"
 #include "logging.h"
+#include "notifyfs.h"
 #include "notifyfs-io.h"
 #include "utils.h"
 #include "message.h"
@@ -201,38 +202,42 @@ static int determine_path_custom(struct notifyfs_fsevent_struct *fsevent)
     untill then these names are not set
 */
 
-static unsigned char entry_in_nameview(struct notifyfs_entry_struct *entry, struct view_struct *view)
+static unsigned char entry_in_view(struct notifyfs_entry_struct *entry, struct view_struct *view)
 {
 
-    if (view->first_entry>=0) {
-	struct notifyfs_entry_struct *first_entry=get_entry(view->first_entry);
+    if (view->order==NOTIFYFS_INDEX_TYPE_NAME) {
 
-	if (entry->nameindex_value<first_entry->nameindex_value) {
+	if (view->first_entry>=0) {
+	    struct notifyfs_entry_struct *first_entry=get_entry(view->first_entry);
 
-	    return 0;
+	    if (entry->nameindex_value<first_entry->nameindex_value) {
 
-	} else if (entry->nameindex_value==first_entry->nameindex_value) {
-	    char *name=get_data(entry->name);
-	    char *first_name=get_data(first_entry->name);
+		return 0;
 
-	    if (strcmp(first_name, name)>0) return 0;
+	    } else if (entry->nameindex_value==first_entry->nameindex_value) {
+		char *name=get_data(entry->name);
+		char *first_name=get_data(first_entry->name);
+
+		if (strcmp(first_name, name)>0) return 0;
+
+	    }
 
 	}
 
-    }
+	if (view->last_entry>=0) {
+	    struct notifyfs_entry_struct *last_entry=get_entry(view->last_entry);
 
-    if (view->last_entry>=0) {
-	struct notifyfs_entry_struct *last_entry=get_entry(view->last_entry);
+	    if (entry->nameindex_value>last_entry->nameindex_value) {
 
-	if (entry->nameindex_value>last_entry->nameindex_value) {
+		return 0;
 
-	    return 0;
+	    } else if (entry->nameindex_value==last_entry->nameindex_value) {
+		char *name=get_data(entry->name);
+		char *last_name=get_data(last_entry->name);
 
-	} else if (entry->nameindex_value==last_entry->nameindex_value) {
-	    char *name=get_data(entry->name);
-	    char *last_name=get_data(last_entry->name);
+		if (strcmp(last_name, name)<0) return 0;
 
-	    if (strcmp(last_name, name)<0) return 0;
+	    }
 
 	}
 
@@ -274,7 +279,6 @@ static unsigned char check_fsevent_applies(struct fseventmask_struct *fseventmas
 static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_fsevent_struct *fsevent)
 {
     struct clientwatch_struct *clientwatch=NULL;
-    struct client_struct *client;
 
     pthread_mutex_lock(&watch->mutex);
 
@@ -282,55 +286,71 @@ static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_
 
     while (clientwatch) {
 
-	client=clientwatch->client;
+	if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	    struct client_struct *client;
 
-        if ( client ) {
+	    client=clientwatch->notifyfs_owner.owner.localclient;
 
-	    logoutput("send_fsevent_to_clients: test client %i is up", (int) client->pid);
+    	    if ( client ) {
 
-            if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
+		logoutput("send_fsevent_to_clients: test client %i is up", (int) client->pid);
 
-		logoutput("send_fsevent_to_clients: test client watch of %i applies", (int) client->pid);
+        	if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
 
-		/* test here the client is interested in the event */
+		    logoutput("send_fsevent_to_clients: test client watch of %i applies", (int) client->pid);
 
-		if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask)==1) {
+		    /* test here the client is interested in the event */
 
-		    /* test the entry is part of the view of the clientwatch */
+		    if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask)==1) {
+			struct view_struct *view=get_view(clientwatch->view);
 
-		    if (clientwatch->view.order==NOTIFYFS_INDEX_TYPE_NONE) {
-			struct notifyfs_connection_struct *connection=client->connection;
+			if (view) {
 
-			logoutput("send_fsevent_to_clients: client watch %i: no order, check for connection", (int) client->pid);
+			    if (entry_in_view(fsevent->entry, view)==1) {
+				struct notifyfs_connection_struct *connection=client->connection;
 
-			if (connection) {
-    			    uint64_t unique=new_uniquectr();
+				logoutput("send_fsevent_to_clients: entry part of view, check for connection");
 
-			    /* send message */
+				if (connection) {
+    				    uint64_t unique=new_uniquectr();
 
-			    send_fsevent_message(connection->fd, unique, clientwatch->client_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
+				    /* send message */
 
-			}
+				    send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
 
-		    } else if (clientwatch->view.order==NOTIFYFS_INDEX_TYPE_NAME) {
-
-			logoutput("send_fsevent_to_clients: client watch %i: name order, check entry in view", (int) client->pid);
-
-			if (entry_in_nameview(fsevent->entry, &clientwatch->view)==1) {
-			    struct notifyfs_connection_struct *connection=client->connection;
-
-			    logoutput("send_fsevent_to_clients: client watch %i: no order, check for connection", (int) client->pid);
-
-			    if (connection) {
-				uint64_t unique=new_uniquectr();
-
-				/* send message */
-
-				send_fsevent_message(connection->fd, unique, clientwatch->client_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
+				}
 
 			    }
 
 			}
+
+		    }
+
+		}
+
+	    }
+
+	} else if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+	    struct notifyfs_server_struct *server;
+
+	    server=clientwatch->notifyfs_owner.owner.remoteserver;
+
+	    /* when the watch is set/owned by a remote server: always send a message, don't test it's in a view etcetera
+	    */
+
+	    if (server) {
+
+		if (server->status==NOTIFYFS_SERVERSTATUS_UP) {
+		    struct notifyfs_connection_struct *connection=server->connection;
+
+		    logoutput("send_fsevent_to_clients: remote server up, check for connection");
+
+		    if (connection) {
+    			uint64_t unique=new_uniquectr();
+
+			/* send message */
+
+			send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
 
 		    }
 
@@ -361,11 +381,7 @@ static void check_for_watches(struct notifyfs_fsevent_struct *fsevent)
 	struct notifyfs_inode_struct *inode=get_inode(fsevent->entry->inode);
 	struct watch_struct *watch=lookup_watch(inode);
 
-	if (watch) {
-
-	    send_fsevent_to_clients(watch, fsevent);
-
-	}
+	if (watch) send_fsevent_to_clients(watch, fsevent);
 
 	if (isrootentry(fsevent->entry)==0) {
 	    struct notifyfs_entry_struct *entry;
@@ -375,11 +391,8 @@ static void check_for_watches(struct notifyfs_fsevent_struct *fsevent)
 
 	    watch=lookup_watch(inode);
 
-	    if (watch) {
+	    if (watch) send_fsevent_to_clients(watch, fsevent);
 
-		send_fsevent_to_clients(watch, fsevent);
-
-	    }
 
 	}
 
@@ -402,7 +415,7 @@ static void remove_fsevent_from_queue(struct notifyfs_fsevent_struct *fsevent)
 
 /* function to remove every clientwatch attached to a watch 
    watch must be locked
-   when a watch is removed, a message is send to the client owning the watch
+   when a watch is removed, a message is send to the client/server owning the watch
 */
 
 static void remove_clientwatches_message(struct watch_struct *watch)
@@ -416,29 +429,15 @@ static void remove_clientwatches_message(struct watch_struct *watch)
 
     while (clientwatch) {
 
-        next_clientwatch=clientwatch->next_per_watch;
-	client=clientwatch->client;
+	next_clientwatch=clientwatch->next_per_watch;
+
+	/* remove from owner (client or server) (and send a message to the owner) */
+
+	remove_clientwatch_from_owner(clientwatch, 1);
+
 
 	clientwatch->next_per_watch=NULL;
 	clientwatch->prev_per_watch=NULL;
-
-        if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
-	    struct notifyfs_connection_struct *connection=client->connection;
-
-	    if (connection) {
-		uint64_t unique=new_uniquectr();
-
-		send_delwatch_message(connection->fd, unique, clientwatch->client_watch_id);
-
-	    }
-
-	}
-
-	lock_client(client);
-	remove_clientwatch_from_client(clientwatch);
-    	clientwatch->client=NULL;
-        unlock_client(client);
-
         free(clientwatch);
 
 	watch->nrwatches--;
@@ -453,8 +452,7 @@ static void remove_clientwatches_message(struct watch_struct *watch)
 
 static void change_clientwatches(struct watch_struct *watch, unsigned char action)
 {
-    struct clientwatch_struct *clientwatch, *next_clientwatch;
-    struct client_struct *client=NULL;
+    struct clientwatch_struct *clientwatch;
 
     pthread_mutex_lock(&watch->mutex);
 
@@ -462,26 +460,50 @@ static void change_clientwatches(struct watch_struct *watch, unsigned char actio
 
     while (clientwatch) {
 
-        next_clientwatch=clientwatch->next_per_watch;
-	client=clientwatch->client;
+	if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	    struct client_struct *client=NULL;
 
-        if ( client ) {
+	    client=clientwatch->notifyfs_owner.owner.localclient;
 
-            if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
-		struct notifyfs_connection_struct *connection=client->connection;
+    	    if ( client ) {
 
-		if (connection) {
-		    uint64_t unique=new_uniquectr();
+        	if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
+		    struct notifyfs_connection_struct *connection=client->connection;
 
-		    send_changewatch_message(connection->fd, unique, clientwatch->client_watch_id, action);
+		    if (connection) {
+			uint64_t unique=new_uniquectr();
+
+			send_changewatch_message(connection->fd, unique, clientwatch->owner_watch_id, action);
+
+		    }
 
 		}
 
 	    }
 
+	} else 	if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+	    struct notifyfs_server_struct *server=NULL;
+
+	    server=clientwatch->notifyfs_owner.owner.remoteserver;
+
+    	    if ( server ) {
+
+        	if ( server->status==NOTIFYFS_SERVERSTATUS_UP ) {
+		    struct notifyfs_connection_struct *connection=server->connection;
+
+		    if (connection) {
+			uint64_t unique=new_uniquectr();
+
+			send_changewatch_message(connection->fd, unique, clientwatch->owner_watch_id, action);
+
+		    }
+
+		}
+
+	    }
 	}
 
-        clientwatch=next_clientwatch;
+        clientwatch=clientwatch->next_per_watch;
 
     }
 

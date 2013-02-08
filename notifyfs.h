@@ -22,5 +22,17 @@
 
 #define NOTIFYFS_REMOTESERVERS_FILE_DEFAULT	"/etc/notifyfs/servers"
 
+#define NOTIFYFS_OWNERTYPE_CLIENT		1
+#define NOTIFYFS_OWNERTYPE_SERVER		2
+#define NOTIFYFS_OWNERTYPE_FUSEFS		3
+
+
+struct notifyfs_owner_struct {
+    unsigned char type;
+    union {
+	struct client_struct *localclient;
+	struct notifyfs_server_struct *remoteserver;
+    } owner;
+};
 
 #endif

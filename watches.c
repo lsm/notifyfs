@@ -55,6 +55,7 @@
 #include "logging.h"
 #include "epoll-utils.h"
 #include "notifyfs-io.h"
+#include "notifyfs.h"
 
 #include "workerthreads.h"
 
@@ -63,11 +64,13 @@
 #include "options.h"
 #include "mountinfo.h"
 #include "message.h"
+#include "message-server.h"
 #include "client-io.h"
 #include "client.h"
 #include "watches.h"
 #include "changestate.h"
 #include "utils.h"
+#include "socket.h"
 #include "networkutils.h"
 
 #ifdef HAVE_INOTIFY
@@ -277,30 +280,6 @@ void remove_watch_backend_os_specific(struct watch_struct *watch)
     remove_watch_backend_inotify(watch);
 }
 
-struct clientwatch_struct *lookup_clientwatch(struct watch_struct *watch, struct client_struct *client)
-{
-    struct clientwatch_struct *clientwatch=NULL;
-
-    pthread_mutex_lock(&watch->mutex);
-
-    /* lookup client watch */
-
-    clientwatch=watch->clientwatches;
-
-    while(clientwatch) {
-
-	if (clientwatch->client==client) break;
-
-	clientwatch=clientwatch->next_per_watch;
-
-    }
-
-    pthread_mutex_unlock(&watch->mutex);
-
-    return clientwatch;
-
-}
-
 void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
 {
 
@@ -490,7 +469,7 @@ void send_setwatch_message_remote(struct notifyfs_server_struct *notifyfs_server
 */
 
 
-void forward_watch_backend(int mountindex, struct watch_struct *watch, char *path)
+static void forward_watch_backend(int mountindex, struct watch_struct *watch, char *path)
 {
     struct notifyfs_mount_struct *mount=get_mount(mountindex);
     struct notifyfs_server_struct *notifyfs_server=get_mount_backend(mount);
@@ -546,8 +525,44 @@ void forward_watch_backend(int mountindex, struct watch_struct *watch, char *pat
 
 }
 
+static void add_clientwatch_owner(struct notifyfs_owner_struct *notifyfs_owner, struct clientwatch_struct *clientwatch)
+{
 
-struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct client_struct *client, char *path, int mountindex)
+    if (notifyfs_owner->type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct client_struct *client=notifyfs_owner->owner.localclient;
+
+	/* add it to list per client */
+
+	pthread_mutex_lock(&client->mutex);
+
+	if (client->clientwatches) ((struct clientwatch_struct *) client->clientwatches)->prev_per_owner=clientwatch;
+	clientwatch->next_per_owner=(struct clientwatch_struct *) client->clientwatches;
+	clientwatch->prev_per_owner=NULL;
+	client->clientwatches=(void *) clientwatch;
+
+	pthread_mutex_unlock(&client->mutex);
+
+    } else if (notifyfs_owner->type==NOTIFYFS_OWNERTYPE_SERVER) {
+	struct notifyfs_server_struct *server=notifyfs_owner->owner.remoteserver;
+
+	/* add it to list per server */
+
+	pthread_mutex_lock(&server->mutex);
+
+	if (server->clientwatches) ((struct clientwatch_struct *) server->clientwatches)->prev_per_owner=clientwatch;
+	clientwatch->next_per_owner=(struct clientwatch_struct *) server->clientwatches;
+	clientwatch->prev_per_owner=NULL;
+	server->clientwatches=(void *) clientwatch;
+
+	pthread_mutex_unlock(&server->mutex);
+
+    }
+
+}
+
+
+
+void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, char *path, int mountindex)
 {
     struct clientwatch_struct *clientwatch=NULL;
     struct watch_struct *watch=NULL;
@@ -597,9 +612,6 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
 	    watch->next=NULL;
 	    watch->prev=NULL;
 
-	    watch->mount=mountindex;
-	    watch->backend=NULL;
-
 	    add_watch_to_table(watch);
 	    add_watch_to_list(watch);
 
@@ -616,13 +628,28 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
 
     pthread_mutex_lock(&watch->mutex);
 
-    /* lookup client watch */
+    /* lookup client watch 
+
+	if it exists already 
+    */
 
     clientwatch=watch->clientwatches;
 
     while(clientwatch) {
 
-	if (clientwatch->client==client) break;
+	if (clientwatch->notifyfs_owner.type==notifyfs_owner->type) {
+
+	    if (notifyfs_owner->type==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+		if (notifyfs_owner->owner.localclient==clientwatch->notifyfs_owner.owner.localclient) break;
+
+	    } else if (notifyfs_owner->type==NOTIFYFS_OWNERTYPE_SERVER) {
+
+		if (notifyfs_owner->owner.remoteserver==clientwatch->notifyfs_owner.owner.remoteserver) break;
+
+	    }
+
+	}
 
 	clientwatch=clientwatch->next_per_watch;
 
@@ -643,9 +670,8 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
 	    clientwatch->fseventmask.fs_event=fseventmask->fs_event;
 
 	    clientwatch->watch=watch;
-	    clientwatch->client=client;
 
-	    clientwatch->client_watch_id=id;
+	    clientwatch->owner_watch_id=id;
 
 	    /* add it to list per watch */
 
@@ -654,16 +680,23 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
 	    clientwatch->prev_per_watch=NULL;
 	    watch->clientwatches=clientwatch;
 
-	    /* add it to list per client */
+	    /* add it to list per owner */
 
-	    pthread_mutex_lock(&client->mutex);
+	    add_clientwatch_owner(notifyfs_owner, clientwatch);
 
-	    if (client->clientwatches) ((struct clientwatch_struct *) client->clientwatches)->prev_per_client=clientwatch;
-	    clientwatch->next_per_client=(struct clientwatch_struct *) client->clientwatches;
-	    clientwatch->prev_per_client=NULL;
-	    client->clientwatches=(void *) clientwatch;
+	    /* assign owner to clientwatch */
 
-	    pthread_mutex_unlock(&client->mutex);
+	    clientwatch->notifyfs_owner.type=notifyfs_owner->type;
+
+	    if (notifyfs_owner->type==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+		clientwatch->notifyfs_owner.owner.localclient=notifyfs_owner->owner.localclient;
+
+	    } else if (notifyfs_owner->type==NOTIFYFS_OWNERTYPE_SERVER) {
+
+		clientwatch->notifyfs_owner.owner.remoteserver=notifyfs_owner->owner.remoteserver;
+
+	    }
 
 	} else {
 
@@ -769,7 +802,7 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
 
     out:
 
-    return clientwatch;
+    return;
 
 }
 
@@ -815,32 +848,79 @@ void remove_clientwatch_from_watch(struct clientwatch_struct *clientwatch)
 
 }
 
-void remove_clientwatch_from_client(struct clientwatch_struct *clientwatch)
+void remove_clientwatch_from_owner(struct clientwatch_struct *clientwatch, unsigned char sendmessage)
 {
-    struct client_struct *client=clientwatch->client;
+    struct notifyfs_connection_struct *connection=NULL;
 
-    if (clientwatch->prev_per_client) clientwatch->prev_per_client->next_per_client=clientwatch->next_per_client;
-    if (clientwatch->next_per_client) clientwatch->next_per_client->prev_per_client=clientwatch->prev_per_client;
+    if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct client_struct *client=clientwatch->notifyfs_owner.owner.localclient;
 
-    if (client->clientwatches==(void *) clientwatch) client->clientwatches=(void *) clientwatch->next_per_client;
+	lock_client(client);
 
-    clientwatch->prev_per_client=NULL;
-    clientwatch->next_per_client=NULL;
+	if (clientwatch->prev_per_owner) clientwatch->prev_per_owner->next_per_owner=clientwatch->next_per_owner;
+	if (clientwatch->next_per_owner) clientwatch->next_per_owner->prev_per_owner=clientwatch->prev_per_owner;
+
+	if (client->clientwatches==(void *) clientwatch) client->clientwatches=(void *) clientwatch->next_per_owner;
+
+	if (sendmessage==1) {
+
+    	    if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) connection=client->connection;
+
+	}
+
+	unlock_client(client);
+
+    } else if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+	struct notifyfs_server_struct *server=clientwatch->notifyfs_owner.owner.remoteserver;
+
+	lock_notifyfs_server(server);
+
+	if (clientwatch->prev_per_owner) clientwatch->prev_per_owner->next_per_owner=clientwatch->next_per_owner;
+	if (clientwatch->next_per_owner) clientwatch->next_per_owner->prev_per_owner=clientwatch->prev_per_owner;
+
+	if (server->clientwatches==(void *) clientwatch) server->clientwatches=(void *) clientwatch->next_per_owner;
+
+	if (sendmessage==1) {
+
+    	    if ( server->status==NOTIFYFS_SERVERSTATUS_UP ) connection=server->connection;
+
+	}
+
+
+	unlock_notifyfs_server(server);
+
+    }
+
+    clientwatch->prev_per_owner=NULL;
+    clientwatch->next_per_owner=NULL;
+
+    if (connection) {
+	uint64_t unique=new_uniquectr();
+
+	send_delwatch_message(connection->fd, unique, clientwatch->owner_watch_id);
+
+    }
 
 }
 
-void remove_clientwatches(struct client_struct *client)
+void remove_clientwatches_client(struct client_struct *client)
 {
-    struct clientwatch_struct *clientwatch;
+    struct clientwatch_struct *clientwatch=NULL;
 
     lock_client(client);
 
     clientwatch=(struct clientwatch_struct *) client->clientwatches;
 
-    while(clientwatch) {
+    while (clientwatch) {
 
 	remove_clientwatch_from_watch(clientwatch);
-	remove_clientwatch_from_client(clientwatch);
+
+	if (clientwatch->prev_per_owner) clientwatch->prev_per_owner->next_per_owner=clientwatch->next_per_owner;
+	if (clientwatch->next_per_owner) clientwatch->next_per_owner->prev_per_owner=clientwatch->prev_per_owner;
+
+	client->clientwatches=(void *) clientwatch->next_per_owner;
+
+	free(clientwatch);
 
 	clientwatch=(struct clientwatch_struct *) client->clientwatches;
 
@@ -850,7 +930,47 @@ void remove_clientwatches(struct client_struct *client)
 
 }
 
+void remove_clientwatches_server(struct notifyfs_server_struct *server)
+{
+    struct clientwatch_struct *clientwatch=NULL;
 
+    lock_notifyfs_server(server);
+
+    clientwatch=(struct clientwatch_struct *) server->clientwatches;
+
+    while(clientwatch) {
+
+	remove_clientwatch_from_watch(clientwatch);
+
+	if (clientwatch->prev_per_owner) clientwatch->prev_per_owner->next_per_owner=clientwatch->next_per_owner;
+	if (clientwatch->next_per_owner) clientwatch->next_per_owner->prev_per_owner=clientwatch->prev_per_owner;
+
+	server->clientwatches=(void *) clientwatch->next_per_owner;
+
+	free(clientwatch);
+
+	clientwatch=(struct clientwatch_struct *) server->clientwatches;
+
+    }
+
+    unlock_notifyfs_server(server);
+
+}
+
+void remove_clientwatches(struct notifyfs_owner_struct *owner)
+{
+    if (owner->type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct client_struct *client=owner->owner.localclient;
+
+	remove_clientwatches_client(client);
+
+    } else if (owner->type==NOTIFYFS_OWNERTYPE_SERVER) {
+	struct notifyfs_server_struct *server=owner->owner.remoteserver;
+
+	remove_clientwatches_server(server);
+
+    }
+}
 
 void initialize_fsnotify_backends()
 {

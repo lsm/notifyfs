@@ -74,7 +74,7 @@ void send_reply_message(int fd, uint64_t unique, int error, void *buffer, size_t
 
 }
 
-void send_delwatch_message(int fd, uint64_t unique, unsigned long client_watch_id)
+void send_delwatch_message(int fd, uint64_t unique, unsigned long id)
 {
     struct notifyfs_message_body message;
     char dummy[1];
@@ -82,7 +82,7 @@ void send_delwatch_message(int fd, uint64_t unique, unsigned long client_watch_i
     message.type=NOTIFYFS_MESSAGE_TYPE_DELWATCH;
 
     message.body.delwatch_message.unique=unique;
-    message.body.delwatch_message.watch_id=client_watch_id;
+    message.body.delwatch_message.watch_id=id;
 
     logoutput("send_delwatch_message: ctr %li", (long int) message.body.delwatch_message.unique);
 
@@ -90,7 +90,7 @@ void send_delwatch_message(int fd, uint64_t unique, unsigned long client_watch_i
 
 }
 
-void send_changewatch_message(int fd, uint64_t unique, unsigned long client_watch_id, unsigned char action)
+void send_changewatch_message(int fd, uint64_t unique, unsigned long id, unsigned char action)
 {
     struct notifyfs_message_body message;
     char dummy[1];
@@ -98,7 +98,7 @@ void send_changewatch_message(int fd, uint64_t unique, unsigned long client_watc
     message.type=NOTIFYFS_MESSAGE_TYPE_CHANGEWATCH;
 
     message.body.changewatch_message.unique=unique;
-    message.body.changewatch_message.watch_id=client_watch_id;
+    message.body.changewatch_message.watch_id=id;
     message.body.changewatch_message.action=action;
 
     logoutput("send_changewatch_message: ctr %li", (long int) message.body.changewatch_message.unique);
@@ -108,7 +108,7 @@ void send_changewatch_message(int fd, uint64_t unique, unsigned long client_watc
 }
 
 
-void send_fsevent_message(int fd, uint64_t unique, unsigned long client_watch_id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time)
+void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time)
 {
     struct notifyfs_message_body message;
     char dummy[1];

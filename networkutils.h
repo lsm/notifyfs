@@ -42,13 +42,17 @@ struct notifyfs_server_struct {
     unsigned char status;
     int error;
     struct timespec connect_time;
+    pthread_mutex_t mutex;
     void *data;
+    void *clientwatches;
 };
 
 // Prototypes
 
 void init_notifyfs_server(struct notifyfs_server_struct *notifyfs_server);
 struct notifyfs_server_struct *create_notifyfs_server();
+void lock_notifyfs_server(struct notifyfs_server_struct *notifyfs_server);
+void unlock_notifyfs_server(struct notifyfs_server_struct *notifyfs_server);
 struct notifyfs_server_struct *compare_notifyfs_servers(int fd);
 
 struct notifyfs_server_struct *get_mount_backend(struct notifyfs_mount_struct *mount);

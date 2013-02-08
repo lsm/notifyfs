@@ -3026,7 +3026,13 @@ int process_client_event(struct notifyfs_connection_struct *connection, uint32_t
 
     if (events & ( EPOLLHUP | EPOLLRDHUP ) ) {
 
-	if (is_remote(connection)==0) {
+	/* identification who owns the connection (client or server) depends on the 
+	    connection being local (->client) or not (->server)
+	    this is not enough when working with more type local processes
+	    like a local fuse fs
+	*/
+
+	if (connection->typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 	    struct client_struct *client;
 
 	    close(connection->fd);
@@ -3042,12 +3048,12 @@ int process_client_event(struct notifyfs_connection_struct *connection, uint32_t
 
 		client->connection=NULL;
 
-		remove_clientwatches(client);
+		remove_clientwatches_client(client);
 		remove_client(client);
 
 	    }
 
-	} else {
+	} else if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 	    struct notifyfs_server_struct *notifyfs_server=(struct notifyfs_server_struct *) connection->data;
 
 	    close(connection->fd);
@@ -3061,6 +3067,8 @@ int process_client_event(struct notifyfs_connection_struct *connection, uint32_t
 
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_DOWN;
 		notifyfs_server->connection=NULL;
+
+		remove_clientwatches_server(notifyfs_server);
 
 	    }
 
@@ -3211,7 +3219,7 @@ struct fuse_lowlevel_ops notifyfs_oper = {
 
 int main(int argc, char *argv[])
 {
-    int res, epoll_fd, socket_fd, mountinfo_fd, lockmonitor_fd;
+    int res, epoll_fd, socket_fd, mountinfo_fd, lockmonitor_fd, inet_fd;
     struct stat st;
     struct epoll_extended_data_struct *epoll_xdata=NULL;
     struct epoll_extended_data_struct xdata_mountinfo=EPOLL_XDATA_INIT;
@@ -3219,6 +3227,7 @@ int main(int argc, char *argv[])
     struct fuse_args global_fuse_args = FUSE_ARGS_INIT(0, NULL);
     struct workerthreads_queue_struct notifyfs_threads_queue=WORKERTHREADS_QUEUE_INIT;
     struct notifyfs_connection_struct localserver_socket;
+    struct notifyfs_connection_struct inetserver_socket;
 
     umask(0);
 
@@ -3371,9 +3380,26 @@ int main(int argc, char *argv[])
 
     }
 
+    inetserver_socket.fd=0;
+    init_xdata(&inetserver_socket.xdata_socket);
+    inetserver_socket.data=NULL;
+    inetserver_socket.type=0;
+    inetserver_socket.allocated=0;
+    inetserver_socket.process_event=NULL;
+
+
     if (notifyfs_options.listennetwork==1) {
 
 	logoutput("main: listen on network port requested, but not yet supported");
+
+	inet_fd=create_inet_serversocket(notifyfs_options.networkport, &inetserver_socket, NULL, add_networkserver);
+
+	if ( inet_fd<=0 ) {
+
+    	    logoutput("Error creating socket fd: error %i.", inet_fd);
+    	    goto out;
+
+	}
 
     }
 

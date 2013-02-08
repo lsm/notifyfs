@@ -39,6 +39,7 @@
 #include <time.h>
 
 #include "notifyfs-io.h"
+#include "notifyfs.h"
 
 #include "entry-management.h"
 #include "logging.h"
@@ -65,9 +66,6 @@ struct client_struct *create_client(unsigned int fd, pid_t pid, uid_t uid, gid_t
 	client->connection=NULL;
 	client->type=type;
 
-	client->buff0size=sizeof(struct notifyfs_message_body);
-	client->recvbuffsize=NOTIFYFS_SERVER_RECVBUFFERSIZE;
-
 	/* pid maybe the tid */
 
 	client->tid=pid;
@@ -80,8 +78,6 @@ struct client_struct *create_client(unsigned int fd, pid_t pid, uid_t uid, gid_t
 	client->prev=NULL;
 
 	pthread_mutex_init(&client->mutex, NULL);
-	pthread_cond_init(&client->cond, NULL);
-	client->lock=0;
 
 	client->status=NOTIFYFS_CLIENTSTATUS_NOTSET;
 
@@ -246,30 +242,11 @@ void lock_client(struct client_struct *client)
 {
     pthread_mutex_lock(&client->mutex);
 
-    if ( client->lock==1 ) {
-
-        while (client->lock==1) {
-
-    	    pthread_cond_wait(&client->cond, &client->mutex);
-
-        }
-
-    }
-
-    client->lock=1;
-
-    pthread_mutex_unlock(&client->mutex);
-
 }
 
 void unlock_client(struct client_struct *client)
 {
-
-    pthread_mutex_lock(&client->mutex);
-    client->lock=0;
-    pthread_cond_broadcast(&client->cond);
     pthread_mutex_unlock(&client->mutex);
-
 }
 
 unsigned char check_client_is_running(struct client_struct *client)

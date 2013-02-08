@@ -39,9 +39,8 @@
 #include <pthread.h>
 #include <time.h>
 
-#include <fuse/fuse_lowlevel.h>
-
 #include "notifyfs-io.h"
+#include "notifyfs.h"
 
 #include "entry-management.h"
 #include "logging.h"
@@ -61,10 +60,11 @@
 #include "socket.h"
 #include "networkutils.h"
 
-#define NOTIFYFS_CLIENTCOMMAND_UPDATE	1
-#define NOTIFYFS_CLIENTCOMMAND_SETWATCH	2
-#define NOTIFYFS_CLIENTCOMMAND_REGISTER	3
-#define NOTIFYFS_CLIENTCOMMAND_SIGNOFF	4
+#define NOTIFYFS_COMMAND_UPDATE		1
+#define NOTIFYFS_COMMAND_SETWATCH	2
+#define NOTIFYFS_COMMAND_REGISTER	3
+#define NOTIFYFS_COMMAND_SIGNOFF	4
+#define NOTIFYFS_COMMAND_FSEVENT	5
 
 struct command_update_struct {
     char *path;
@@ -74,29 +74,30 @@ struct command_update_struct {
 struct command_setwatch_struct {
     char *path;
     unsigned char pathallocated;
-    int client_watch_id;
+    int owner_watch_id;
     struct fseventmask_struct fseventmask;
-    struct view_struct view;
+};
+
+struct command_fsevent_struct {
+    int owner_watch_id;
+    struct fseventmask_struct fseventmask;
 };
 
 struct clientcommand_struct {
     uint64_t unique;
-    struct client_struct *client;
     unsigned char type;
+    struct notifyfs_owner_struct owner;
     union {
 	struct command_update_struct update;
 	struct command_setwatch_struct setwatch;
+	struct command_fsevent_struct fsevent;
     } command;
 };
 
 static struct workerthreads_queue_struct *global_workerthreads_queue=NULL;
 
-/* function to process the list command from a client:
 
-    - make sure the path does exist
-    - make sure the contents of that directory is cached
-    - send the client a buffer with entries
-    - and .... ?
+/* function to process the update command from a client 
 
 */
 
@@ -121,7 +122,17 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
     parent=call_info.entry;
 
     if (! parent) {
-	struct notifyfs_connection_struct *connection=clientcommand->client->connection;
+        struct notifyfs_connection_struct *connection=NULL;
+
+	if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	    connection=clientcommand->owner.owner.localclient->connection;
+
+	} else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+
+	    connection=clientcommand->owner.owner.remoteserver->connection;
+
+	}
 
 	if (connection) {
 	    logoutput("process_command_update: error creating path %s", call_info.path);
@@ -167,6 +178,7 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 
 	    if (res>=0) {
 
+
 		remove_old_entries(parent, &rightnow);
 
 	    } else {
@@ -188,16 +200,17 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 
     }
 
-    /* send the client */
+    /* reply the sender */
 
-    if (clientcommand->client->connection) {
-	struct notifyfs_connection_struct *connection=clientcommand->client->connection;
+    if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct notifyfs_connection_struct *connection=clientcommand->owner.owner.localclient->connection;
 
-	if (connection) {
+	if (connection) send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
 
-	    send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
+    } else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+	struct notifyfs_connection_struct *connection=clientcommand->owner.owner.remoteserver->connection;
 
-	}
+	if (connection) send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
 
     }
 
@@ -216,8 +229,20 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 
     }
 
-
 }
+
+/* 
+    process a message to set a watch
+
+    it can be a message from local client to the local server, via a local socket
+
+    or
+
+    it can be a message about a forwarded watch, when the remote server is the backend
+
+    (todo: a local backend like fuse)
+
+*/
 
 static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 {
@@ -237,32 +262,41 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
     entry=call_info.entry;
 
     if (! entry) {
+        struct notifyfs_connection_struct *connection=NULL;
+
+	if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	    connection=clientcommand->owner.owner.localclient->connection;
+
+	} else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+
+	    connection=clientcommand->owner.owner.remoteserver->connection;
+
+	}
 
 	logoutput("process_command_setwatch: errror creating path %s", call_info.path);
 
 	/* here correct the fs 
 	    and send an error
 	*/
-	if (clientcommand->client->connection) {
-	    struct notifyfs_connection_struct *connection=clientcommand->client->connection;
 
-	    if (connection) {
+	if (connection) {
 
-		send_reply_message(connection->fd, clientcommand->unique, ENOENT, NULL, 0);
-		goto finish;
-
-	    }
+	    send_reply_message(connection->fd, clientcommand->unique, ENOENT, NULL, 0);
+	    goto finish;
 
 	}
 
     }
 
-    if (command_setwatch->client_watch_id>0) {
+    if (command_setwatch->owner_watch_id>0) {
 	struct notifyfs_inode_struct *inode;
 
 	inode=get_inode(entry->inode);
 
-	add_clientwatch(inode, &command_setwatch->fseventmask, command_setwatch->client_watch_id, clientcommand->client, command_setwatch->path, call_info.mount);
+	/* with a local sender, add the mountindex also */
+
+	add_clientwatch(inode, &command_setwatch->fseventmask, command_setwatch->owner_watch_id, &clientcommand->owner, command_setwatch->path, call_info.mount);
 
     }
 
@@ -283,50 +317,96 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 
 }
 
-/* process the register client futher ... by sending the names of the various shared memory chunks */
+/* process the register client/server */
 
 static void process_command_register(struct clientcommand_struct *clientcommand)
 {
-    struct client_struct *client=clientcommand->client;
-
-    logoutput("process_command_register");
-
-    lock_client(client);
-
-    clientcommand->client->status=NOTIFYFS_CLIENTSTATUS_UP;
-
-    unlock_client(client);
+    struct notifyfs_connection_struct *connection=NULL;
 
     /* just send a reply, nothing else now */
 
-    if (clientcommand->client->connection) {
-	struct notifyfs_connection_struct *connection=clientcommand->client->connection;
+    logoutput("process_command_register");
 
-	if (connection) {
+    if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct client_struct *client=clientcommand->owner.owner.localclient;
 
-	    send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
+	connection=client->connection;
 
-	}
+	lock_client(client);
+	client->status=NOTIFYFS_CLIENTSTATUS_UP;
+	unlock_client(client);
+
+    } else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+	struct notifyfs_server_struct *server=clientcommand->owner.owner.remoteserver;
+
+	connection=server->connection;
+
+	lock_notifyfs_server(server);
+	server->status=NOTIFYFS_SERVERSTATUS_UP;
+	unlock_notifyfs_server(server);
 
     }
+
+    /* there must be a connection... this is just action after receiving message from the client on that connection.. */
+
+    if (connection) send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
 
 }
 
 static void process_command_signoff(struct clientcommand_struct *clientcommand)
 {
-    struct client_struct *client=clientcommand->client;
+    struct notifyfs_connection_struct *connection=NULL;
+
+    /* just send a reply, nothing else now */
 
     logoutput("process_command_signoff");
 
-    lock_client(client);
+    if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct client_struct *client=clientcommand->owner.owner.localclient;
 
-    clientcommand->client->status=NOTIFYFS_CLIENTSTATUS_DOWN;
+	connection=client->connection;
 
-    unlock_client(client);
+	lock_client(client);
+	client->status=NOTIFYFS_CLIENTSTATUS_DOWN;
+	unlock_client(client);
 
-    /* remove client, with all watches */
+    } else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+	struct notifyfs_server_struct *server=clientcommand->owner.owner.remoteserver;
 
-    remove_client(client);
+	connection=server->connection;
+
+	lock_notifyfs_server(server);
+	server->status=NOTIFYFS_SERVERSTATUS_DOWN;
+	unlock_notifyfs_server(server);
+
+    }
+
+    /* there must be a connection... this is just action after receiving message from the client on that connection.. */
+
+    if (connection) send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
+
+}
+
+/* 
+    process a message with a fsevent
+
+    this will come from a remote server, when a watch has been forwarded to it before
+    (or (todo) from a local fs (fuse) )
+
+*/
+
+static void process_command_fsevent(struct clientcommand_struct *clientcommand)
+{
+    struct command_fsevent_struct *command_fsevent=&(clientcommand->command.fsevent);
+    struct fseventmask_struct *fseventmask=&(command_fsevent->fseventmask);
+
+    logoutput("process_command_fsevent: received a fsevent %i:%i:%i:%i", fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
+
+    /* here find the right watch */
+
+    /* owner is known!!! 
+
+    */
 
 }
 
@@ -334,21 +414,25 @@ static void process_command(void *data)
 {
     struct clientcommand_struct *clientcommand=(struct clientcommand_struct *) data;
 
-    if (clientcommand->type==NOTIFYFS_CLIENTCOMMAND_UPDATE) {
+    if (clientcommand->type==NOTIFYFS_COMMAND_UPDATE) {
 
 	process_command_update(clientcommand);
 
-    } else if (clientcommand->type==NOTIFYFS_CLIENTCOMMAND_SETWATCH ) {
+    } else if (clientcommand->type==NOTIFYFS_COMMAND_SETWATCH ) {
 
 	process_command_setwatch(clientcommand);
 
-    } else if (clientcommand->type==NOTIFYFS_CLIENTCOMMAND_REGISTER ) {
+    } else if (clientcommand->type==NOTIFYFS_COMMAND_REGISTER ) {
 
 	process_command_register(clientcommand);
 
-    } else if (clientcommand->type==NOTIFYFS_CLIENTCOMMAND_SIGNOFF ) {
+    } else if (clientcommand->type==NOTIFYFS_COMMAND_SIGNOFF ) {
 
 	process_command_signoff(clientcommand);
+
+    } else if (clientcommand->type==NOTIFYFS_COMMAND_FSEVENT ) {
+
+	process_command_fsevent(clientcommand);
 
     }
 
@@ -356,39 +440,40 @@ static void process_command(void *data)
 
 }
 
+/* function to handle the register message from a local client */
 
 void handle_register_message(int fd, void *data,  struct notifyfs_register_message *register_message, void *buff, int len, unsigned char remote)
 {
-    struct client_struct *client=NULL;
     struct clientcommand_struct *clientcommand=NULL;
 
-    client=(struct client_struct *) data;
+    if (remote==0) {
+	struct client_struct *client=NULL;
 
-    logoutput("handle register message, client pid %i, message pid %i tid %i", client->pid, register_message->pid, register_message->tid);
+	client=(struct client_struct *) data;
 
-    /* check the pid and the tid the client has send, and the tid earlier detected is a task of the mainpid */
+	logoutput("handle register message, client pid %i, message pid %i tid %i", client->pid, register_message->pid, register_message->tid);
 
-    if ( belongtosameprocess(register_message->pid, register_message->tid)==0 ) {
+	/* check the pid and the tid the client has send, and the tid earlier detected is a task of the mainpid */
 
-	logoutput("handle register message: pid %i and tid %i send by client (%i) are not part of same process", register_message->pid, register_message->tid, client->tid);
+	if ( belongtosameprocess(register_message->pid, register_message->tid)==0 ) {
 
-	/* ignore message.. */
+	    logoutput("handle register message: pid %i and tid %i send by client (%i) are not part of same process", register_message->pid, register_message->tid, client->tid);
 
-	return;
+	    return;
+
+	}
+
+	if ( belongtosameprocess(register_message->pid, client->tid)==0 ) {
+
+	    logoutput("handle register message: pid %i send by client and tid %i are not part of same process", register_message->pid, client->tid);
+
+	    return;
+
+	}
+
+	client->pid=register_message->pid;
 
     }
-
-    if ( belongtosameprocess(register_message->pid, client->tid)==0 ) {
-
-	logoutput("handle register message: pid %i send by client and tid %i are not part of same process", register_message->pid, client->tid);
-
-	/* ignore message.. */
-
-	return;
-
-    }
-
-    client->pid=register_message->pid;
 
     /* process the register futher in a thread */
 
@@ -400,8 +485,22 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
 	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
 	clientcommand->unique=register_message->unique;
-	clientcommand->client=client;
-	clientcommand->type=NOTIFYFS_CLIENTCOMMAND_REGISTER;
+
+	if (remote==0) {
+
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+
+	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
+
+	} else {
+
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+
+	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+
+	}
+
+	clientcommand->type=NOTIFYFS_COMMAND_REGISTER;
 
 	workerthread=get_workerthread(global_workerthreads_queue);
 
@@ -444,12 +543,9 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
 
 void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message *signoff_message, void *buff, int len, unsigned char remote)
 {
-    struct client_struct *client=NULL;
     struct clientcommand_struct *clientcommand=NULL;
 
-    client=(struct client_struct *) data;
-
-    logoutput("handle signoff message, client pid %i", client->pid);
+    logoutput("handle signoff message");
 
     /* process the register futher in a thread */
 
@@ -461,8 +557,22 @@ void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message 
 	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
 	clientcommand->unique=signoff_message->unique;
-	clientcommand->client=client;
-	clientcommand->type=NOTIFYFS_CLIENTCOMMAND_SIGNOFF;
+
+	if (remote==0) {
+
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+
+	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
+
+	} else {
+
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+
+	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+
+	}
+
+	clientcommand->type=NOTIFYFS_COMMAND_SIGNOFF;
 
 	workerthread=get_workerthread(global_workerthreads_queue);
 
@@ -505,10 +615,7 @@ void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message 
 
 void handle_update_message(int fd, void *data, struct notifyfs_update_message *update_message, void *buff, int len, unsigned char remote)
 {
-    struct client_struct *client=NULL;
     struct clientcommand_struct *clientcommand=NULL;
-
-    client=(struct client_struct *) data;
 
     if (buff) {
 
@@ -520,8 +627,22 @@ void handle_update_message(int fd, void *data, struct notifyfs_update_message *u
 	    memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
 	    clientcommand->unique=update_message->unique;
-	    clientcommand->client=client;
-	    clientcommand->type=NOTIFYFS_CLIENTCOMMAND_UPDATE;
+
+	    if (remote==0) {
+
+		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+
+		clientcommand->owner.owner.localclient=(struct client_struct *) data;
+
+	    } else {
+
+		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+
+		clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+
+	    }
+
+	    clientcommand->type=NOTIFYFS_COMMAND_UPDATE;
 
 	    /* path is first part of buffer
 	    */
@@ -592,10 +713,8 @@ void handle_update_message(int fd, void *data, struct notifyfs_update_message *u
 
 void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_message *setwatch_message, void *buff, int len, unsigned char remote)
 {
-    struct client_struct *client=NULL;
     struct clientcommand_struct *clientcommand=NULL;
 
-    client=(struct client_struct *) data;
 
     /* some sanity checks */
 
@@ -616,8 +735,22 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 	    memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
 	    clientcommand->unique=setwatch_message->unique;
-	    clientcommand->client=client;
-	    clientcommand->type=NOTIFYFS_CLIENTCOMMAND_SETWATCH;
+
+	    if (remote==0) {
+
+		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+
+		clientcommand->owner.owner.localclient=(struct client_struct *) data;
+
+	    } else {
+
+		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+
+		clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+
+	    }
+
+	    clientcommand->type=NOTIFYFS_COMMAND_SETWATCH;
 
 	    clientcommand->command.setwatch.path=NULL;
 	    clientcommand->command.setwatch.pathallocated=0;
@@ -635,7 +768,7 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
 	    clientcommand->command.setwatch.pathallocated=1;
 
-	    clientcommand->command.setwatch.client_watch_id=setwatch_message->watch_id;
+	    clientcommand->command.setwatch.owner_watch_id=setwatch_message->watch_id;
 
 	    clientcommand->command.setwatch.fseventmask.attrib_event=setwatch_message->fseventmask.attrib_event;
 	    clientcommand->command.setwatch.fseventmask.xattr_event=setwatch_message->fseventmask.xattr_event;
@@ -694,12 +827,58 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
 void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message *fsevent_message, void *buff, int len, unsigned char remote)
 {
-    struct client_struct *client=NULL;
     struct clientcommand_struct *clientcommand=NULL;
 
-    client=(struct client_struct *) data;
+    logoutput("handle fsevent message:");
 
-    logoutput("handle fsevent message: TODO");
+    clientcommand=malloc(sizeof(struct clientcommand_struct));
+
+    if (clientcommand) {
+	struct workerthread_struct *workerthread;
+
+	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
+
+	clientcommand->unique=fsevent_message->unique;
+
+	if (remote==0) {
+
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+
+	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
+
+	} else {
+
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+
+	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+
+	}
+
+	clientcommand->type=NOTIFYFS_COMMAND_FSEVENT;
+
+	workerthread=get_workerthread(global_workerthreads_queue);
+
+	if (workerthread) {
+
+	    workerthread->processevent_cb=process_command;
+	    workerthread->data=(void *) clientcommand;
+
+	    signal_workerthread(workerthread);
+
+	} else {
+
+	    /* no free thread.... what now ?? */
+
+	    logoutput("handle_fsevent_message: no free thread...");
+	    goto error;
+
+	}
+
+    } else {
+
+	logoutput("handle_fsevent_message: cannot allocate clientcommand");
+
+    }
 
     return;
 

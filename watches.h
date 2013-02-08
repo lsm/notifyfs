@@ -67,20 +67,18 @@ struct watch_struct {
     struct watch_struct *prev_hash;
     struct watch_struct *next;
     struct watch_struct *prev;
-    int mount;
-    void *backend;
 };
 
 struct clientwatch_struct {
     struct fseventmask_struct fseventmask;
-    struct view_struct view;
+    int view;
     struct watch_struct *watch;
-    struct client_struct *client;
-    int client_watch_id;
+    struct notifyfs_owner_struct notifyfs_owner;
+    int owner_watch_id;
     struct clientwatch_struct *next_per_watch;
     struct clientwatch_struct *prev_per_watch;
-    struct clientwatch_struct *next_per_client;
-    struct clientwatch_struct *prev_per_client;
+    struct clientwatch_struct *next_per_owner;
+    struct clientwatch_struct *prev_per_owner;
 };
 
 /* struct to identify and process an event 
@@ -120,10 +118,12 @@ struct watch_struct *lookup_watch(struct notifyfs_inode_struct *inode);
 void add_watch_to_list(struct watch_struct *watch);
 void remove_watch_from_list(struct watch_struct *watch);
 
-struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct client_struct *client, char *path, int mount);
-struct clientwatch_struct *lookup_clientwatch(struct watch_struct *watch, struct client_struct *client);
-void remove_clientwatch_from_client(struct clientwatch_struct *clientwatch);
-void remove_clientwatches(struct client_struct *client);
+void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *owner, char *path, int mount);
+void remove_clientwatch_from_owner(struct clientwatch_struct *clientwatch, unsigned char sendmessage);
+
+void remove_clientwatches(struct notifyfs_owner_struct *owner);
+void remove_clientwatches_client(struct client_struct *client);
+void remove_clientwatches_server(struct notifyfs_server_struct *server);
 
 void initialize_fsnotify_backends();
 void close_fsnotify_backends();

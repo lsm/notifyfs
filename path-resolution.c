@@ -43,15 +43,12 @@
 
 #define LOG_LOGAREA LOG_LOGAREA_PATH_RESOLUTION
 
-#include <fuse/fuse_lowlevel.h>
 
 #include "logging.h"
 #include "notifyfs-io.h"
+
 #include "entry-management.h"
 #include "path-resolution.h"
-#include "watches.h"
-#include "mountinfo.h"
-#include "message.h"
 #include "utils.h"
 
 unsigned char call_info_lock;
