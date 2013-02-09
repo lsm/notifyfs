@@ -1024,7 +1024,7 @@ static void determine_remotepath_cifs(char *source, char *path, char *notifyfs_u
 
 static void determine_remotepath_sshfs(char *source, char *options, char *path, char *notifyfs_url, int len)
 {
-    char *sep1=NULL;
+    char *sep1=NULL, *pathstart=NULL;
     int pos=0, len1;
     char user[64];
 
@@ -1084,6 +1084,7 @@ static void determine_remotepath_sshfs(char *source, char *options, char *path, 
 	    if (pos+len0<len) {
 
 		memcpy(notifyfs_url+pos, sep1+1, len0);
+		pathstart=notifyfs_url+pos;
 		pos+=len0;
 
 	    }
@@ -1119,13 +1120,12 @@ static void determine_remotepath_sshfs(char *source, char *options, char *path, 
 
     len1=strlen(path);
 
-    if (strlen(path)>0) {
-
-	unslash(path);
+    if (len1>0) {
 
 	if (pos+len1<len) {
 
 	    memcpy(notifyfs_url+pos, path, len1);
+	    if (! pathstart) pathstart=notifyfs_url+pos;
 	    pos+=len1;
 
 	    *(notifyfs_url+pos)='\0';
@@ -1133,6 +1133,8 @@ static void determine_remotepath_sshfs(char *source, char *options, char *path, 
 	}
 
     }
+
+    if (pathstart) unslash(pathstart);
 
 }
 
