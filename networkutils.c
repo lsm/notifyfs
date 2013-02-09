@@ -1117,6 +1117,7 @@ static void determine_remotepath_sshfs(char *source, char *options, char *path, 
 
     }
 
+
     len1=strlen(path);
 
     if (pos+len1<len) {
@@ -1127,6 +1128,8 @@ static void determine_remotepath_sshfs(char *source, char *options, char *path, 
 	*(notifyfs_url+pos)='\0';
 
     }
+
+    unslash(notifyfs_url);
 
 }
 

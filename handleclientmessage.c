@@ -257,7 +257,6 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 
     call_info.path=command_setwatch->path;
 
-
     /* make sure the path does exist (and lookup the entry) */
 
     create_notifyfs_path(&call_info, NULL);
