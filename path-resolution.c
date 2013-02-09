@@ -298,7 +298,7 @@ void create_notifyfs_path(struct call_info_struct *call_info, struct stat *buff_
     get_current_time(&current_time);
 
     parent=get_rootentry();
-    entry=NULL;
+    entry=parent;
 
     call_info->entry=NULL;
     call_info->watch=NULL;
