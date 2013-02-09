@@ -1117,19 +1117,22 @@ static void determine_remotepath_sshfs(char *source, char *options, char *path, 
 
     }
 
-
     len1=strlen(path);
 
-    if (pos+len1<len) {
+    if (strlen(path)>0) {
 
-	memcpy(notifyfs_url+pos, path, len1);
-	pos+=len1;
+	unslash(path);
 
-	*(notifyfs_url+pos)='\0';
+	if (pos+len1<len) {
+
+	    memcpy(notifyfs_url+pos, path, len1);
+	    pos+=len1;
+
+	    *(notifyfs_url+pos)='\0';
+
+	}
 
     }
-
-    unslash(notifyfs_url);
 
 }
 
@@ -1154,132 +1157,138 @@ void determine_remotepath(struct notifyfs_mount_struct *mount, char *path, char 
 
 }
 
-char *process_notifyfsurl(char *url)
+static char *process_notifyfsurl_sshfs(char *sshfs_url)
 {
-    int lenpath;
+    char *sep1;
+    char *user=NULL;
     char *path=NULL;
 
-    if (strlen(url)>0) {
+    sep1=strchr(sshfs_url, '@');
 
-	if (strncmp(url, "sshfs", 5)==0) {
-	    char *sep0;
-	    char *user=NULL;
+    if (sep1) {
 
-	    sep0=strchr(url, ':');
+	/* when there is a @, the first part is a user */
 
-	    if (sep0) {
-		char *sep1;
+	*sep1='\0';
+	user=sshfs_url;
+	sep1++;
 
-		sep0++;
+    } else {
 
-		sep1=strchr(sep0, '@');
+	sep1=sshfs_url;
 
-		if (sep1) {
+    }
 
-		    /* when there is a @, the first part is a user */
+    if (strncmp(sep1, "%HOME%", 6)==0) {
 
-		    *sep1='\0';
-		    user=sep0;
-		    sep1++;
+	if (!user) {
 
-		} else {
+	    logoutput("process_notifyfsurl_sshfs: HOME set in url, but user not set");
+	    goto out;
 
-		    sep1=sep0;
+	} else if (strlen(user)==0) {
+
+	    logoutput("process_notifyfsurl_sshfs: HOME set in url, but user is empty");
+	    goto out;
+
+	} else if (strlen(user)>0) {
+	    struct passwd *pwd;
+	    int len0, len1;
+
+	    errno=0;
+
+	    /* TODO: use of central functions to do a lookup of users properties */
+
+	    pwd=getpwnam(user);
+
+	    if ( ! pwd) {
+
+		logoutput("process_notifyfsurl_sshfs: user %s not found", user);
+		goto out;
+
+	    }
+
+	    len0=strlen(pwd->pw_dir);
+	    sep1+=6; /* len of %HOME% */
+	    len1=strlen(sep1);
+
+	    if (len1==0) {
+
+		/* extra path empty */
+
+		path=malloc(len0+1);
+
+		if (path) {
+
+		    memcpy(path, pwd->pw_dir, len0);
+		    *(path+len0)='\0';
+
+		}
+
+	    } else if (*(sep1)=='/') {
+
+		/* extra path starts with a slash */
+
+		path=malloc(len0+len1+1);
+
+		if (path) {
+
+		    memcpy(path, pwd->pw_dir, len0);
+		    memcpy(path+len0, sep1, len1);
+		    *(path+len0+len1)='\0';
 
 		}
 
-		if (strncmp(sep1, "%HOME%", 6)==0) {
+	    } else {
 
-		    if (!user) {
+		/* extra path does not start with a slash */
 
-			logoutput("process_notifyfsurl: HOME set in url, but user not set");
+		path=malloc(len0+len1+2);
 
-			goto out;
+		if (path) {
 
-		    } else if (strlen(user)>0) {
-			struct passwd *pwd;
-
-			errno=0;
-
-			pwd=getpwnam(user);
-
-			if (pwd) {
-			    int len0=strlen(pwd->pw_dir);
-			    int len1=strlen(sep1);
-
-			    lenpath=len0+1;
-
-			    if (len1>0) lenpath+=len1;
-
-			    path=malloc(lenpath);
-
-			    if (path) {
-
-				memcpy(path, pwd->pw_dir, len0);
-				sep1+=6; /* len of %HOME */
-
-				if (len1>0) {
-
-				    memcpy(path+len0, sep1, len1);
-				    *(path+len0+len1)='\0';
-
-				} else {
-
-				    *(path+len0)='\0';
-
-				}
-
-			    } else {
-
-				logoutput("process_notifyfsurl: unable to allocate memory for path");
-				goto out;
-
-			    }
-
-			} else {
-
-			    if (errno>0) {
-
-				logoutput("process_notifyfsurl: error %i reading user properties %s", errno, user);
-
-			    } else {
-
-				logoutput("process_notifyfsurl: user %s not found", user);
-
-			    }
-
-			    goto out;
-
-			}
-
-		    }
-
-		} else {
-		    int len1=strlen(sep1);
-
-		    if (len1>0) {
-
-			path=malloc(len1+1);
-
-			if (path) {
-
-			    memcpy(path, sep1, len1);
-			    *(path+len1)='\0';
-
-			} else {
-
-			    logoutput("process_notifyfsurl: unable to allocate memory for path");
-			    goto out;
-
-			}
-
-		    } else {
-
-			logoutput("process_notifyfsurl: url does not contain a path");
-
-		    }
+		    memcpy(path, pwd->pw_dir, len0);
+		    *(path+len0)='/';
+		    memcpy(path+len0+1, sep1, len1);
+		    *(path+len0+len1+1)='\0';
 
 		}
+
+	    }
+
+	}
+
+    } else {
+	int len1=strlen(sep1);
+
+	if (len1>=6 && strncmp(sep1, "%ROOT%", 6)==0) {
+
+	    sep1+=6;
+	    len1=strlen(sep1);
+
+	}
+
+	if (len1==0 || (len1==1 && strcmp(sep1, "/")==0)) {
+
+	    /* path empty -> assume root */
+
+	    path=malloc(2);
+
+	    if (path) {
+
+		*path='/';
+		*(path+1)='\0';
+
+	    }
+
+	} else {
+
+	    path=malloc(len1+1);
+
+	    if (path) {
+
+		memcpy(path, sep1, len1);
+		*(path+len1)='\0';
 
 	    }
 
@@ -1288,6 +1297,33 @@ char *process_notifyfsurl(char *url)
     }
 
     out:
+
+    return path;
+
+}
+
+
+
+char *process_notifyfsurl(char *url)
+{
+    char *path=NULL;
+
+    if (strlen(url)>0) {
+
+	if (strncmp(url, "sshfs", 5)==0) {
+	    char *sep0;
+
+	    sep0=strchr(url, ':');
+
+	    if (sep0) {
+
+		path=process_notifyfsurl_sshfs(sep0+1);
+
+	    }
+
+	}
+
+    }
 
     return path;
 

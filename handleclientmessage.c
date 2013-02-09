@@ -60,11 +60,11 @@
 #include "socket.h"
 #include "networkutils.h"
 
-#define NOTIFYFS_COMMAND_UPDATE		1
-#define NOTIFYFS_COMMAND_SETWATCH	2
-#define NOTIFYFS_COMMAND_REGISTER	3
-#define NOTIFYFS_COMMAND_SIGNOFF	4
-#define NOTIFYFS_COMMAND_FSEVENT	5
+#define NOTIFYFS_COMMAND_UPDATE				1
+#define NOTIFYFS_COMMAND_SETWATCH			2
+#define NOTIFYFS_COMMAND_REGISTER			3
+#define NOTIFYFS_COMMAND_SIGNOFF			4
+#define NOTIFYFS_COMMAND_FSEVENT			5
 
 struct command_update_struct {
     char *path;

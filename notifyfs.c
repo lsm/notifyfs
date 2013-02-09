@@ -3107,6 +3107,7 @@ int add_localclient(struct notifyfs_connection_struct *connection, uint32_t even
 	    if (client) {
 
 		connection->data=(void *) client;
+		connection->typedata=NOTIFYFS_OWNERTYPE_CLIENT;
 		connection->process_event=process_client_event;
 		client->connection=connection;
 
@@ -3170,6 +3171,7 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 		get_current_time(&notifyfs_server->connect_time);
 		notifyfs_server->error=0;
 		connection->data=(void *) notifyfs_server;
+		connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
 		connection->process_event=process_client_event;
 
 	    }
@@ -3189,6 +3191,7 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 		notifyfs_server->type=NOTIFYFS_SERVERTYPE_NETWORK;
 		get_current_time(&notifyfs_server->connect_time);
 		connection->data=(void *) notifyfs_server;
+		connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
 		connection->process_event=process_client_event;
 
 	    }
