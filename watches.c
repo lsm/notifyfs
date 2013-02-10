@@ -699,6 +699,7 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 	    clientwatch->fseventmask.fs_event=fseventmask->fs_event;
 
 	    clientwatch->watch=watch;
+	    watch->nrwatches++;
 
 	    clientwatch->owner_watch_id=id;
 
@@ -840,6 +841,8 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 void remove_clientwatch_from_watch(struct clientwatch_struct *clientwatch)
 {
     struct watch_struct *watch=clientwatch->watch;
+
+    logoutput("remove_clientwatch_from_watch: nr watches %i", watch->nrwatches);
 
     /* detach from watch */
 

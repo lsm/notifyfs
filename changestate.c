@@ -205,6 +205,8 @@ static int determine_path_custom(struct notifyfs_fsevent_struct *fsevent)
 static unsigned char entry_in_view(struct notifyfs_entry_struct *entry, struct view_struct *view)
 {
 
+    if (!view) return 1;
+
     if (view->order==NOTIFYFS_INDEX_TYPE_NAME) {
 
 	if (view->first_entry>=0) {
@@ -304,21 +306,17 @@ static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_
 		    if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask)==1) {
 			struct view_struct *view=get_view(clientwatch->view);
 
-			if (view) {
+			if (entry_in_view(fsevent->entry, view)==1) {
+			    struct notifyfs_connection_struct *connection=client->connection;
 
-			    if (entry_in_view(fsevent->entry, view)==1) {
-				struct notifyfs_connection_struct *connection=client->connection;
+			    logoutput("send_fsevent_to_clients: entry part of view, check for connection");
 
-				logoutput("send_fsevent_to_clients: entry part of view, check for connection");
+			    if (connection) {
+    				uint64_t unique=new_uniquectr();
 
-				if (connection) {
-    				    uint64_t unique=new_uniquectr();
+				/* send message */
 
-				    /* send message */
-
-				    send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
-
-				}
+				send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
 
 			    }
 
@@ -881,7 +879,7 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
     }
 
-    if (catched==0) logoutput("process_one_fsevent: event not handled here");
+    if (catched==0) logoutput("process_one_fsevent: event %i:%i:%i:%i not handled here", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
 
 }
 

@@ -597,6 +597,8 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 			struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 			struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
+			if (! attr) attr=assign_attr(&st, inode);
+
 			if (attr) {
 
 			    copy_stat(&attr->cached_st, &st);
@@ -694,6 +696,10 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_OPEN;
 	i_event->mask-=IN_OPEN;
 
+	/* an open call is also used to create an entry */
+
+	if (entrycreated==1) fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_CREATED;
+
     }
 
     if ( i_event->mask & IN_CLOSE_WRITE ) {
@@ -773,7 +779,17 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 		struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 		struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
-		logoutput("evaluate_fsevent_inotify: testing and comparing the attributes");
+		if (attr) {
+
+		    logoutput("evaluate_fsevent_inotify: testing and comparing the attributes");
+
+		} else {
+
+		    logoutput("evaluate_fsevent_inotify: attributes empty .... ");
+
+		    goto out;
+
+		}
 
 		if (attr->cached_st.st_mode!=st.st_mode) {
 
@@ -862,6 +878,8 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 			    maybe make this configurable...
 			    default: ignore this
 			*/
+
+			logoutput("evaluate_fsevent_inotify: modify timestamp changed");
 
 			if (i_event->mask & IN_ATTRIB) i_event->mask-=IN_ATTRIB;
 
@@ -968,6 +986,8 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
     out:
 
+    logoutput("evaluate_fsevent_inotify: ready");
+
     return notifyfs_fsevent;
 
 }
@@ -1010,7 +1030,7 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
 
                 }
 
-		if ( i_event->mask & IN_ISDIR && i_event->mask &(IN_OPEN | IN_CLOSE_NOWRITE | IN_IGNORED)) {
+		if ( (i_event->mask & IN_ISDIR) && (i_event->mask & (IN_OPEN | IN_CLOSE_NOWRITE))) {
 
 		    /* explicit ignore the reading of directories */
 
