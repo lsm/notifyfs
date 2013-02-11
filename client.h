@@ -36,6 +36,8 @@ struct client_struct {
     unsigned char status;
     void *clientwatches;
     struct notifyfs_connection_struct *connection;
+    char *buffer;
+    size_t lenbuffer;
 };
 
 // Prototypes

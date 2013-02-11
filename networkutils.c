@@ -73,6 +73,7 @@ static pthread_mutex_t servers_list_mutex=PTHREAD_MUTEX_INITIALIZER;
 static int servers_ctr=0;
 
 extern struct notifyfs_options_struct notifyfs_options;
+extern int process_connection_event(struct notifyfs_connection_struct *connection, uint32_t events);
 
 
 /* function to determine the ipv4 address, given a name of a remote host */
@@ -507,6 +508,9 @@ void init_notifyfs_server(struct notifyfs_server_struct *notifyfs_server)
 
     notifyfs_server->connection=NULL;
 
+    notifyfs_server->buffer=NULL;
+    notifyfs_server->lenbuffer=0;
+
 }
 
 void lock_notifyfs_server(struct notifyfs_server_struct *notifyfs_server)
@@ -566,15 +570,6 @@ struct notifyfs_server_struct *create_notifyfs_server()
     pthread_mutex_unlock(&servers_list_mutex);
 
     return notifyfs_server;
-
-}
-
-static int process_message_from_backend(struct notifyfs_connection_struct *connection, uint32_t events)
-{
-
-    /* just receive the message: the callback should be intelligent enough to detect it's a message from the remote notifyfs server */
-
-    return receive_message(connection->fd, connection->data, events, is_remote(connection));
 
 }
 
@@ -818,7 +813,7 @@ void connect_remote_notifyfs_server(char *ipv4address)
 		what callback here, it's the receiving of the fsevent messages coming from the remote server
 	    */
 
-	    res=create_inet_clientsocket(ipv4address, notifyfs_options.networkport, connection, NULL, process_message_from_backend);
+	    res=create_inet_clientsocket(ipv4address, notifyfs_options.networkport, connection, NULL, process_connection_event);
 
 	    if (res<0) {
 

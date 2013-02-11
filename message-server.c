@@ -127,6 +127,8 @@ void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fsev
     message.body.fsevent_message.detect_time.tv_sec=detect_time->tv_sec;
     message.body.fsevent_message.detect_time.tv_nsec=detect_time->tv_nsec;
 
+    message.body.fsevent_message.watch_id=id;
+
     logoutput("send_fsevent_message: ctr %li", (long int) message.body.fsevent_message.unique);
 
     send_message(fd, &message, (void *) dummy, 1);

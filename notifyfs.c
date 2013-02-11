@@ -3021,7 +3021,7 @@ unsigned char skip_mount_entry(char *source, char *fs, char *path)
 
 }
 
-int process_client_event(struct notifyfs_connection_struct *connection, uint32_t events)
+int process_connection_event(struct notifyfs_connection_struct *connection, uint32_t events)
 {
 
     if (events & ( EPOLLHUP | EPOLLRDHUP ) ) {
@@ -3042,7 +3042,7 @@ int process_client_event(struct notifyfs_connection_struct *connection, uint32_t
 
 	    if (client) {
 
-		logoutput("process_client_event: hangup of client %i, remove watches", client->pid);
+		logoutput("process_connection_event: hangup of client %i, remove watches", client->pid);
 
 		/* here clear all clients watches */
 
@@ -3063,7 +3063,7 @@ int process_client_event(struct notifyfs_connection_struct *connection, uint32_t
 
 	    if (notifyfs_server) {
 
-		logoutput("process_client_event: hangup of remote server");
+		logoutput("process_connection_event: hangup of remote server");
 
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_DOWN;
 		notifyfs_server->connection=NULL;
@@ -3077,8 +3077,52 @@ int process_client_event(struct notifyfs_connection_struct *connection, uint32_t
 	free(connection);
 
     } else if (events & EPOLLIN) {
+	char *buffer=NULL;
+	size_t lenbuffer=0;
 
-	int res=receive_message(connection->fd, connection->data, events, is_remote(connection));
+	if (connection->typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+	    struct client_struct *client=(struct client_struct *) connection->data;
+
+	    /* get the buffer for a client */
+
+	    if ( ! client->buffer) {
+
+		client->buffer=malloc(NOTIFYFS_RECVBUFFERSIZE);
+
+		if (client->buffer) {
+
+		    client->lenbuffer=NOTIFYFS_RECVBUFFERSIZE;
+		    logoutput("process_connection_event: buffer created for client (size: %i)", client->lenbuffer);
+
+		}
+
+	    }
+
+	    buffer=client->buffer;
+	    lenbuffer=client->lenbuffer;
+
+	} else if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+	    struct notifyfs_server_struct *notifyfs_server=(struct notifyfs_server_struct *) connection->data;
+
+	    if ( ! notifyfs_server->buffer) {
+
+		notifyfs_server->buffer=malloc(NOTIFYFS_RECVBUFFERSIZE);
+
+		if (notifyfs_server->buffer) {
+
+		    notifyfs_server->lenbuffer=NOTIFYFS_RECVBUFFERSIZE;
+		    logoutput("process_connection_event: buffer created for server (size: %i)", notifyfs_server->lenbuffer);
+
+		}
+
+	    }
+
+	    buffer=notifyfs_server->buffer;
+	    lenbuffer=notifyfs_server->lenbuffer;
+
+	}
+
+	int res=receive_message(connection->fd, connection->data, events, connection->typedata, buffer, lenbuffer);
 
     }
 
@@ -3108,7 +3152,7 @@ int add_localclient(struct notifyfs_connection_struct *connection, uint32_t even
 
 		connection->data=(void *) client;
 		connection->typedata=NOTIFYFS_OWNERTYPE_CLIENT;
-		connection->process_event=process_client_event;
+		connection->process_event=process_connection_event;
 		client->connection=connection;
 
 	    } else {
@@ -3168,11 +3212,13 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 
 		notifyfs_server->connection=connection;
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
-		get_current_time(&notifyfs_server->connect_time);
 		notifyfs_server->error=0;
+
+		get_current_time(&notifyfs_server->connect_time);
+
 		connection->data=(void *) notifyfs_server;
 		connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
-		connection->process_event=process_client_event;
+		connection->process_event=process_connection_event;
 
 	    }
 
@@ -3189,10 +3235,12 @@ int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t ev
 		notifyfs_server->connection=connection;
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
 		notifyfs_server->type=NOTIFYFS_SERVERTYPE_NETWORK;
+
 		get_current_time(&notifyfs_server->connect_time);
+
 		connection->data=(void *) notifyfs_server;
 		connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
-		connection->process_event=process_client_event;
+		connection->process_event=process_connection_event;
 
 	    }
 

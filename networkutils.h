@@ -38,6 +38,8 @@ struct notifyfs_filesystem_struct {
 
 struct notifyfs_server_struct {
     unsigned char type;
+    char *buffer;
+    size_t lenbuffer;
     struct notifyfs_connection_struct *connection;
     unsigned char status;
     int error;

@@ -444,11 +444,26 @@ static void process_command(void *data)
 
 /* function to handle the register message from a local client */
 
-void handle_register_message(int fd, void *data,  struct notifyfs_register_message *register_message, void *buff, int len, unsigned char remote)
+void handle_register_message(int fd, void *data,  struct notifyfs_register_message *register_message, void *buff, int len, unsigned char typedata)
 {
     struct clientcommand_struct *clientcommand=NULL;
 
-    if (remote==0) {
+    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	logoutput("handle register message: received a register from client");
+
+    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+
+	logoutput("handle register message: received a register from server");
+
+    } else {
+
+	logoutput("handle register message: received a register from unknown sender, cannot continue");
+	goto error;
+
+    }
+
+    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 	struct client_struct *client=NULL;
 
 	client=(struct client_struct *) data;
@@ -460,16 +475,14 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
 	if ( belongtosameprocess(register_message->pid, register_message->tid)==0 ) {
 
 	    logoutput("handle register message: pid %i and tid %i send by client (%i) are not part of same process", register_message->pid, register_message->tid, client->tid);
-
-	    return;
+	    goto error;
 
 	}
 
 	if ( belongtosameprocess(register_message->pid, client->tid)==0 ) {
 
 	    logoutput("handle register message: pid %i send by client and tid %i are not part of same process", register_message->pid, client->tid);
-
-	    return;
+	    goto error;
 
 	}
 
@@ -488,13 +501,13 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
 
 	clientcommand->unique=register_message->unique;
 
-	if (remote==0) {
+	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
 
 	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
 
-	} else {
+	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
 
@@ -543,11 +556,24 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
 
 }
 
-void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message *signoff_message, void *buff, int len, unsigned char remote)
+void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message *signoff_message, void *buff, int len, unsigned char typedata)
 {
     struct clientcommand_struct *clientcommand=NULL;
 
-    logoutput("handle signoff message");
+    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	logoutput("handle signoff message: received a signoff from client");
+
+    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+
+	logoutput("handle signoff message: received a signoff from server");
+
+    } else {
+
+	logoutput("handle signoff message: received a  signoff from unknown sender, cannot continue");
+	goto error;
+
+    }
 
     /* process the register futher in a thread */
 
@@ -560,13 +586,13 @@ void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message 
 
 	clientcommand->unique=signoff_message->unique;
 
-	if (remote==0) {
+	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
 
 	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
 
-	} else {
+	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
 
@@ -615,78 +641,96 @@ void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message 
 
 }
 
-void handle_update_message(int fd, void *data, struct notifyfs_update_message *update_message, void *buff, int len, unsigned char remote)
+void handle_update_message(int fd, void *data, struct notifyfs_update_message *update_message, void *buff, int len, unsigned char typedata)
 {
     struct clientcommand_struct *clientcommand=NULL;
 
-    if (buff) {
+    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
-	clientcommand=malloc(sizeof(struct clientcommand_struct));
+	logoutput("handle update message: received an update from client");
 
-	if (clientcommand) {
-	    struct workerthread_struct *workerthread;
+    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
-	    memset(clientcommand, 0, sizeof(struct clientcommand_struct));
+	logoutput("handle update message: received an update from server");
 
-	    clientcommand->unique=update_message->unique;
+    } else {
 
-	    if (remote==0) {
+	logoutput("handle update message: received an update from unknown sender, cannot continue");
+	goto error;
 
-		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+    }
 
-		clientcommand->owner.owner.localclient=(struct client_struct *) data;
+    if (!buff) {
 
-	    } else {
+	logoutput("handle update message: buffer is empty, cannot continue");
+	goto error;
 
-		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+    }
 
-		clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+    clientcommand=malloc(sizeof(struct clientcommand_struct));
 
-	    }
+    if (clientcommand) {
+	struct workerthread_struct *workerthread;
 
-	    clientcommand->type=NOTIFYFS_COMMAND_UPDATE;
+	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
-	    /* path is first part of buffer
-	    */
+	clientcommand->unique=update_message->unique;
 
-	    clientcommand->command.update.pathallocated=0;
+	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
-	    clientcommand->command.update.path=strdup((char *) buff);
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
 
-	    if ( ! clientcommand->command.update.path) {
+	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
 
-		logoutput("handle_update_message: no memory to allocate %s", (char *) buff);
-		goto error;
+	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
-	    }
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
 
-	    clientcommand->command.update.pathallocated=1;
+	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
 
-	    workerthread=get_workerthread(global_workerthreads_queue);
+	}
 
-	    if (workerthread) {
+	clientcommand->type=NOTIFYFS_COMMAND_UPDATE;
 
-		/* make a workerthread process the list command for client */
+	/* path is first part of buffer
+	*/
 
-		workerthread->processevent_cb=process_command;
-		workerthread->data=(void *) clientcommand;
+	clientcommand->command.update.pathallocated=0;
 
-		signal_workerthread(workerthread);
+	clientcommand->command.update.path=strdup((char *) buff);
 
-	    } else {
+	if ( ! clientcommand->command.update.path) {
 
-		/* no free thread.... what now ?? */
+	    logoutput("handle_update_message: no memory to allocate %s", (char *) buff);
+	    goto error;
 
-		logoutput("handle update message: no free thread...");
-		goto error;
+	}
 
-	    }
+	clientcommand->command.update.pathallocated=1;
+
+	workerthread=get_workerthread(global_workerthreads_queue);
+
+	if (workerthread) {
+
+	    /* make a workerthread process the list command for client */
+
+	    workerthread->processevent_cb=process_command;
+	    workerthread->data=(void *) clientcommand;
+
+	    signal_workerthread(workerthread);
 
 	} else {
 
-	    logoutput("handle update message: cannot allocate clientcommand");
+	    /* no free thread.... what now ?? */
+
+	    logoutput("handle update message: no free thread...");
+	    goto error;
 
 	}
+
+    } else {
+
+	logoutput("handle update message: cannot allocate clientcommand");
 
     }
 
@@ -713,102 +757,118 @@ void handle_update_message(int fd, void *data, struct notifyfs_update_message *u
 
 }
 
-void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_message *setwatch_message, void *buff, int len, unsigned char remote)
+void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_message *setwatch_message, void *buff, int len, unsigned char typedata)
 {
     struct clientcommand_struct *clientcommand=NULL;
 
+    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	logoutput("handle setwatch message: received a setwatch from client");
+
+    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+
+	logoutput("handle setwatch message: received a setwatch from server");
+
+    } else {
+
+	logoutput("handle setwatch message: received a setwatch from unknown sender, cannot continue");
+	goto error;
+
+    }
 
     /* some sanity checks */
 
     if (setwatch_message->watch_id<=0) {
 
 	logoutput("handle setwatch message: error: watch id not positive..");
-	return;
+	goto error;
 
     }
 
-    if (buff) {
+    if (!buff) {
 
-	clientcommand=malloc(sizeof(struct clientcommand_struct));
+	logoutput("handle setwatch message: buffer is empty, cannot continue");
+	goto error;
 
-	if (clientcommand) {
-	    struct workerthread_struct *workerthread;
+    }
 
-	    memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
-	    clientcommand->unique=setwatch_message->unique;
+    clientcommand=malloc(sizeof(struct clientcommand_struct));
 
-	    if (remote==0) {
+    if (clientcommand) {
+	struct workerthread_struct *workerthread;
 
-		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
-		clientcommand->owner.owner.localclient=(struct client_struct *) data;
+	clientcommand->unique=setwatch_message->unique;
 
-	    } else {
+	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
-		clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
 
-		clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
-	    }
+	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
 
-	    clientcommand->type=NOTIFYFS_COMMAND_SETWATCH;
+	}
 
-	    clientcommand->command.setwatch.path=NULL;
-	    clientcommand->command.setwatch.pathallocated=0;
+	clientcommand->type=NOTIFYFS_COMMAND_SETWATCH;
 
-	    if (remote==0) {
+	clientcommand->command.setwatch.path=NULL;
+	clientcommand->command.setwatch.pathallocated=0;
 
-		/* path is first part of buffer */
+	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
-		clientcommand->command.setwatch.path=strdup((char *) buff);
+	    /* path is first part of buffer */
 
-	    } else {
+	    clientcommand->command.setwatch.path=strdup((char *) buff);
 
-		clientcommand->command.setwatch.path=process_notifyfsurl((char *) buff);
+	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
-	    }
+	    clientcommand->command.setwatch.path=process_notifyfsurl((char *) buff);
 
-	    if ( ! clientcommand->command.setwatch.path) {
+	}
 
-		logoutput("handle_setwatch_message: no memory to allocate %s", (char *) buff);
-		goto error;
+	if ( ! clientcommand->command.setwatch.path) {
 
-	    }
+	    logoutput("handle_setwatch_message: no memory to allocate %s", (char *) buff);
+	    goto error;
 
-	    clientcommand->command.setwatch.pathallocated=1;
+	}
 
-	    clientcommand->command.setwatch.owner_watch_id=setwatch_message->watch_id;
+	clientcommand->command.setwatch.pathallocated=1;
 
-	    clientcommand->command.setwatch.fseventmask.attrib_event=setwatch_message->fseventmask.attrib_event;
-	    clientcommand->command.setwatch.fseventmask.xattr_event=setwatch_message->fseventmask.xattr_event;
-	    clientcommand->command.setwatch.fseventmask.move_event=setwatch_message->fseventmask.move_event;
-	    clientcommand->command.setwatch.fseventmask.file_event=setwatch_message->fseventmask.file_event;
-	    clientcommand->command.setwatch.fseventmask.fs_event=setwatch_message->fseventmask.fs_event;
+	clientcommand->command.setwatch.owner_watch_id=setwatch_message->watch_id;
 
-	    workerthread=get_workerthread(global_workerthreads_queue);
+	clientcommand->command.setwatch.fseventmask.attrib_event=setwatch_message->fseventmask.attrib_event;
+	clientcommand->command.setwatch.fseventmask.xattr_event=setwatch_message->fseventmask.xattr_event;
+	clientcommand->command.setwatch.fseventmask.move_event=setwatch_message->fseventmask.move_event;
+	clientcommand->command.setwatch.fseventmask.file_event=setwatch_message->fseventmask.file_event;
+	clientcommand->command.setwatch.fseventmask.fs_event=setwatch_message->fseventmask.fs_event;
 
-	    if (workerthread) {
+	workerthread=get_workerthread(global_workerthreads_queue);
 
-		workerthread->processevent_cb=process_command;
-		workerthread->data=(void *) clientcommand;
+	if (workerthread) {
 
-		signal_workerthread(workerthread);
+	    workerthread->processevent_cb=process_command;
+	    workerthread->data=(void *) clientcommand;
 
-	    } else {
-
-		/* no free thread.... what now ?? */
-
-		logoutput("handle_setwatch_message: no free thread...");
-		goto error;
-
-	    }
+	    signal_workerthread(workerthread);
 
 	} else {
 
-	    logoutput("handle_setwatch_message: cannot allocate clientcommand");
+	    /* no free thread.... what now ?? */
+
+	    logoutput("handle_setwatch_message: no free thread...");
+	    goto error;
 
 	}
+
+    } else {
+
+	logoutput("handle_setwatch_message: cannot allocate clientcommand");
 
     }
 
@@ -835,11 +895,24 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
 }
 
-void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message *fsevent_message, void *buff, int len, unsigned char remote)
+void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message *fsevent_message, void *buff, int len, unsigned char typedata)
 {
     struct clientcommand_struct *clientcommand=NULL;
 
-    logoutput("handle fsevent message:");
+    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	logoutput("handle fsevent message: received an fsevent from client");
+
+    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+
+	logoutput("handle fsevent message: received an fsevent from server");
+
+    } else {
+
+	logoutput("handle fsevent message: received an fsevent from unknown sender, cannot continue");
+	goto error;
+
+    }
 
     clientcommand=malloc(sizeof(struct clientcommand_struct));
 
@@ -850,13 +923,13 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 
 	clientcommand->unique=fsevent_message->unique;
 
-	if (remote==0) {
+	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
 
 	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
 
-	} else {
+	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
 
