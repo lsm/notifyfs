@@ -3023,60 +3023,9 @@ unsigned char skip_mount_entry(char *source, char *fs, char *path)
 
 int process_connection_event(struct notifyfs_connection_struct *connection, uint32_t events)
 {
+    logoutput("process_connection_event");
 
-    if (events & ( EPOLLHUP | EPOLLRDHUP ) ) {
-
-	/* identification who owns the connection (client or server) depends on the 
-	    connection being local (->client) or not (->server)
-	    this is not enough when working with more type local processes
-	    like a local fuse fs
-	*/
-
-	if (connection->typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
-	    struct client_struct *client;
-
-	    close(connection->fd);
-	    connection->fd=0;
-
-	    client=(struct client_struct *) connection->data;
-
-	    if (client) {
-
-		logoutput("process_connection_event: hangup of client %i, remove watches", client->pid);
-
-		/* here clear all clients watches */
-
-		client->connection=NULL;
-
-		remove_clientwatches_client(client);
-		remove_client(client);
-
-	    }
-
-	} else if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
-	    struct notifyfs_server_struct *notifyfs_server=(struct notifyfs_server_struct *) connection->data;
-
-	    close(connection->fd);
-	    connection->fd=0;
-
-	    /* remote server hangup */
-
-	    if (notifyfs_server) {
-
-		logoutput("process_connection_event: hangup of remote server");
-
-		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_DOWN;
-		notifyfs_server->connection=NULL;
-
-		remove_clientwatches_server(notifyfs_server);
-
-	    }
-
-	}
-
-	free(connection);
-
-    } else if (events & EPOLLIN) {
+    if (events & EPOLLIN) {
 	char *buffer=NULL;
 	size_t lenbuffer=0;
 
@@ -3123,6 +3072,66 @@ int process_connection_event(struct notifyfs_connection_struct *connection, uint
 	}
 
 	int res=receive_message(connection->fd, connection->data, events, connection->typedata, buffer, lenbuffer);
+
+	if (res==0) {
+
+	    /* in case of a connection with a remote server this means a hangup */
+
+	    if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+
+		events|=EPOLLHUP;
+
+	    }
+
+	}
+
+    }
+
+    if (events & ( EPOLLHUP | EPOLLRDHUP ) ) {
+
+	if (connection->typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+	    struct client_struct *client;
+
+	    close(connection->fd);
+	    connection->fd=0;
+
+	    client=(struct client_struct *) connection->data;
+
+	    if (client) {
+
+		logoutput("process_connection_event: hangup of client %i, remove watches", client->pid);
+
+		/* here clear all clients watches */
+
+		client->connection=NULL;
+
+		remove_clientwatches_client(client);
+		remove_client(client);
+
+	    }
+
+	} else if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+	    struct notifyfs_server_struct *notifyfs_server=(struct notifyfs_server_struct *) connection->data;
+
+	    close(connection->fd);
+	    connection->fd=0;
+
+	    /* remote server hangup */
+
+	    if (notifyfs_server) {
+
+		logoutput("process_connection_event: hangup of remote server");
+
+		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_DOWN;
+		notifyfs_server->connection=NULL;
+
+		remove_clientwatches_server(notifyfs_server);
+
+	    }
+
+	}
+
+	free(connection);
 
     }
 

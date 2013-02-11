@@ -808,6 +808,8 @@ void connect_remote_notifyfs_server(char *ipv4address)
 	if (connection) {
 
 	    notifyfs_server->connection=connection;
+	    connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
+	    connection->data=(void *) notifyfs_server;
 
 	    /* here try to connect to the remote notifyfs server 
 		what callback here, it's the receiving of the fsevent messages coming from the remote server
