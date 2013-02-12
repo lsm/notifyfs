@@ -212,7 +212,7 @@ void remove_watch_from_table(struct watch_struct *watch)
 
 /* simple lookup function of watch */
 
-struct watch_struct *lookup_watch(struct notifyfs_inode_struct *inode)
+struct watch_struct *lookup_watch_inode(struct notifyfs_inode_struct *inode)
 {
     struct watch_struct *watch=NULL;
     int hash=inode->ino%WATCHES_TABLESIZE;
@@ -232,6 +232,32 @@ struct watch_struct *lookup_watch(struct notifyfs_inode_struct *inode)
     return watch;
 
 }
+
+struct watch_struct *lookup_watch_list(unsigned long ctr)
+{
+    struct watch_struct *watch=NULL;
+
+    /* lookup using the ctr */
+
+    pthread_mutex_lock(&watchctr_mutex);
+
+    watch=watch_list;
+
+    while(watch) {
+
+	if (watch->ctr==ctr) break;
+
+	watch=watch->next;
+
+    }
+
+    pthread_mutex_unlock(&watchctr_mutex);
+
+    return watch;
+
+}
+
+
 
 void add_watch_to_list(struct watch_struct *watch)
 {
@@ -608,7 +634,7 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 
     }
 
-    watch=lookup_watch(inode);
+    watch=lookup_watch_inode(inode);
 
     if ( ! watch ) {
 
@@ -873,6 +899,28 @@ void remove_clientwatch_from_watch(struct clientwatch_struct *clientwatch)
 	watch->fseventmask.fs_event=0;
 
 	/* just leave it hanging around for now.. */
+
+    } else {
+
+	clientwatch=watch->clientwatches;
+
+	watch->fseventmask.attrib_event=0;
+	watch->fseventmask.xattr_event=0;
+	watch->fseventmask.file_event=0;
+	watch->fseventmask.move_event=0;
+	watch->fseventmask.fs_event=0;
+
+	while(clientwatch) {
+
+	    watch->fseventmask.attrib_event |= clientwatch->fseventmask.attrib_event;
+	    watch->fseventmask.xattr_event |= clientwatch->fseventmask.xattr_event;
+	    watch->fseventmask.file_event |= clientwatch->fseventmask.file_event;
+	    watch->fseventmask.move_event |= clientwatch->fseventmask.move_event;
+	    watch->fseventmask.fs_event |= clientwatch->fseventmask.fs_event;
+
+	    clientwatch=clientwatch->next_per_watch;
+
+	}
 
     }
 

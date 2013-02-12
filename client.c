@@ -82,7 +82,7 @@ struct client_struct *create_client(unsigned int fd, pid_t pid, uid_t uid, gid_t
 	client->status=NOTIFYFS_CLIENTSTATUS_NOTSET;
 
 	client->buffer=NULL;
-	client->lenbuffer=NULL;
+	client->lenbuffer=0;
 
 	client->clientwatches=NULL;
 

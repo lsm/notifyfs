@@ -59,6 +59,7 @@
 #include "watches.h"
 #include "socket.h"
 #include "networkutils.h"
+#include "changestate.h"
 
 #define NOTIFYFS_COMMAND_UPDATE				1
 #define NOTIFYFS_COMMAND_SETWATCH			2
@@ -81,6 +82,9 @@ struct command_setwatch_struct {
 struct command_fsevent_struct {
     int owner_watch_id;
     struct fseventmask_struct fseventmask;
+    int entry;
+    char *name;
+    unsigned char nameallocated;
 };
 
 struct clientcommand_struct {
@@ -155,7 +159,7 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
     */
 
     inode=get_inode(parent->inode);
-    watch=lookup_watch(inode);
+    watch=lookup_watch_inode(inode);
 
     if ( ! watch) {
 	struct timespec current_time;
@@ -400,15 +404,97 @@ static void process_command_signoff(struct clientcommand_struct *clientcommand)
 static void process_command_fsevent(struct clientcommand_struct *clientcommand)
 {
     struct command_fsevent_struct *command_fsevent=&(clientcommand->command.fsevent);
-    struct fseventmask_struct *fseventmask=&(command_fsevent->fseventmask);
+    struct fseventmask_struct *fseventmask=&command_fsevent->fseventmask;
+    struct notifyfs_entry_struct *entry=NULL;
+    struct watch_struct *watch=NULL;
+    struct notifyfs_fsevent_struct *fsevent=NULL;
 
     logoutput("process_command_fsevent: received a fsevent %i:%i:%i:%i", fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
 
-    /* here find the right watch */
+    /* first lookup the watch using owner id 
+	there must be watch this event refers to
+    */
 
-    /* owner is known!!! 
+    watch=lookup_watch_list(command_fsevent->owner_watch_id);
+
+    if (! watch) {
+
+	logoutput("process_command_fsevent: watch not found for id %i", command_fsevent->owner_watch_id);
+	return;
+
+    }
+
+    if (command_fsevent->name) {
+	struct notifyfs_inode_struct *inode=watch->inode;
+
+	/* in dir */
+
+	entry=get_entry(inode->alias);
+
+	if (entry) {
+
+	    entry=find_entry_raw(entry, inode, command_fsevent->name, 1, create_entry);
+
+	}
+
+    } else {
+	struct notifyfs_inode_struct *inode=watch->inode;
+
+	/* event is on watch self */
+
+	entry=get_entry(inode->alias);
+
+    }
+
+    if ( ! entry) {
+
+	logoutput("process_command_fsevent: entry not found for id %i", command_fsevent->owner_watch_id);
+	return;
+
+    }
+
+
+    /*
+	what to do next ??
+
+	analyse with what it known already here ...
+
+	simular to the event handled by inotify....
 
     */
+
+    fsevent=create_fsevent(entry);
+
+    fsevent->fseventmask.attrib_event=command_fsevent->fseventmask.attrib_event;
+    fsevent->fseventmask.xattr_event=command_fsevent->fseventmask.xattr_event;
+    fsevent->fseventmask.move_event=command_fsevent->fseventmask.move_event;
+    fsevent->fseventmask.file_event=command_fsevent->fseventmask.file_event;
+
+    /* 	is it smart to do something with fs events here since they are comong from a remote host
+	a (u)mount event on the remote host has no meaning here
+    */
+
+    fsevent->fseventmask.fs_event=command_fsevent->fseventmask.fs_event;
+
+
+
+    queue_fsevent(fsevent);
+
+    finish:
+
+    if (command_fsevent->nameallocated==1) {
+
+	if (command_fsevent->name) {
+
+	    free(command_fsevent->name);
+	    command_fsevent->name=NULL;
+
+	}
+
+	command_fsevent->nameallocated=0;
+
+    }
+
 
 }
 
@@ -895,6 +981,10 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
 }
 
+/*
+    handle an fsevent message coming from a client (which is actually not possible) or a remote server
+*/
+
 void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message *fsevent_message, void *buff, int len, unsigned char typedata)
 {
     struct clientcommand_struct *clientcommand=NULL;
@@ -918,6 +1008,7 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 
     if (clientcommand) {
 	struct workerthread_struct *workerthread;
+	struct notifyfs_entry_struct *entry=NULL;
 
 	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
@@ -938,6 +1029,50 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 	}
 
 	clientcommand->type=NOTIFYFS_COMMAND_FSEVENT;
+
+	clientcommand->command.fsevent.owner_watch_id=fsevent_message->watch_id;
+
+	clientcommand->command.fsevent.fseventmask.attrib_event=fsevent_message->fseventmask.attrib_event;
+	clientcommand->command.fsevent.fseventmask.xattr_event=fsevent_message->fseventmask.xattr_event;
+	clientcommand->command.fsevent.fseventmask.move_event=fsevent_message->fseventmask.move_event;
+	clientcommand->command.fsevent.fseventmask.file_event=fsevent_message->fseventmask.file_event;
+	clientcommand->command.fsevent.fseventmask.fs_event=fsevent_message->fseventmask.fs_event;
+
+        if (fsevent_message->entry>=0) {
+
+	    /* this will probably fail since client or servers sending this fsevent message are usually not using
+		the shared memory
+	    */
+
+	    entry=get_entry(fsevent_message->entry);
+
+	}
+
+	if (! entry) {
+
+	    if (fsevent_message->indir==1) {
+
+		if ( ! buff ) {
+
+		    logoutput("handle_fsevent_message: error, event in directory, but buff not defined");
+		    goto error;
+
+		}
+
+		clientcommand->command.fsevent.name=strdup((char *) buff);
+
+		if (! clientcommand->command.fsevent.name) {
+
+		    logoutput("handle_fsevent_message: error, unable to allocate memory for %s", (char *) buff);
+		    goto error;
+
+		}
+
+		clientcommand->command.fsevent.nameallocated=1;
+
+	    }
+
+	}
 
 	workerthread=get_workerthread(global_workerthreads_queue);
 

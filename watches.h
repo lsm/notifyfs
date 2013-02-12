@@ -113,7 +113,8 @@ void unlock_watch(struct watch_struct *watch);
 
 void add_watch_to_table(struct watch_struct *watch);
 void remove_watch_from_table(struct watch_struct *watch);
-struct watch_struct *lookup_watch(struct notifyfs_inode_struct *inode);
+struct watch_struct *lookup_watch_inode(struct notifyfs_inode_struct *inode);
+struct watch_struct *lookup_watch_list(unsigned long ctr);
 
 void add_watch_to_list(struct watch_struct *watch);
 void remove_watch_from_list(struct watch_struct *watch);

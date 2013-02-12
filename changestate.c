@@ -249,24 +249,88 @@ static unsigned char entry_in_view(struct notifyfs_entry_struct *entry, struct v
 
 }
 
-static unsigned char check_fsevent_applies(struct fseventmask_struct *fseventmaska, struct fseventmask_struct *fseventmaskb)
+static unsigned char check_fsevent_applies(struct fseventmask_struct *fseventmaska, struct fseventmask_struct *fseventmaskb, unsigned char indir)
 {
 
     if (fseventmaska->attrib_event & fseventmaskb->attrib_event) {
 
-	return 1;
+	if (indir==1) {
+
+	    if (fseventmaska->attrib_event & NOTIFYFS_FSEVENT_ATTRIB_CHILD) {
+
+		return 1;
+
+	    }
+
+	} else {
+
+	    if (fseventmaska->attrib_event & NOTIFYFS_FSEVENT_ATTRIB_SELF) {
+
+		return 1;
+
+	    }
+
+	}
 
     } else if (fseventmaska->xattr_event & fseventmaskb->xattr_event) {
 
-	return 1;
+	if (indir==1) {
+
+	    if (fseventmaska->xattr_event & NOTIFYFS_FSEVENT_XATTR_CHILD) {
+
+		return 1;
+
+	    }
+
+	} else {
+
+	    if (fseventmaska->xattr_event & NOTIFYFS_FSEVENT_XATTR_SELF) {
+
+		return 1;
+
+	    }
+
+	}
 
     } else if (fseventmaska->file_event & fseventmaskb->file_event) {
 
-	return 1;
+	if (indir==1) {
+
+	    if (fseventmaska->file_event & NOTIFYFS_FSEVENT_FILE_CHILD) {
+
+		return 1;
+
+	    }
+
+	} else {
+
+	    if (fseventmaska->file_event & NOTIFYFS_FSEVENT_FILE_SELF) {
+
+		return 1;
+
+	    }
+
+	}
 
     } else if (fseventmaska->move_event & fseventmaskb->move_event) {
 
-	return 1;
+	if (indir==1) {
+
+	    if (fseventmaska->move_event & NOTIFYFS_FSEVENT_MOVE_CHILD) {
+
+		return 1;
+
+	    }
+
+	} else {
+
+	    if (fseventmaska->move_event & NOTIFYFS_FSEVENT_MOVE_SELF) {
+
+		return 1;
+
+	    }
+
+	}
 
     } else if (fseventmaska->fs_event & fseventmaskb->fs_event) {
 
@@ -278,7 +342,11 @@ static unsigned char check_fsevent_applies(struct fseventmask_struct *fseventmas
 
 }
 
-static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_fsevent_struct *fsevent)
+/*
+    TODO: add the situation fsevent is on watch
+*/
+
+static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_fsevent_struct *fsevent, unsigned char indir)
 {
     struct clientwatch_struct *clientwatch=NULL;
 
@@ -301,12 +369,36 @@ static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_
 
 		    logoutput("send_fsevent_to_clients: test client watch of %i applies", (int) client->pid);
 
-		    /* test here the client is interested in the event */
+		    if (indir==1) {
 
-		    if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask)==1) {
-			struct view_struct *view=get_view(clientwatch->view);
+			/* test here the client is interested in the event */
 
-			if (entry_in_view(fsevent->entry, view)==1) {
+			if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask, 1)==1) {
+			    struct view_struct *view=get_view(clientwatch->view);
+
+			    if (entry_in_view(fsevent->entry, view)==1) {
+				struct notifyfs_connection_struct *connection=client->connection;
+
+				logoutput("send_fsevent_to_clients: entry part of view, check for connection");
+
+				if (connection) {
+    				    uint64_t unique=new_uniquectr();
+
+				    /* send message */
+
+				    send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time, 1);
+
+				}
+
+			    }
+
+			}
+
+		    } else {
+
+			/* event on watch */
+
+			if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask, 0)==1) {
 			    struct notifyfs_connection_struct *connection=client->connection;
 
 			    logoutput("send_fsevent_to_clients: entry part of view, check for connection");
@@ -316,7 +408,7 @@ static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_
 
 				/* send message */
 
-				send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
+				send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time, 0);
 
 			    }
 
@@ -346,9 +438,18 @@ static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_
 		    if (connection) {
     			uint64_t unique=new_uniquectr();
 
-			/* send message */
+			if (indir==1) {
+			    char *name=get_data(fsevent->entry->name);
 
-			send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time);
+			    /* send message */
+
+			    send_fsevent_message_remote(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, name, &fsevent->detect_time);
+
+			} else {
+
+			    send_fsevent_message_remote(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, NULL, &fsevent->detect_time);
+
+			}
 
 		    }
 
@@ -377,9 +478,11 @@ static void check_for_watches(struct notifyfs_fsevent_struct *fsevent)
 
     if (fsevent->entry) {
 	struct notifyfs_inode_struct *inode=get_inode(fsevent->entry->inode);
-	struct watch_struct *watch=lookup_watch(inode);
+	struct watch_struct *watch=lookup_watch_inode(inode);
 
-	if (watch) send_fsevent_to_clients(watch, fsevent);
+	/* event on watch self */
+
+	if (watch) send_fsevent_to_clients(watch, fsevent, 0);
 
 	if (isrootentry(fsevent->entry)==0) {
 	    struct notifyfs_entry_struct *entry;
@@ -387,10 +490,16 @@ static void check_for_watches(struct notifyfs_fsevent_struct *fsevent)
 	    entry=get_entry(fsevent->entry->parent);
 	    inode=get_inode(entry->inode);
 
-	    watch=lookup_watch(inode);
+	    watch=lookup_watch_inode(inode);
 
-	    if (watch) send_fsevent_to_clients(watch, fsevent);
+	    if (watch) {
+		char *name=get_data(entry->name);
 
+		/* event in directory of watch */
+
+		send_fsevent_to_clients(watch, fsevent, 1);
+
+	    }
 
 	}
 
@@ -580,7 +689,7 @@ static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *
 	}
 
 	if (self==1) {
-	    struct watch_struct *watch=lookup_watch(inode);
+	    struct watch_struct *watch=lookup_watch_inode(inode);
 
 	    if (watch) {
 
@@ -846,6 +955,8 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 	struct watch_struct *watch;
 	pathstring path;
 
+	logoutput("process_one_fsevent: remove/moved, handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
+
 	strcpy(path, fsevent->path);
 
 	catched=1;
@@ -860,8 +971,6 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
     } else {
 
-	logoutput("process_one_fsevent: handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
-
 	if ((fsevent->fseventmask.move_event & (NOTIFYFS_FSEVENT_MOVE_CREATED | NOTIFYFS_FSEVENT_MOVE_MOVED_TO)) ||
 	    (fsevent->fseventmask.attrib_event & NOTIFYFS_FSEVENT_ATTRIB_CA) || 
 	    (fsevent->fseventmask.xattr_event & NOTIFYFS_FSEVENT_XATTR_CA) || 
@@ -871,7 +980,7 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
 	    /* creation as already done */
 
-	    logoutput("process_one_fsevent: new or changed entry (created, moved to, file, meta)");
+	    logoutput("process_one_fsevent: new/changed, handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
 
 	    check_for_watches(fsevent);
 

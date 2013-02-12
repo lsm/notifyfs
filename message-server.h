@@ -26,6 +26,7 @@
 void send_reply_message(int fd, uint64_t unique, int error, void *buffer, size_t size);
 void send_delwatch_message(int fd, uint64_t unique, unsigned long id);
 void send_changewatch_message(int fd, uint64_t unique, unsigned long id, unsigned char action);
-void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time);
+void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time, unsigned char indir);
+void send_fsevent_message_remote(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, char *name, struct timespec *detect_time);
 
 #endif

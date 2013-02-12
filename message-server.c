@@ -107,8 +107,13 @@ void send_changewatch_message(int fd, uint64_t unique, unsigned long id, unsigne
 
 }
 
+/*
+    send a fsevent message local
+    it's local cause the entry index is part of the message, and this is only usefull for processes sharing the entry cache
+*/
 
-void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time)
+
+void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time, unsigned char indir)
 {
     struct notifyfs_message_body message;
     char dummy[1];
@@ -126,7 +131,7 @@ void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fsev
 
     message.body.fsevent_message.detect_time.tv_sec=detect_time->tv_sec;
     message.body.fsevent_message.detect_time.tv_nsec=detect_time->tv_nsec;
-
+    message.body.fsevent_message.indir=indir;
     message.body.fsevent_message.watch_id=id;
 
     logoutput("send_fsevent_message: ctr %li", (long int) message.body.fsevent_message.unique);
@@ -134,3 +139,41 @@ void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fsev
     send_message(fd, &message, (void *) dummy, 1);
 
 }
+
+void send_fsevent_message_remote(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, char *name, struct timespec *detect_time)
+{
+    struct notifyfs_message_body message;
+
+    message.type=NOTIFYFS_MESSAGE_TYPE_FSEVENT;
+
+    message.body.fsevent_message.unique=unique;
+
+    message.body.fsevent_message.fseventmask.attrib_event=fseventmask->attrib_event;
+    message.body.fsevent_message.fseventmask.xattr_event=fseventmask->xattr_event;
+    message.body.fsevent_message.fseventmask.file_event=fseventmask->file_event;
+    message.body.fsevent_message.fseventmask.move_event=fseventmask->move_event;
+    message.body.fsevent_message.fseventmask.fs_event=fseventmask->fs_event;
+
+    message.body.fsevent_message.detect_time.tv_sec=detect_time->tv_sec;
+    message.body.fsevent_message.detect_time.tv_nsec=detect_time->tv_nsec;
+    message.body.fsevent_message.watch_id=id;
+
+    logoutput("send_fsevent_message: ctr %li", (long int) message.body.fsevent_message.unique);
+
+    if (name) {
+
+	message.body.fsevent_message.indir=1;
+
+	send_message(fd, &message, (void *) name, strlen(name)+1);
+
+    } else {
+	char dummy[1];
+
+	message.body.fsevent_message.indir=0;
+
+	send_message(fd, &message, (void *) dummy, 1);
+
+    }
+
+}
+
