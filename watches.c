@@ -468,7 +468,7 @@ void send_setwatch_message_remote(struct notifyfs_server_struct *notifyfs_server
     message.body.setwatch_message.fseventmask.attrib_event=watch->fseventmask.attrib_event;
     message.body.setwatch_message.fseventmask.xattr_event=watch->fseventmask.xattr_event;
     message.body.setwatch_message.fseventmask.file_event=watch->fseventmask.file_event;
-    message.body.setwatch_message.fseventmask.file_event=watch->fseventmask.move_event;
+    message.body.setwatch_message.fseventmask.move_event=watch->fseventmask.move_event;
     message.body.setwatch_message.fseventmask.fs_event=0;
 
     logoutput("send_watch_message_remote: ctr %li", message.body.setwatch_message.unique);

@@ -90,24 +90,28 @@ static int check_pathlen(struct notifyfs_entry_struct *entry)
 
 	inode=get_inode(entry->inode);
 
-	/* check the inode status: if pending to be removed or already removed then ready */
+	if (inode) {
 
-	if (inode->status==FSEVENT_INODE_STATUS_TOBEREMOVED || inode->status==FSEVENT_INODE_STATUS_REMOVED ) {
+	    /* check the inode status: if pending to be removed or already removed then ready */
 
-	    /* if a part of the path is removed already or to be removed assume it's already in progress */
+	    if (inode->status==FSEVENT_INODE_STATUS_TOBEREMOVED || inode->status==FSEVENT_INODE_STATUS_REMOVED ) {
 
-	    len=-EINPROGRESS;
-	    break;
+		/* if a part of the path is removed already or to be removed assume it's already in progress */
 
-	} else if (entry->parent>=0 && (inode->status==FSEVENT_INODE_STATUS_TOBEUNMOUNTED || inode->status==FSEVENT_INODE_STATUS_UNMOUNTED)) {
+		len=-EINPROGRESS;
+		break;
 
-	    /* if a parent is (to be) unmounted then assume it's already in  progress 
+	    } else if (entry->parent>=0 && (inode->status==FSEVENT_INODE_STATUS_TOBEUNMOUNTED || inode->status==FSEVENT_INODE_STATUS_UNMOUNTED)) {
+
+		/* if a parent is (to be) unmounted then assume it's already in  progress 
 		TEST THIS !!! it's possible that events are mixed up like:
 		unmount, then direct a create of a new file in this directory
 		this event may not be ignored !! */
 
-	    len=-EINPROGRESS;
-	    break;
+		len=-EINPROGRESS;
+		break;
+
+	    }
 
 	}
 
@@ -493,7 +497,6 @@ static void check_for_watches(struct notifyfs_fsevent_struct *fsevent)
 	    watch=lookup_watch_inode(inode);
 
 	    if (watch) {
-		char *name=get_data(entry->name);
 
 		/* event in directory of watch */
 
@@ -951,8 +954,6 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 	}
 
     } else if (fsevent->fseventmask.move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED )) {
-	struct notifyfs_inode_struct *inode;
-	struct watch_struct *watch;
 	pathstring path;
 
 	logoutput("process_one_fsevent: remove/moved, handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
@@ -976,9 +977,62 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 	    (fsevent->fseventmask.xattr_event & NOTIFYFS_FSEVENT_XATTR_CA) || 
 	    (fsevent->fseventmask.file_event & (NOTIFYFS_FSEVENT_FILE_MODIFIED | NOTIFYFS_FSEVENT_FILE_SIZE | NOTIFYFS_FSEVENT_FILE_LOCK_CA))) {
 
-	    catched=1;
+	    struct notifyfs_entry_struct *entry=fsevent->entry;
+	    struct notifyfs_inode_struct *inode=NULL;
 
-	    /* creation as already done */
+	    /* it's possible that the entry does not have an inode yet */
+
+	    if (entry->inode<0) assign_inode(entry);
+
+	    inode=get_inode(entry->inode);
+
+	    if (inode) {
+		struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+
+		if (! attr) {
+		    struct stat st;
+
+		    if (lstat(fsevent->path, &st)==0) {
+
+			attr=assign_attr(&st, inode);
+
+			if (attr) {
+
+			    copy_stat(&attr->cached_st, &st);
+			    copy_stat_times(&attr->cached_st, &st);
+
+			    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
+			    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
+
+			    if ( S_ISDIR(st.st_mode)) {
+
+				/* directory no access yet */
+
+				attr->mtim.tv_sec=0;
+				attr->mtim.tv_nsec=0;
+
+			    } else {
+
+				attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
+				attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
+
+			    }
+
+			}
+
+		    } else {
+
+			/* what to do here: a fsevent indicating a change, a create, but not a delete, but stat gives an error */
+
+			logoutput("process_one_fsevent: new/changed, but stat gives error %i", errno);
+
+		    }
+
+		}
+
+	    }
+
+	    catched=1;
 
 	    logoutput("process_one_fsevent: new/changed, handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
 
@@ -988,7 +1042,13 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
     }
 
-    if (catched==0) logoutput("process_one_fsevent: event %i:%i:%i:%i not handled here", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
+    if (catched==0) {
+
+	/* not handled here */
+
+	logoutput("process_one_fsevent: event %i:%i:%i:%i not handled here", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
+
+    }
 
 }
 
@@ -1340,16 +1400,15 @@ void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent)
 	struct notifyfs_entry_struct *entry=notifyfs_fsevent->entry;
 	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 
-	inode->status=FSEVENT_INODE_STATUS_TOBEREMOVED;
+	if (inode) inode->status=FSEVENT_INODE_STATUS_TOBEREMOVED;
 
     }
-
 
     if (fseventmask->fs_event & NOTIFYFS_FSEVENT_FS_UNMOUNT) {
 	struct notifyfs_entry_struct *entry=notifyfs_fsevent->entry;
 	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 
-	inode->status=FSEVENT_INODE_STATUS_TOBEUNMOUNTED;
+	if (inode) inode->status=FSEVENT_INODE_STATUS_TOBEUNMOUNTED;
 
     }
 

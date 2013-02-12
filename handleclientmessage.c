@@ -435,6 +435,14 @@ static void process_command_fsevent(struct clientcommand_struct *clientcommand)
 
 	    entry=find_entry_raw(entry, inode, command_fsevent->name, 1, create_entry);
 
+	    /* when created: assign an inode 
+
+		but when it's a remove/delete/move away, it's a bit stupid to assign a inode
+
+	    */
+
+
+
 	}
 
     } else {
@@ -475,8 +483,6 @@ static void process_command_fsevent(struct clientcommand_struct *clientcommand)
     */
 
     fsevent->fseventmask.fs_event=command_fsevent->fseventmask.fs_event;
-
-
 
     queue_fsevent(fsevent);
 

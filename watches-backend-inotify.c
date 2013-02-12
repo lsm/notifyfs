@@ -629,6 +629,9 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
 			entrycreated=1;
 
+			fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_CREATED;
+
+
 		    } else {
 
 			/* do nothing here...entry did not exist in notifyfs 
@@ -696,9 +699,6 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_OPEN;
 	i_event->mask-=IN_OPEN;
 
-	/* an open call is also used to create an entry */
-
-	if (entrycreated==1) fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_CREATED;
 
     }
 
