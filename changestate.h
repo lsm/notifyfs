@@ -25,5 +25,6 @@
 void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent);
 struct notifyfs_fsevent_struct *create_fsevent(struct notifyfs_entry_struct *entry);
 void init_changestate(struct workerthreads_queue_struct *workerthreads_queue);
+struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *watch, struct fseventmask_struct *fseventmask, char *name);
 
 #endif

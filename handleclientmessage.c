@@ -146,9 +146,10 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 	    */
 
 	    send_reply_message(connection->fd, clientcommand->unique, ENOENT, NULL, 0);
-	    goto finish;
 
 	}
+
+	goto finish;
 
     }
 
@@ -289,9 +290,10 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 	if (connection) {
 
 	    send_reply_message(connection->fd, clientcommand->unique, ENOENT, NULL, 0);
-	    goto finish;
 
 	}
+
+	goto finish;
 
     }
 
@@ -393,6 +395,7 @@ static void process_command_signoff(struct clientcommand_struct *clientcommand)
 
 }
 
+
 /* 
     process a message with a fsevent
 
@@ -420,71 +423,13 @@ static void process_command_fsevent(struct clientcommand_struct *clientcommand)
     if (! watch) {
 
 	logoutput("process_command_fsevent: watch not found for id %i", command_fsevent->owner_watch_id);
-	return;
+	goto finish;
 
     }
 
-    if (command_fsevent->name) {
-	struct notifyfs_inode_struct *inode=watch->inode;
+    fsevent=evaluate_remote_fsevent(watch, fseventmask, command_fsevent->name);
 
-	/* in dir */
-
-	entry=get_entry(inode->alias);
-
-	if (entry) {
-
-	    entry=find_entry_raw(entry, inode, command_fsevent->name, 1, create_entry);
-
-	    /* when created: assign an inode 
-
-		but when it's a remove/delete/move away, it's a bit stupid to assign a inode
-
-	    */
-
-
-
-	}
-
-    } else {
-	struct notifyfs_inode_struct *inode=watch->inode;
-
-	/* event is on watch self */
-
-	entry=get_entry(inode->alias);
-
-    }
-
-    if ( ! entry) {
-
-	logoutput("process_command_fsevent: entry not found for id %i", command_fsevent->owner_watch_id);
-	return;
-
-    }
-
-
-    /*
-	what to do next ??
-
-	analyse with what it known already here ...
-
-	simular to the event handled by inotify....
-
-    */
-
-    fsevent=create_fsevent(entry);
-
-    fsevent->fseventmask.attrib_event=command_fsevent->fseventmask.attrib_event;
-    fsevent->fseventmask.xattr_event=command_fsevent->fseventmask.xattr_event;
-    fsevent->fseventmask.move_event=command_fsevent->fseventmask.move_event;
-    fsevent->fseventmask.file_event=command_fsevent->fseventmask.file_event;
-
-    /* 	is it smart to do something with fs events here since they are comong from a remote host
-	a (u)mount event on the remote host has no meaning here
-    */
-
-    fsevent->fseventmask.fs_event=command_fsevent->fseventmask.fs_event;
-
-    queue_fsevent(fsevent);
+    if (fsevent) queue_fsevent(fsevent);
 
     finish:
 

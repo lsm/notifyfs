@@ -110,7 +110,7 @@ static int check_pathlen(struct notifyfs_entry_struct *entry)
 
 }
 
-static char *determine_path_custom(struct notifyfs_entry_struct *entry)
+char *determine_path_entry(struct notifyfs_entry_struct *entry)
 {
     char *pos;
     int nreturn=0, len;
@@ -540,7 +540,7 @@ static void forward_watch_backend(int mountindex, struct watch_struct *watch, ch
 
 	    entry=get_entry(mount->entry);
 
-	    mountpoint=determine_path_custom(entry);
+	    mountpoint=determine_path_entry(entry);
 
 	    if (mountpoint) {
 
@@ -846,9 +846,13 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 
 	set_watch_backend_os_specific(watch, path);
 
-	/* test it's on a network or fuse fs */
+	if (notifyfs_options.listennetwork==0) {
 
-	if (mountindex>=0) forward_watch_backend(mountindex, watch, path);
+	    /* test it's on a network or fuse fs */
+
+	    if (mountindex>=0) forward_watch_backend(mountindex, watch, path);
+
+	}
 
     }
 

@@ -106,6 +106,8 @@ struct notifyfs_fsevent_struct {
 
 // Prototypes
 
+char *determine_path_entry(struct notifyfs_entry_struct *entry);
+
 void init_watch_hashtables();
 
 void lock_watch(struct watch_struct *watch);

@@ -1490,3 +1490,250 @@ void init_changestate(struct workerthreads_queue_struct *workerthreads_queue)
 
 }
 
+struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *watch, struct fseventmask_struct *fseventmask, char *name)
+{
+    struct notifyfs_fsevent_struct *fsevent=NULL;
+    struct notifyfs_entry_struct *entry=NULL;
+    struct notifyfs_inode_struct *inode=NULL;
+    struct stat st;
+    char *path=NULL;
+
+    if (name) {
+	struct notifyfs_entry_struct *parent=NULL;
+
+	inode=watch->inode;
+	parent=get_entry(inode->alias);
+
+	entry=find_entry_raw(parent, inode, name, 1, NULL);
+
+	if ( ! entry) {
+
+	    if (fseventmask->move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED)) {
+
+		/* ignore this event: it's does not exist here, so a delete message does not matter */
+
+		goto out;
+
+	    }
+
+	    entry=create_entry(parent, name);
+
+	    if ( ! entry) {
+
+		logoutput("evaluate_remote_fsevent: unable to create an entry for %s, cannot continue", name);
+		goto out;
+
+	    }
+
+	}
+
+    } else {
+
+	inode=watch->inode;
+	entry=get_entry(inode->alias);
+
+    }
+
+    path=determine_path_entry(entry);
+
+    if ( ! path) {
+
+	logoutput("evaluate_remote_fsevent: unable to create an path for %s, cannot continue", name);
+	goto out;
+
+    }
+
+    if (lstat(path, &st)==-1) {
+
+	/* path does not exist anymore */
+
+	fsevent=create_fsevent(entry);
+
+	if (fsevent) {
+
+	    fsevent->fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+	    fsevent->path=path;
+	    fsevent->pathallocated=1;
+
+	    get_current_time(&fsevent->detect_time);
+
+	} else {
+
+	    logoutput("evaluate_remote_fsevent: unable to create an fsevent for %s, cannot continue", name);
+
+	}
+
+	goto out;
+
+    }
+
+    if (entry->inode<0) assign_inode(entry);
+
+    inode=get_inode(entry->inode);
+
+    if (inode) {
+	struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+
+	if (! attr) {
+
+	    attr=assign_attr(&st, inode);
+
+	    if (attr) {
+
+		copy_stat(&attr->cached_st, &st);
+		copy_stat_times(&attr->cached_st, &st);
+
+		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
+		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
+
+		if ( S_ISDIR(st.st_mode)) {
+
+		    /* directory no access yet */
+
+		    attr->mtim.tv_sec=0;
+		    attr->mtim.tv_nsec=0;
+
+		} else {
+
+		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
+		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
+
+		}
+
+	    } else {
+
+		logoutput("evaluate_remote_fsevent: unable to create an attr for %s, cannot continue", name);
+		goto out;
+
+	    }
+
+	    fsevent=create_fsevent(entry);
+
+	    if (fsevent) {
+
+		fsevent->path=path;
+		fsevent->pathallocated=1;
+
+		get_current_time(&fsevent->detect_time);
+
+		fsevent->fseventmask.attrib_event=fseventmask->attrib_event;
+		fsevent->fseventmask.xattr_event=fseventmask->xattr_event;
+		fsevent->fseventmask.file_event=fseventmask->file_event;
+		fsevent->fseventmask.move_event=fseventmask->move_event;
+		fsevent->fseventmask.fs_event=0;
+
+	    } else {
+
+		logoutput("evaluate_remote_fsevent: unable to create an fsevent for %s, cannot continue", name);
+
+	    }
+
+	} else {
+
+	    /* here: able to compare the outcome of lstat and the cached attributes
+		only where there is a difference, create an fsevent
+	    */
+
+	    /* first completly ignore what the remote notifyfs server/fs has reported, and take what the stat reports */
+
+	    fseventmask->attrib_event=0;
+	    fseventmask->xattr_event=0; /* do something else with this info */
+	    fseventmask->file_event=0;
+	    fseventmask->move_event=0;
+	    fseventmask->fs_event=0;
+
+	    if (st.st_mode != attr->cached_st.st_mode) {
+
+		fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_MODE;
+		attr->cached_st.st_mode=st.st_mode;
+
+	    }
+
+	    if (st.st_uid != attr->cached_st.st_uid) {
+
+		fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_OWNER;
+		attr->cached_st.st_uid=st.st_uid;
+
+	    }
+
+	    if (st.st_gid != attr->cached_st.st_gid) {
+
+		fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_GROUP;
+		attr->cached_st.st_gid=st.st_gid;
+
+	    }
+
+	    if (st.st_nlink != attr->cached_st.st_nlink) {
+
+		fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_NLINKS;
+		attr->cached_st.st_nlink=st.st_nlink;
+
+	    }
+
+	    if (st.st_size != attr->cached_st.st_size) {
+
+		fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_SIZE;
+		attr->cached_st.st_size=st.st_size;
+
+	    }
+
+	    /*
+
+		what to do with changes in ctime and mtime ??
+
+		attr->cached_st.st_ctime.tv_sec<st.st_ctim.tv_sec || 
+		(attr->cached_st.st_ctim.tv_sec==st.st_ctim.tv_sec && attr->cached_st.st_ctim.tv_nsec<st.st_ctim.tv_nsec) ||
+		attr->cached_st.st_mtim.tv_sec<st.st_mtim.tv_sec || 
+		(attr->cached_st.st_mtim.tv_sec==st.st_mtim.tv_sec && attr->cached_st.st_mtim.tv_nsec<st.st_mtim.tv_nsec)) {
+	    */
+
+
+	    if (fseventmask->file_event>0 || fseventmask->move_event>0 || fseventmask->xattr_event>0 || fseventmask->attrib_event>0) {
+
+		fsevent=create_fsevent(entry);
+
+		if (fsevent) {
+
+		    fsevent->fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+		    fsevent->path=path;
+		    fsevent->pathallocated=1;
+
+		    get_current_time(&fsevent->detect_time);
+
+		    fsevent->fseventmask.attrib_event=fseventmask->attrib_event;
+		    fsevent->fseventmask.xattr_event=fseventmask->xattr_event;
+		    fsevent->fseventmask.file_event=fseventmask->file_event;
+		    fsevent->fseventmask.move_event=fseventmask->move_event;
+		    fsevent->fseventmask.fs_event=0;
+
+		} else {
+
+		    logoutput("evaluate_remote_fsevent: unable to create an fsevent for %s, cannot continue", name);
+
+		}
+
+	    }
+
+	}
+
+    } else {
+
+	logoutput("evaluate_remote_fsevent: unable to create an inode for %s, cannot continue", name);
+
+    }
+
+    out:
+
+    if ( ! fsevent) {
+
+	if (path) {
+
+	    free(path);
+	    path=NULL;
+	}
+
+    }
+
+    return fsevent;
+
+}
