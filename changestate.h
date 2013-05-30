@@ -20,11 +20,31 @@
 #ifndef NOTIFYFS_CHANGESTATE_H
 #define NOTIFYFS_CHANGESTATE_H
 
+struct notifyfs_fsevent_struct {
+    unsigned char status;
+    struct fseventmask_struct fseventmask;
+    struct pathinfo_struct pathinfo;
+    struct timespec detect_time;
+    struct timespec process_time;
+    void *data;
+    int flags;
+    struct notifyfs_fsevent_struct *next;
+    struct notifyfs_fsevent_struct *prev;
+};
+
+
 // Prototypes
 
-void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent);
+void queue_fsevent(struct notifyfs_fsevent_struct *fsevent);
+
 struct notifyfs_fsevent_struct *create_fsevent(struct notifyfs_entry_struct *entry);
+void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
+void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
+
 void init_changestate(struct workerthreads_queue_struct *workerthreads_queue);
 struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *watch, struct fseventmask_struct *fseventmask, char *name);
+
+unsigned char directory_is_viewed(struct watch_struct *watch);
+void update_directory_count(struct watch_struct *watch, unsigned int count);
 
 #endif

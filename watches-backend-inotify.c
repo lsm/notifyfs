@@ -24,7 +24,6 @@
 #define INOTIFY_WATCH_LOOKUP_WATCH		2
 
 extern struct notifyfs_options_struct notifyfs_options;
-// extern void changestate(struct call_info_struct *call_info);
 
 static int inotify_fd=0;
 static struct epoll_extended_data_struct xdata_inotify;
@@ -325,12 +324,13 @@ static int translate_fseventmask_to_inotify(struct fseventmask_struct *fseventma
 
 */
 
-void set_watch_backend_inotify(struct watch_struct *watch, char *path)
+int set_watch_backend_inotify(struct watch_struct *watch)
 {
     int wd;
     int inotify_mask, inotify_mask_final;
     struct inotify_watch_struct *inotify_watch=NULL;
     char maskstring[64];
+    int nreturn=0;
 
     logoutput("set_watch_backend_inotify");
 
@@ -342,7 +342,8 @@ void set_watch_backend_inotify(struct watch_struct *watch, char *path)
 
 	/* fseventmask is not resulting in a os specific watch */
 
-	return;
+	nreturn=-EINVAL;
+	goto out;
 
     }
 
@@ -357,53 +358,28 @@ void set_watch_backend_inotify(struct watch_struct *watch, char *path)
 	if (inotify_watch->mask==inotify_mask) {
 
 	    logoutput("set_watch_backend_inotify: watch has been set before with the same mask: doing nothing");
-
-	    return;
-
-	}
-
-    }
-
-    if (! path) {
-	struct call_info_struct call_info;
-	struct notifyfs_entry_struct *entry;
-
-	/* path not set: construct it here */
-
-	entry=get_entry(watch->inode->alias);
-
-	init_call_info(&call_info, entry);
-
-	if (determine_path(&call_info, NOTIFYFS_PATH_NONE)<0) {
-
-	    logoutput("set_watch_backend_inotify: error");
-
-	    return;
+	    nreturn=-EEXIST;
+	    goto out;
 
 	}
-
-	path=call_info.path;
 
     }
 
     print_mask(inotify_mask, maskstring, 64);
 
-    logoutput("set_watch_backend_inotify: call inotify_add_watch on path %s and mask %i/%s", path, inotify_mask, maskstring);
+    logoutput("set_watch_backend_inotify: call inotify_add_watch on path %s and mask %i/%s", watch->pathinfo.path, inotify_mask, maskstring);
 
 
     /* add some sane flags and all events:
     */
 
-#ifdef IN_EXCL_UNLINK
-
-    inotify_mask_final=inotify_mask | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_ALL_EVENTS;
-
-#else
-
     inotify_mask_final=inotify_mask | IN_DONT_FOLLOW | IN_ALL_EVENTS;
 
-#endif
+#ifdef IN_EXCL_UNLINK
 
+    inotify_mask_final|=IN_EXCL_UNLINK;
+
+#endif
 
     if (inotify_watch) {
 
@@ -412,22 +388,23 @@ void set_watch_backend_inotify(struct watch_struct *watch, char *path)
 	    /* this will be probably always be true when the watch has been set before */
 
 	    logoutput("set_watch_backend_inotify: watch has been set before with the same mask: doing nothing");
-
-	    return;
+	    goto out;
 
 	}
 
     }
 
-    wd=inotify_add_watch(inotify_fd, path, inotify_mask_final);
+    wd=inotify_add_watch(inotify_fd, watch->pathinfo.path, inotify_mask_final);
 
     if ( wd==-1 ) {
+
+	nreturn=-errno;
 
         logoutput("set_watch_backend_inotify: setting inotify watch gives error: %i", errno);
 
 	/* safe to return ?? */
 
-	return;
+	goto out;
 
     }
 
@@ -459,14 +436,18 @@ void set_watch_backend_inotify(struct watch_struct *watch, char *path)
 
     }
 
+    out:
+
+    return nreturn;
+
 }
 
-void change_watch_backend_inotify(struct watch_struct *watch, char *path)
+int change_watch_backend_inotify(struct watch_struct *watch)
 {
 
     /* with inotify the changing of an existing is the same call as the adding of a new watch */
 
-    set_watch_backend_inotify(watch, path);
+    return set_watch_backend_inotify(watch);
 
 }
 
@@ -536,8 +517,6 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
     }
 
-    logoutput("evaluate_fsevent_inotify: inotify watch %i found", i_event->wd);
-
     /* get the notifyfs watch */
 
     watch=inotify_watch->watch;
@@ -551,20 +530,41 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
     }
 
+    logoutput("evaluate_fsevent_inotify: inotify watch %i on %s (len=%i) found", i_event->wd, watch->pathinfo.path, watch->pathinfo.len);
+
     init_notifyfs_fsevent(notifyfs_fsevent);
 
     fseventmask=&notifyfs_fsevent->fseventmask;
-
-    notifyfs_fsevent->watch=watch;
 
     /* get the entry on which the event occurs */
 
     if (i_event->len>0) {
 	char eventstring[32];
 
+	notifyfs_fsevent->pathinfo.path=malloc(watch->pathinfo.len + 2 + i_event->len);
+
+	if ( ! notifyfs_fsevent->pathinfo.path) {
+
+	    free(notifyfs_fsevent);
+	    notifyfs_fsevent=NULL;
+	    goto out;
+
+	}
+
+	notifyfs_fsevent->pathinfo.len=watch->pathinfo.len;
+
+	memcpy(notifyfs_fsevent->pathinfo.path, watch->pathinfo.path, notifyfs_fsevent->pathinfo.len);
+	*(notifyfs_fsevent->pathinfo.path+notifyfs_fsevent->pathinfo.len)='/';
+	notifyfs_fsevent->pathinfo.len++;
+	memcpy(notifyfs_fsevent->pathinfo.path+notifyfs_fsevent->pathinfo.len, i_event->name, i_event->len);
+	notifyfs_fsevent->pathinfo.len+=i_event->len;
+	*(notifyfs_fsevent->pathinfo.path+notifyfs_fsevent->pathinfo.len)='\0';
+
+	notifyfs_fsevent->pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
 	print_mask(i_event->mask, eventstring, 32);
 
-	logoutput("evaluate_fsevent_inotify: event on %s, mask %i/%s", i_event->name, i_event->mask, eventstring);
+	logoutput("evaluate_fsevent_inotify: event on %s, path %s, mask %i/%s", i_event->name, notifyfs_fsevent->pathinfo.path, i_event->mask, eventstring);
 
         /* something happens on an entry in the directory.. check it's in use
         by this fs, the find command will return NULL if it isn't 
@@ -583,17 +583,8 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
 		if (entry->inode>=0) {
 		    struct stat st;
-		    struct call_info_struct call_info;
 
-        	    init_call_info(&call_info, entry);
-
-        	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-        	    if (res<0) goto out;
-
-		    notifyfs_fsevent->path=call_info.path;
-		    notifyfs_fsevent->pathallocated=1;
-
-		    if (lstat(call_info.path, &st)==0) {
+		    if (lstat(notifyfs_fsevent->pathinfo.path, &st)==0) {
 			struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 			struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
@@ -648,7 +639,6 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
 		    }
 
-
 		} else {
 
 		    remove_entry(entry);
@@ -668,6 +658,23 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 	char eventstring[32];
 	char *name;
 
+	notifyfs_fsevent->pathinfo.path=malloc(watch->pathinfo.len + 1);
+
+	if ( ! notifyfs_fsevent->pathinfo.path) {
+
+	    free(notifyfs_fsevent);
+	    notifyfs_fsevent=NULL;
+	    goto out;
+
+	}
+
+	notifyfs_fsevent->pathinfo.len=watch->pathinfo.len;
+
+	memcpy(notifyfs_fsevent->pathinfo.path, watch->pathinfo.path, notifyfs_fsevent->pathinfo.len);
+	*(notifyfs_fsevent->pathinfo.path+notifyfs_fsevent->pathinfo.len)='\0';
+
+	notifyfs_fsevent->pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
 	print_mask(i_event->mask, eventstring, 32);
 
 	/*  event on watch self
@@ -681,7 +688,7 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
     }
 
-    notifyfs_fsevent->entry=entry;
+    notifyfs_fsevent->data=(void *) entry;
 
     if ( i_event->mask & IN_ACCESS ) {
 
@@ -736,32 +743,17 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 	    /* something happened on the attributes, but since there is no cache available (it's created)
 		it's not possible to determine what exactly */
 
-	    fseventmask->attrib_event=NOTIFYFS_FSEVENT_ATTR_NOTSET;
+	    fseventmask->attrib_event=NOTIFYFS_FSEVENT_ATTRIB_NOTSET;
 	    i_event->mask-=IN_ATTRIB;
 
 	} else {
-	    struct call_info_struct call_info;
 	    struct stat st;
 
-	    /* stat not defined: get it here */
-
-    	    init_call_info(&call_info, entry);
-
-    	    res=determine_path(&call_info, NOTIFYFS_PATH_FORCE);
-    	    if (res<0) goto out;
-
-	    if (! notifyfs_fsevent->path) {
-
-		notifyfs_fsevent->path=call_info.path;
-		notifyfs_fsevent->pathallocated=1;
-
-	    }
-
-	    if (lstat(call_info.path, &st)==-1) {
+	    if (lstat(notifyfs_fsevent->pathinfo.path, &st)==-1) {
 
 		/* strange case: i_event about entry, but stat gives error... */
 
-		logoutput("evaluate_fsevent_inotify: strange case.. event on %s but stat gives error %i", call_info.path, errno);
+		logoutput("evaluate_fsevent_inotify: strange case.. event on %s but stat gives error %i", notifyfs_fsevent->pathinfo.path, errno);
 
 		i_event->mask-=IN_ATTRIB;
 
@@ -985,8 +977,6 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
     }
 
     out:
-
-    logoutput("evaluate_fsevent_inotify: ready");
 
     return notifyfs_fsevent;
 

@@ -40,7 +40,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include <pwd.h>
+#include <grp.h>
+
 #include "logging.h"
+#include "notifyfs-fsevent.h"
 #include "notifyfs-io.h"
 #include "path-resolution.h"
 #include "options.h"
@@ -57,6 +61,7 @@ static void print_usage(const char *progname)
 	                "          [--logarea=NR,]\n"
 	                "          [--accessmode=NR,]\n"
 	                "          [--testmode]\n"
+	                "          [--enablefusefs=0/1, default 1]\n"
 	                "          [--fuseoptions=STRING]\n"
 	                "          [--forwardlocal=0/1, default 0]\n"
 	                "          [--forwardnetwork=0/1, default 0]\n"
@@ -92,6 +97,7 @@ static void print_help() {
 
     fprintf(stdout, "    --access=NUMBER            set accessmode (0=no check,1=root has access,2=check client)\n");
     fprintf(stdout, "    --testmode[=0/1]           enable testmode (1=testmode, 0=default)\n");
+    fprintf(stdout, "    --enablefusefs[=0/1]       enable testmode (1=enable fuse fs, 0=default)\n");
     fprintf(stdout, "    --forwardlocal[=0/1]       try to forward a watch to a local fs like a fuse fs (0=default)\n");
     fprintf(stdout, "    --forwardnetwork[=0/1]     try to forward a watch to a remote notifyfs server (0=default)\n");
     fprintf(stdout, "    --listennetwork[=0/1]      listen on the network for forwarded watches (0=default)\n");
@@ -331,6 +337,7 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 	{"logging", 		optional_argument, 		0, 0},
 	{"logarea", 		optional_argument, 		0, 0},
 	{"testmode", 		optional_argument,      	0, 0},
+	{"enablefusefs", 	optional_argument,      	0, 0},
 	{"accessmode", 		optional_argument,		0, 0},
 	{"socket", 		optional_argument,		0, 0},
 	{"listennetwork",	optional_argument,		0, 0},
@@ -364,6 +371,10 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
     notifyfs_options.accessmode=0;
 
+    /* enable the mounting of fuse fs */
+
+    notifyfs_options.enablefusefs=1;
+
     /* socket */
 
     memset(notifyfs_options.socket, '\0', PATH_MAX);
@@ -388,6 +399,10 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
     notifyfs_options.networkport=790;
 
+    /* do not use ipv6 for now */
+
+    notifyfs_options.ipv6=0;
+
     /* forwarding */
 
     notifyfs_options.forwardlocal=0;
@@ -397,6 +412,10 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
     /* hide system files */
 
     notifyfs_options.hidesystemfiles=1;
+
+    /* the group id for the shared memory */
+
+    notifyfs_options.shm_gid=0;
 
     /* start the fuse options with the program name, just like the normal argv */
 
@@ -484,6 +503,18 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 		    } else {
 
 			fprintf(stderr, "Warning: option --testmode requires an argument. Taking default.\n");
+
+		    }
+
+		} else if ( strcmp(long_options[long_options_index].name, "enablefuse")==0 ) {
+
+		    if ( optarg ) {
+
+			notifyfs_options.enablefusefs=(atoi(optarg)>0) ? 1 : 0;
+
+		    } else {
+
+			fprintf(stderr, "Warning: option --enablefusefs requires an argument. Taking default.\n");
 
 		    }
 
@@ -642,13 +673,6 @@ int read_global_settings_from_file(char *path)
 
 	if ( strcmp(option, "general.logging")==0 ) {
 
-	    if ( notifyfs_options.logging ) {
-
-		logoutput("logging already set");
-		continue;
-
-	    }
-
 	    if (strlen(value)>0) {
 
 		notifyfs_options.logging=atoi(value);
@@ -657,16 +681,17 @@ int read_global_settings_from_file(char *path)
 
 	} else if ( strcmp(option, "general.logarea")==0 ) {
 
-	    if ( notifyfs_options.logarea ) {
-
-		logoutput("logarea already set");
-		continue;
-
-	    }
-
 	    if (strlen(value)>0) {
 
 		notifyfs_options.logarea=atoi(value);
+
+	    }
+
+	} else if ( strcmp(option, "general.enablefusefs")==0 ) {
+
+	    if (strlen(value)>0) {
+
+		notifyfs_options.enablefusefs=(atoi(value)>0) ? 1 : 0;
 
 	    }
 
@@ -719,6 +744,23 @@ int read_global_settings_from_file(char *path)
 	    if (strlen(value)>0) {
 
 		notifyfs_options.listennetwork=(atoi(value)>0) ? 1 : 0;
+
+	    }
+
+	} else if ( strcmp(option, "shm.group")==0 ) {
+
+	    struct group *grp;
+
+    	    grp=getgrnam(value);
+
+    	    if ( grp ) {
+
+        	notifyfs_options.shm_gid=grp->gr_gid;
+        	logoutput("found shm group %s, gid %i", value, notifyfs_options.shm_gid);
+
+    	    } else {
+
+		logoutput("shm group %s not found", value);
 
 	    }
 

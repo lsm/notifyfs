@@ -39,43 +39,62 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "notifyfs-fsevent.h"
 #include "notifyfs-io.h"
 #include "notifyfs.h"
+
+#include "epoll-utils.h"
+
+#include "socket.h"
 
 #include "entry-management.h"
 #include "logging.h"
 #include "utils.h"
 
+#include "backend.h"
+#include "networkservers.h"
+
 #include "workerthreads.h"
-#include "message.h"
-#include "handlemessage.h"
+
+#include "message-base.h"
+#include "message-send.h"
+#include "message-receive.h"
 
 #include "path-resolution.h"
-#include "epoll-utils.h"
-#include "message-server.h"
-#include "client-io.h"
+#include "entry-management.h"
 #include "client.h"
 #include "handleclientmessage.h"
 #include "watches.h"
-#include "socket.h"
+
 #include "networkutils.h"
+#include "filesystem.h"
+
+#include "options.h"
 #include "changestate.h"
+
+extern struct notifyfs_options_struct notifyfs_options;
 
 #define NOTIFYFS_COMMAND_UPDATE				1
 #define NOTIFYFS_COMMAND_SETWATCH			2
 #define NOTIFYFS_COMMAND_REGISTER			3
 #define NOTIFYFS_COMMAND_SIGNOFF			4
 #define NOTIFYFS_COMMAND_FSEVENT			5
+#define NOTIFYFS_COMMAND_VIEW				6
+
+struct command_register_struct {
+    int mode;
+    unsigned char type;
+    char *data;
+};
 
 struct command_update_struct {
-    char *path;
-    unsigned char pathallocated;
+    struct pathinfo_struct pathinfo;
 };
 
 struct command_setwatch_struct {
-    char *path;
-    unsigned char pathallocated;
+    struct pathinfo_struct pathinfo;
     int owner_watch_id;
+    int view;
     struct fseventmask_struct fseventmask;
 };
 
@@ -87,18 +106,304 @@ struct command_fsevent_struct {
     unsigned char nameallocated;
 };
 
+struct command_view_struct {
+    int view;
+};
+
 struct clientcommand_struct {
     uint64_t unique;
     unsigned char type;
     struct notifyfs_owner_struct owner;
     union {
+	struct command_register_struct regis;
 	struct command_update_struct update;
 	struct command_setwatch_struct setwatch;
 	struct command_fsevent_struct fsevent;
+	struct command_view_struct view;
     } command;
 };
 
-static struct workerthreads_queue_struct *global_workerthreads_queue=NULL;
+static struct workerthreads_queue_struct *workerthreads_queue=NULL;
+
+
+/*
+    function to test a mount has a backend, and if so, forward the watch to that backend
+
+    the path on the remote host depends on the "root" of what has been shared (smb) or exported (nfs)
+
+    for example a nfs export from 192.168.0.2:/usr/share
+    is mounted at /data for example
+
+    now if a watch is set on /data/some/dir/to/watch, the corresponding path on 192.168.0.2 is
+    /usr/share/some/dir/to/watch
+
+    this is simple for nfs, it's a bit difficult for smb: the "rootpath" of the share is in
+    netbioslanguage, and is not a directory. For example:
+    the source of a mount is //mainserver/public, so the "share" name is public. For this 
+    host it's impossible to detect what directory/path this share is build with. So, it sends
+    the share name to the notifyfs server on mainserver like:
+
+    cifs:/public/some/dir/to/watch
+
+    and let it to the notifyfs process on mainserver to find out what directory the share
+    public is on (by parsing the smb.conf file for example)
+
+    for sshfs this can be also very complicated
+
+    using sshfs like:
+
+    sshfs sbon@192.168.0.2:/ ~/mount -o allow_other
+
+    works ok, since it mounts the root (/) at ~/mount, but it's a bit more complicated when
+
+    sshfs sbon@192.168.0.2: ~/mount -o allow_other
+
+    will take the home directory on 192.168.0.2 of sbon as root.
+
+    Now this host is also not able to determine the home of sbon on 192.168.0.2. To handle this case
+
+    a template is send:
+
+    sshfs:sbon@%HOME%/some/dir/to/watch
+
+*/
+
+
+static void forward_watch_backend(int mountindex, struct watch_struct *watch, char *path)
+{
+    struct notifyfs_mount_struct *mount=get_mount(mountindex);
+    struct supermount_struct *supermount=NULL;
+    struct notifyfs_backend_struct *backend=NULL;
+
+    supermount=find_supermount_majorminor(mount->major, mount->minor);
+
+    if (supermount) {
+
+	backend=supermount->backend;
+
+    } else {
+
+	logoutput("forward_watch_backend: no supermount found for %i:%i", mount->major, mount->minor);
+	return;
+
+    }
+
+    if ( ! backend ) {
+
+	logoutput("forward_watch_backend: no backend found for %i:%i - %s", mount->major, mount->minor, supermount->source);
+	return;
+
+    }
+
+    if (backend->type==NOTIFYFS_BACKENDTYPE_SERVER){
+	struct notifyfs_connection_struct *connection=backend->connection;
+	struct notifyfs_filesystem_struct *fs=NULL;
+
+    	fs=supermount->fs;
+
+	if ( ! fs ) {
+
+	    logoutput("forward_watch_backend: no filesystem found for %i:%i - %s", mount->major, mount->minor, fs->filesystem);
+	    return;
+
+	}
+
+	if ( ! fs->fsfunctions) {
+
+	    logoutput("forward_watch_backend: no fsfunctions found for %s", fs->filesystem);
+	    return;
+
+	}
+
+	if ( ! fs->fsfunctions->construct_url) {
+
+	    logoutput("forward_watch_backend: no construct url function found for %s", fs->filesystem);
+	    return;
+
+	}
+
+	if (backend->status==NOTIFYFS_BACKENDSTATUS_UP && connection) {
+	    struct notifyfs_entry_struct *entry=NULL;
+	    struct pathinfo_struct pathinfo={NULL, 0, 0};
+	    int res;
+
+	    logoutput("forward_watch_backend: network backend found on %s", path);
+
+	    entry=get_entry(mount->entry);
+	    res=determine_path_entry(entry, &pathinfo);
+
+	    if (pathinfo.path) {
+
+		if (issubdirectory(path, pathinfo.path, 1)>0) {
+		    int lenpath=strlen(path);
+		    pathstring url;
+		    uint64_t unique=new_uniquectr();
+
+		    if (lenpath==pathinfo.len) {
+
+			(*fs->fsfunctions->construct_url) (supermount->source, supermount->options, "/", url, sizeof(pathstring));
+
+		    } else {
+
+			(*fs->fsfunctions->construct_url) (supermount->source, supermount->options, path+pathinfo.len, url, sizeof(pathstring));
+
+		    }
+
+		    send_setwatch_message(connection->fd, unique, watch->ctr, (void *) url, -1, watch->fseventmask.attrib_event, watch->fseventmask.xattr_event, watch->fseventmask.file_event, watch->fseventmask.move_event);
+
+		}
+
+	    }
+
+	    free_path_pathinfo(&pathinfo);
+
+	}
+
+    } else if (backend->type==NOTIFYFS_BACKENDTYPE_FUSEFS){
+	struct notifyfs_connection_struct *connection=backend->connection;
+
+	if (backend->status==NOTIFYFS_BACKENDSTATUS_UP && connection) {
+	    struct notifyfs_entry_struct *entry=NULL;
+	    struct pathinfo_struct pathinfo={NULL, 0, 0};
+	    int res;
+
+	    logoutput("forward_watch_backend: fuse backend found on %s", path);
+
+	    entry=get_entry(mount->entry);
+	    res=determine_path_entry(entry, &pathinfo);
+
+	    if (pathinfo.path) {
+
+		if (issubdirectory(path, pathinfo.path, 1)>0) {
+		    int lenpath=strlen(path);
+		    uint64_t unique=new_uniquectr();
+
+		    if (lenpath==pathinfo.len) {
+
+			send_setwatch_message(connection->fd, unique, watch->ctr, "/", -1, watch->fseventmask.attrib_event, watch->fseventmask.xattr_event, watch->fseventmask.file_event, watch->fseventmask.move_event);
+
+		    } else {
+
+			send_setwatch_message(connection->fd, unique, watch->ctr, path+pathinfo.len, -1, watch->fseventmask.attrib_event, watch->fseventmask.xattr_event, watch->fseventmask.file_event, watch->fseventmask.move_event);
+
+		    }
+
+		}
+
+	    }
+
+	    free_path_pathinfo(&pathinfo);
+
+	}
+
+    } else if (backend->type==NOTIFYFS_BACKENDTYPE_LOCALHOST) {
+	struct notifyfs_entry_struct *entry=NULL;
+	struct pathinfo_struct pathinfo={NULL, 0, 0};
+	int res;
+	struct notifyfs_filesystem_struct *fs=NULL;
+
+    	fs=supermount->fs;
+
+	if ( ! fs ) {
+
+	    logoutput("forward_watch_backend: no filesystem found for %i:%i - %s", mount->major, mount->minor, fs->filesystem);
+	    return;
+
+	}
+
+	if ( ! fs->fsfunctions) {
+
+	    logoutput("forward_watch_backend: no fsfunctions found for %s", fs->filesystem);
+	    return;
+
+	}
+
+	if ( ! fs->fsfunctions->get_localpath) {
+
+	    logoutput("forward_watch_backend: no get localpath function found for %s", fs->filesystem);
+	    return;
+
+	}
+
+	logoutput("forward_watch_backend: local backend found on %s", path);
+
+	entry=get_entry(mount->entry);
+	res=determine_path_entry(entry, &pathinfo);
+
+	if (pathinfo.path) {
+
+	    if (issubdirectory(path, pathinfo.path, 1)>0) {
+		int lenpath=strlen(path);
+		char *localpath=NULL;
+
+		if (lenpath==pathinfo.len) {
+
+		    localpath=(*fs->fsfunctions->get_localpath) (fs->filesystem, supermount->options, supermount->source, "");
+
+		} else {
+
+		    localpath=(*fs->fsfunctions->get_localpath) (fs->filesystem, supermount->options, supermount->source, path+pathinfo.len);
+
+		}
+
+		if (localpath) {
+		    struct pathinfo_struct backend_pathinfo;
+		    struct stat st;
+
+		    logoutput("forward_watch_backend: local path %s found", localpath);
+
+		    backend_pathinfo.path=localpath;
+		    backend_pathinfo.len=strlen(localpath);
+		    backend_pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
+		    entry=create_notifyfs_path(&backend_pathinfo, &st, 0, 0, &res, 0, 0, 0);
+
+		    if (entry) {
+			struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+			struct notifyfs_owner_struct owner;
+			struct timespec current_time;
+
+			owner.type=NOTIFYFS_OWNERTYPE_SERVER;
+			owner.owner.remoteserver=get_local_server();
+
+			get_current_time(&current_time);
+
+			add_clientwatch(inode, &watch->fseventmask, watch->ctr, &owner, &backend_pathinfo, &current_time);
+
+		    }
+
+		    free_path_pathinfo(&backend_pathinfo);
+		    localpath=NULL;
+
+		}
+
+	    }
+
+	    free_path_pathinfo(&pathinfo);
+
+	}
+
+    }
+
+}
+
+void send_clientcommand_reply(struct clientcommand_struct *clientcommand, int error)
+{
+    struct notifyfs_connection_struct *connection=NULL;
+
+    if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	connection=clientcommand->owner.owner.localclient->connection;
+
+    } else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+
+	connection=clientcommand->owner.owner.remoteserver->connection;
+
+    }
+
+    if (connection) send_reply_message(connection->fd, clientcommand->unique, error, NULL, 0);
+
+}
 
 
 /* function to process the update command from a client 
@@ -107,59 +412,57 @@ static struct workerthreads_queue_struct *global_workerthreads_queue=NULL;
 
 static void process_command_update(struct clientcommand_struct *clientcommand)
 {
-    struct call_info_struct call_info;
     struct command_update_struct *command_update=&(clientcommand->command.update);
     struct notifyfs_entry_struct *entry, *parent;
     struct watch_struct *watch=NULL;
     struct notifyfs_inode_struct *inode;
     struct stat st;
+    int error=0;
 
-    logoutput("process_command_update: process path %s", command_update->path);
+    logoutput("process_command_update: process path %s", command_update->pathinfo.path);
 
-    init_call_info(&call_info, NULL);
-    call_info.path=command_update->path;
+    if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct client_struct *client=clientcommand->owner.owner.localclient;
 
-    /* make sure the path does exist (and lookup the entry and get stat) */
+	/*
+	    a local client: check the permissions
+	*/
 
-    create_notifyfs_path(&call_info, &st);
+	parent=create_notifyfs_path(&command_update->pathinfo, &st, 2, R_OK|X_OK, &error, client->pid, client->uid, client->gid);
 
-    parent=call_info.entry;
+    } else {
 
-    if (! parent) {
-        struct notifyfs_connection_struct *connection=NULL;
+	/*
+	    from a remote server: no permissions checking cause that has been done there already 
+	*/
 
-	if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	parent=create_notifyfs_path(&command_update->pathinfo, &st, 0, 0, &error, 0, 0, 0);
 
-	    connection=clientcommand->owner.owner.localclient->connection;
+    }
 
-	} else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+    if (! parent || error>0) {
+	error=(error>0) ? error : ENOENT;
 
-	    connection=clientcommand->owner.owner.remoteserver->connection;
-
-	}
-
-	if (connection) {
-	    logoutput("process_command_update: error creating path %s", call_info.path);
-
-	    /* here correct the fs 
-		and send an error
-	    */
-
-	    send_reply_message(connection->fd, clientcommand->unique, ENOENT, NULL, 0);
-
-	}
+	logoutput("process_command_update: error (%i:%s) creating path %s", error, strerror(error), command_update->pathinfo.path);
+	send_clientcommand_reply(clientcommand, error);
 
 	goto finish;
 
     }
 
-    /* if no watch has been set the contents is not cached
-
-	TODO: check the watch is watching "enough"
-
+    /*
+	if no watch has been set the contents is not cached
     */
 
     inode=get_inode(parent->inode);
+
+    if (! inode) {
+
+	logoutput("process_command_update: inode does not exist");
+	goto finish;
+
+    }
+
     watch=lookup_watch_inode(inode);
 
     if ( ! watch) {
@@ -170,36 +473,46 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 
 	attr=get_attr(inode->attr);
 
-	if (attr->mtim.tv_sec<st.st_mtim.tv_sec || 
-	    (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec) ) {
-	    int res;
-	    struct timespec rightnow;
+	if ( ! attr) {
 
-	    get_current_time(&rightnow);
+	    if (st.st_mode==0) lstat(command_update->pathinfo.path, &st);
+	    attr=assign_attr(&st, inode);
 
-	    /* when contents is changed (mtime is newer than the latest access) sync it */
+	}
 
-	    res=sync_directory_full(call_info.path, parent, &rightnow);
+	if ( attr) {
 
-	    if (res>=0) {
+	    if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec) ) {
+		int res;
+		struct timespec rightnow;
+		unsigned char createfsevent=1;
 
+		get_current_time(&rightnow);
 
-		remove_old_entries(parent, &rightnow);
+		/* when contents is changed (mtime is newer than the latest access) sync it */
+
+		res=sync_directory_full(command_update->pathinfo.path, parent, &rightnow, &createfsevent);
+
+		if (res>=0) {
+
+		    remove_old_entries(parent, &rightnow, &createfsevent);
+
+		} else {
+
+		    /* some error syncing the directory... what to do with the error
+		    */
+
+		    logoutput("process_command_update: error %i sync directory %s", res, command_update->pathinfo.path);
+
+		}
 
 	    } else {
+		struct timespec rightnow;
 
-		/* */
-
-		logoutput("process_command_update: error %i sync directory %s", res, call_info.path);
+		get_current_time(&rightnow);
+		sync_directory_simple(command_update->pathinfo.path, parent, &rightnow);
 
 	    }
-
-	} else {
-	    struct timespec rightnow;
-
-	    get_current_time(&rightnow);
-
-	    sync_directory_simple(call_info.path, parent, &rightnow);
 
 	}
 
@@ -207,32 +520,11 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 
     /* reply the sender */
 
-    if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
-	struct notifyfs_connection_struct *connection=clientcommand->owner.owner.localclient->connection;
-
-	if (connection) send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
-
-    } else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
-	struct notifyfs_connection_struct *connection=clientcommand->owner.owner.remoteserver->connection;
-
-	if (connection) send_reply_message(connection->fd, clientcommand->unique, 0, NULL, 0);
-
-    }
+    send_clientcommand_reply(clientcommand, 0);
 
     finish:
 
-    if (command_update->pathallocated==1) {
-
-	if (command_update->path) {
-
-	    free(command_update->path);
-	    command_update->path=NULL;
-
-	}
-
-	command_update->pathallocated=0;
-
-    }
+    free_path_pathinfo(&command_update->pathinfo);
 
 }
 
@@ -251,77 +543,269 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 
 static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 {
-    struct call_info_struct call_info;
     struct command_setwatch_struct *command_setwatch=&(clientcommand->command.setwatch);
-    struct notifyfs_entry_struct *entry;
+    struct notifyfs_entry_struct *entry=NULL;
+    struct notifyfs_inode_struct *inode=NULL;
+    int error=0;
+    struct watch_struct *watch=NULL;
+    struct clientwatch_struct *clientwatch=NULL;
+    struct client_struct *client=NULL;
+    struct view_struct *view=NULL;
+    struct stat st;
+    struct fseventmask_struct *fseventmask=&command_setwatch->fseventmask;
+    struct fseventmask_struct zero_fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
+    struct timespec current_time;
 
     logoutput("process_command_setwatch");
 
-    init_call_info(&call_info, NULL);
+    if (command_setwatch->view>=0) {
 
+	view=get_view(command_setwatch->view);
 
-    call_info.path=command_setwatch->path;
+	if ( !view ) {
 
-    /* make sure the path does exist (and lookup the entry) */
+	    logoutput("process_command_setwatch: view %i not found", command_setwatch->view);
+	    error=EINVAL;
+	    goto error;
 
-    create_notifyfs_path(&call_info, NULL);
+	} else {
 
-    entry=call_info.entry;
-
-    if (! entry) {
-        struct notifyfs_connection_struct *connection=NULL;
-
-	if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
-
-	    connection=clientcommand->owner.owner.localclient->connection;
-
-	} else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
-
-	    connection=clientcommand->owner.owner.remoteserver->connection;
+	    logoutput("process_command_setwatch: view %i found", command_setwatch->view);
 
 	}
-
-	logoutput("process_command_setwatch: error creating path %s", call_info.path);
-
-	/* here correct the fs 
-	    and send an error
-	*/
-
-	if (connection) {
-
-	    send_reply_message(connection->fd, clientcommand->unique, ENOENT, NULL, 0);
-
-	}
-
-	goto finish;
 
     }
 
-    if (command_setwatch->owner_watch_id>0) {
-	struct notifyfs_inode_struct *inode;
+    if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
 
-	inode=get_inode(entry->inode);
+	client=clientcommand->owner.owner.localclient;
 
-	/* with a local sender, add the mountindex also */
+	if (view) {
 
-	add_clientwatch(inode, &command_setwatch->fseventmask, command_setwatch->owner_watch_id, &clientcommand->owner, command_setwatch->path, call_info.mount);
+	    if (view->pid != client->pid) {
+
+		error=EINVAL;
+		logoutput("process_command_setwatch: error, client has pid %i, but view has pid %i", client->pid, view->pid);
+		goto error;
+
+	    }
+
+	    if (view->parent_entry>=0) {
+
+		entry=get_entry(view->parent_entry);
+
+	    }
+
+	}
+
+	if (entry) {
+	    int res;
+
+	    logoutput("process_command_setwatch: entry set");
+
+	    /* entry is known (from view): determine the path from here */
+
+	    res=determine_path(entry, &command_setwatch->pathinfo);
+
+	    if (res>=0) res=check_access_path(command_setwatch->pathinfo.path, client->pid, client->uid, client->gid, &st, R_OK|X_OK);
+
+	    if (res<0) {
+
+		error=abs(res);
+		goto error;
+
+	    }
+
+	    logoutput("process_command_setwatch: path %s found", command_setwatch->pathinfo.path);
+
+	} else {
+
+	    logoutput("process_command_setwatch: entry not set, path %s", command_setwatch->pathinfo.path);
+
+	    entry=create_notifyfs_path(&command_setwatch->pathinfo, &st, 2, R_OK, &error, client->pid, client->uid, client->gid);
+
+	}
+
+    } else {
+
+	if (view) {
+
+	    /* only a client can set a view */
+
+	    error=EINVAL;
+	    goto error;
+
+	}
+
+	/*
+	    from a remote server: no permissions checking cause that has been done there already 
+	*/
+
+	entry=create_notifyfs_path(&command_setwatch->pathinfo, &st, 0, 0, &error, 0, 0, 0);
+
+	if (st.st_mode==0) {
+
+	    lstat(command_setwatch->pathinfo.path, &st);
+
+	}
+
+    }
+
+    if (! entry || error>0) {
+
+	error=(error>0) ? error : ENOENT;
+	goto error;
+
+    }
+
+    inode=get_inode(entry->inode);
+
+    if (view) {
+
+	/* walk through all clientwatches used by this client */
+
+	clientwatch=client->clientwatches;
+
+	while(clientwatch) {
+
+	    if (clientwatch->view==view) {
+
+		watch=clientwatch->watch;
+
+		if (watch->inode != inode) clientwatch->view=NULL;
+
+	    }
+
+	    clientwatch=clientwatch->next_per_owner;
+
+	}
+
+	view->parent_entry=entry->index;
+
+	/* make sure the view is active: it is present in the hashtable */
+
+	activate_view(view);
+
+    }
+
+    get_current_time(&current_time);
+
+    clientwatch=add_clientwatch(inode, fseventmask, command_setwatch->owner_watch_id, &clientcommand->owner, &command_setwatch->pathinfo, &current_time);
+
+    if (clientwatch) {
+	struct watch_struct *watch=clientwatch->watch;
+
+	if (view) {
+
+	    clientwatch->view=view;
+
+	    /*
+		set status to synclevel 1
+		this means for the client that:
+		- watch has been set without error
+		- it can start synchronize it's own cache
+	    */
+
+	    logoutput("process_command_setwatch: set view %i to synclevel 1", view->index);
+
+	    pthread_mutex_lock(&view->mutex);
+	    view->status=NOTIFYFS_VIEWSTATUS_SYNCLEVEL1;
+	    pthread_cond_broadcast(&view->cond);
+	    pthread_mutex_unlock(&view->mutex);
+
+	}
+
+	if (notifyfs_options.listennetwork==0 && entry->mount>=0) {
+
+	    forward_watch_backend(entry->mount, watch, command_setwatch->pathinfo.path);
+
+	}
+
+	logoutput("process_command_setwatch: synchronize directory");
+
+	if (watch->create_time.tv_sec==current_time.tv_sec && watch->create_time.tv_nsec==current_time.tv_nsec) {
+	    struct notifyfs_attr_struct *attr;
+
+	    /* just created... */
+
+	    attr=get_attr(inode->attr);
+
+	    if (! attr) attr=assign_attr(&st, inode);
+
+	    /* check the directory needs a full sync or a simple one */
+
+	    if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec) ) {
+		unsigned char createfsevent=1;
+		int res;
+
+		/*
+		    when contents is changed (mtime is newer than the latest access) sync it 
+		    note that when there is created a view 
+
+		*/
+
+		logoutput("process_command_setwatch: full synchronize");
+
+		res=sync_directory_full(command_setwatch->pathinfo.path, entry, &current_time, &createfsevent);
+
+		if (res>=0) {
+		    unsigned int count=0;
+
+		    logoutput("process_command_setwatch: remove old entries");
+
+		    count=remove_old_entries(entry, &current_time, &createfsevent);
+		    update_directory_count(watch, count);
+
+		} else {
+
+		    /* */
+
+		    logoutput("process_command_view: error %i sync directory %s", res, command_setwatch->pathinfo.path);
+
+		}
+
+	    } else {
+		unsigned int count=0;
+
+		logoutput("process_command_setwatch: simple synchronize");
+
+		count=sync_directory_simple(command_setwatch->pathinfo.path, entry, &current_time);
+		update_directory_count(watch, count);
+
+	    }
+
+	} else {
+	    unsigned int count=0;
+
+	    logoutput("process_command_setwatch: simple synchronize");
+
+	    count=sync_directory_simple(command_setwatch->pathinfo.path, entry, &current_time);
+	    update_directory_count(watch, count);
+
+	}
+
+	if (view) {
+
+	    logoutput("process_command_setwatch: set view %i to synclevel 3", view->index);
+
+	    pthread_mutex_lock(&view->mutex);
+	    view->status=NOTIFYFS_VIEWSTATUS_SYNCLEVEL3;
+	    pthread_cond_broadcast(&view->cond);
+	    pthread_mutex_unlock(&view->mutex);
+
+	}
 
     }
 
     finish:
 
-    if (command_setwatch->pathallocated==1) {
+    free_path_pathinfo(&command_setwatch->pathinfo);
+    return;
 
-	if (command_setwatch->path) {
+    error:
 
-	    free(command_setwatch->path);
-	    command_setwatch->path=NULL;
-
-	}
-
-	command_setwatch->pathallocated=0;
-
-    }
+    logoutput("process_command_setwatch: error (%i:%s)", error, strerror(error));
+    send_clientcommand_reply(clientcommand, error);
 
 }
 
@@ -340,18 +824,49 @@ static void process_command_register(struct clientcommand_struct *clientcommand)
 
 	connection=client->connection;
 
-	lock_client(client);
-	client->status=NOTIFYFS_CLIENTSTATUS_UP;
-	unlock_client(client);
+	if (clientcommand->command.regis.type==NOTIFYFS_CLIENTTYPE_APP) {
+
+	    logoutput("process_command_register: handle a normal app");
+
+	    lock_client(client);
+
+	    client->status=NOTIFYFS_CLIENTSTATUS_UP;
+	    client->type=NOTIFYFS_CLIENTTYPE_APP;
+	    client->mode=clientcommand->command.regis.mode;
+
+	    unlock_client(client);
+
+	} else if (clientcommand->command.regis.type==NOTIFYFS_CLIENTTYPE_FUSEFS ) {
+
+	    /* here transform the client to a fuse fs backend */
+
+	    lock_client(client);
+	    client->status=NOTIFYFS_CLIENTSTATUS_UP;
+	    client->type=NOTIFYFS_CLIENTTYPE_FUSEFS;
+	    unlock_client(client);
+
+	    /* futher action is taken when it's mounted */
+
+	    if (clientcommand->command.regis.data) {
+
+		logoutput("process_command_register: handle a fuse fs (data: %s)", clientcommand->command.regis.data);
+
+		client->data=clientcommand->command.regis.data;
+		clientcommand->command.regis.data=NULL;
+
+	    } else {
+
+		logoutput("process_command_register: handle a fuse fs (no path)");
+
+	    }
+
+	}
 
     } else if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
 	struct notifyfs_server_struct *server=clientcommand->owner.owner.remoteserver;
 
 	connection=server->connection;
-
-	lock_notifyfs_server(server);
-	server->status=NOTIFYFS_SERVERSTATUS_UP;
-	unlock_notifyfs_server(server);
+	change_status_server(server, NOTIFYFS_SERVERSTATUS_UP);
 
     }
 
@@ -383,9 +898,7 @@ static void process_command_signoff(struct clientcommand_struct *clientcommand)
 
 	connection=server->connection;
 
-	lock_notifyfs_server(server);
-	server->status=NOTIFYFS_SERVERSTATUS_DOWN;
-	unlock_notifyfs_server(server);
+	change_status_server(server, NOTIFYFS_SERVERSTATUS_DOWN);
 
     }
 
@@ -428,7 +941,6 @@ static void process_command_fsevent(struct clientcommand_struct *clientcommand)
     }
 
     fsevent=evaluate_remote_fsevent(watch, fseventmask, command_fsevent->name);
-
     if (fsevent) queue_fsevent(fsevent);
 
     finish:
@@ -446,8 +958,196 @@ static void process_command_fsevent(struct clientcommand_struct *clientcommand)
 
     }
 
+}
+
+static void process_command_view(struct clientcommand_struct *clientcommand)
+{
+    struct command_view_struct *command_view=&(clientcommand->command.view);
+    struct notifyfs_entry_struct *entry=NULL;
+    struct view_struct *view=NULL;
+    struct stat st;
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct client_struct *client=NULL;
+    int error=0, res;
+
+    logoutput("process_command_view");
+
+    if (clientcommand->owner.type!=NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	/* only a client can set a view */
+
+	error=EINVAL;
+	goto finish;
+
+    }
+
+    client=clientcommand->owner.owner.localclient;
+
+    view=get_view(command_view->view);
+
+    if ( !view ) {
+
+	logoutput("process_command_view: view %i not found", command_view->view);
+	error=EINVAL;
+	goto finish;
+
+    }
+
+    /* activate the view.. means adding to a hashtable */
+
+    activate_view(view);
+
+    entry=get_entry(view->parent_entry);
+
+    if (entry) {
+
+	/*
+	    check the permissions
+        */
+
+	res=determine_path(entry, &pathinfo);
+
+	if (res==0) {
+
+	    res=check_access_path(pathinfo.path, client->pid, client->uid, client->gid, &st, R_OK|X_OK);
+
+	    if (res<0) error=-res;
+
+	} else if (res<0) {
+
+	    error=-res;
+
+	}
+
+    }
+
+    if (! entry || error>0) {
+
+	error=(error>0) ? error : ENOENT;
+
+	if (error==EACCES) {
+
+	    logoutput("process_command_view: client has not enough permissions");
+
+	} else if (error==ENOENT) {
+
+	    logoutput("process_command_view: path does not exist");
+
+	} else {
+
+	    if (pathinfo.path) {
+
+		logoutput("process_command_view: error %i:%s when access path %s", error, strerror(error), pathinfo.path);
+
+	    } else {
+
+		logoutput("process_command_view: error %i:%s when determing path", error, strerror(error));
+
+	    }
+
+	}
+
+    } else {
+
+	if ( ! S_ISDIR(st.st_mode)) {
+
+	    logoutput("process_command_view: %s is not a directory, can only view a directory", pathinfo.path);
+	    error=ENOTDIR;
+
+	}
+
+    }
+
+    finish:
+
+    /* when error then ready */
+
+    if (error>0) {
+
+	send_clientcommand_reply(clientcommand, error);
+
+    } else {
+	struct watch_struct *watch=NULL;
+	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+
+	/* a valid view */
+
+	send_clientcommand_reply(clientcommand, 0);
+
+	pthread_mutex_lock(&view->mutex);
+	view->status=NOTIFYFS_VIEWSTATUS_SYNCLEVEL1;
+	pthread_cond_broadcast(&view->cond);
+	pthread_mutex_unlock(&view->mutex);
+
+	watch=lookup_watch_inode(inode);
+
+	if ( ! watch) {
+	    struct timespec current_time;
+	    struct notifyfs_attr_struct *attr;
+
+	    /* object is not watched : so check it manually */
+
+	    attr=get_attr(inode->attr);
+
+	    if ( ! attr) {
+
+		/* stat st is set while checking permissions .. */
+
+		attr=assign_attr(&st, inode);
+
+	    }
+
+	    if (attr) {
+
+		/* check the directory needs a full sync or a simple one */
+
+		if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec) ) {
+		    struct timespec rightnow;
+		    unsigned char createfsevent=1;
+
+		    get_current_time(&rightnow);
+
+		    /* when contents is changed (mtime is newer than the latest access) sync it */
+
+		    res=sync_directory_full(pathinfo.path, entry, &rightnow, &createfsevent);
+
+		    if (res>=0) {
+
+			remove_old_entries(entry, &rightnow, &createfsevent);
+
+		    } else {
+
+			/* */
+
+			logoutput("process_command_view: error %i sync directory %s", res, pathinfo.path);
+
+		    }
+
+		} else {
+		    struct timespec rightnow;
+
+		    get_current_time(&rightnow);
+
+		    sync_directory_simple(pathinfo.path, entry, &rightnow);
+
+		}
+
+	    }
+
+	}
+
+	pthread_mutex_lock(&view->mutex);
+	view->status=NOTIFYFS_VIEWSTATUS_SYNCLEVEL2;
+	pthread_cond_broadcast(&view->cond);
+	pthread_mutex_unlock(&view->mutex);
+
+    }
+
+    free_path_pathinfo(&pathinfo);
 
 }
+
+
 
 static void process_command(void *data)
 {
@@ -473,6 +1173,10 @@ static void process_command(void *data)
 
 	process_command_fsevent(clientcommand);
 
+    } else if (clientcommand->type==NOTIFYFS_COMMAND_VIEW ) {
+
+	process_command_view(clientcommand);
+
     }
 
     free(clientcommand);
@@ -488,6 +1192,17 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
     if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
 	logoutput("handle register message: received a register from client");
+
+	if (register_message->type==NOTIFYFS_CLIENTTYPE_FUSEFS) {
+
+	    if ( ! buff ) {
+
+		logoutput("handle register message: received a register from a fuse fs, but buffer empty");
+		goto error;
+
+	    }
+
+	}
 
     } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
@@ -525,6 +1240,7 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
 
 	client->pid=register_message->pid;
 
+
     }
 
     /* process the register futher in a thread */
@@ -538,23 +1254,43 @@ void handle_register_message(int fd, void *data,  struct notifyfs_register_messa
 
 	clientcommand->unique=register_message->unique;
 
+	clientcommand->command.regis.type=register_message->type;
+	clientcommand->command.regis.data=NULL;
+
 	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
-
 	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
+
+	    if (register_message->type==NOTIFYFS_CLIENTTYPE_FUSEFS) {
+
+	    	if (buff) {
+
+	    	    clientcommand->command.regis.data=strdup((char *) buff);
+
+	    	    if (! clientcommand->command.regis.data) {
+
+	    		logoutput("handle_register_message: no memory to allocate %s", (char *) buff);
+	    		goto error;
+
+	    	    }
+
+	    	}
+
+	    }
 
 	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
-
 	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
+
 
 	}
 
 	clientcommand->type=NOTIFYFS_COMMAND_REGISTER;
+	clientcommand->command.regis.mode=register_message->mode;
 
-	workerthread=get_workerthread(global_workerthreads_queue);
+	workerthread=get_workerthread(workerthreads_queue);
 
 	if (workerthread) {
 
@@ -639,7 +1375,7 @@ void handle_signoff_message(int fd, void *data, struct notifyfs_signoff_message 
 
 	clientcommand->type=NOTIFYFS_COMMAND_SIGNOFF;
 
-	workerthread=get_workerthread(global_workerthreads_queue);
+	workerthread=get_workerthread(workerthreads_queue);
 
 	if (workerthread) {
 
@@ -716,13 +1452,11 @@ void handle_update_message(int fd, void *data, struct notifyfs_update_message *u
 	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
-
 	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
 
 	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
 	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
-
 	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
 
 	}
@@ -732,20 +1466,22 @@ void handle_update_message(int fd, void *data, struct notifyfs_update_message *u
 	/* path is first part of buffer
 	*/
 
-	clientcommand->command.update.pathallocated=0;
+	clientcommand->command.update.pathinfo.flags=0;
+	clientcommand->command.update.pathinfo.len=0;
 
-	clientcommand->command.update.path=strdup((char *) buff);
+	clientcommand->command.update.pathinfo.path=strdup((char *) buff);
 
-	if ( ! clientcommand->command.update.path) {
+	if ( ! clientcommand->command.update.pathinfo.path) {
 
 	    logoutput("handle_update_message: no memory to allocate %s", (char *) buff);
 	    goto error;
 
 	}
 
-	clientcommand->command.update.pathallocated=1;
+	clientcommand->command.update.pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+	clientcommand->command.update.pathinfo.len=len;
 
-	workerthread=get_workerthread(global_workerthreads_queue);
+	workerthread=get_workerthread(workerthreads_queue);
 
 	if (workerthread) {
 
@@ -777,13 +1513,7 @@ void handle_update_message(int fd, void *data, struct notifyfs_update_message *u
 
     if (clientcommand) {
 
-	if (clientcommand->command.update.pathallocated==1) {
-
-	    free(clientcommand->command.update.path);
-	    clientcommand->command.update.path=NULL;
-	    clientcommand->command.update.pathallocated=0;
-
-	}
+	free_path_pathinfo(&clientcommand->command.update.pathinfo);
 
 	free(clientcommand);
 	clientcommand=NULL;
@@ -822,14 +1552,6 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
     }
 
-    if (!buff) {
-
-	logoutput("handle setwatch message: buffer is empty, cannot continue");
-	goto error;
-
-    }
-
-
     clientcommand=malloc(sizeof(struct clientcommand_struct));
 
     if (clientcommand) {
@@ -853,29 +1575,35 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
 	clientcommand->type=NOTIFYFS_COMMAND_SETWATCH;
 
-	clientcommand->command.setwatch.path=NULL;
-	clientcommand->command.setwatch.pathallocated=0;
+	clientcommand->command.setwatch.pathinfo.path=NULL;
+	clientcommand->command.setwatch.pathinfo.flags=0;
+	clientcommand->command.setwatch.pathinfo.len=0;
 
-	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+	if (buff) {
 
-	    /* path is first part of buffer */
+	    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
-	    clientcommand->command.setwatch.path=strdup((char *) buff);
+		/* path is first part of buffer */
 
-	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+		clientcommand->command.setwatch.pathinfo.path=strdup((char *) buff);
 
-	    clientcommand->command.setwatch.path=process_notifyfsurl((char *) buff);
+	    } else if (typedata==NOTIFYFS_OWNERTYPE_BACKEND) {
+
+		clientcommand->command.setwatch.pathinfo.path=process_notifyfsurl((char *) buff);
+
+	    }
+
+	    if ( ! clientcommand->command.setwatch.pathinfo.path) {
+
+		logoutput("handle_setwatch_message: no memory to allocate %s", (char *) buff);
+		goto error;
+
+	    }
 
 	}
 
-	if ( ! clientcommand->command.setwatch.path) {
-
-	    logoutput("handle_setwatch_message: no memory to allocate %s", (char *) buff);
-	    goto error;
-
-	}
-
-	clientcommand->command.setwatch.pathallocated=1;
+	clientcommand->command.setwatch.pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+	clientcommand->command.setwatch.pathinfo.len=strlen(clientcommand->command.setwatch.pathinfo.path);
 
 	clientcommand->command.setwatch.owner_watch_id=setwatch_message->watch_id;
 
@@ -885,7 +1613,9 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 	clientcommand->command.setwatch.fseventmask.file_event=setwatch_message->fseventmask.file_event;
 	clientcommand->command.setwatch.fseventmask.fs_event=setwatch_message->fseventmask.fs_event;
 
-	workerthread=get_workerthread(global_workerthreads_queue);
+	clientcommand->command.setwatch.view=setwatch_message->view;
+
+	workerthread=get_workerthread(workerthreads_queue);
 
 	if (workerthread) {
 
@@ -915,13 +1645,7 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
     if (clientcommand) {
 
-	if (clientcommand->command.setwatch.pathallocated==1) {
-
-	    free(clientcommand->command.setwatch.path);
-	    clientcommand->command.setwatch.path=NULL;
-	    clientcommand->command.setwatch.pathallocated=0;
-
-	}
+	free_path_pathinfo(&clientcommand->command.setwatch.pathinfo);
 
 	free(clientcommand);
 	clientcommand=NULL;
@@ -942,11 +1666,12 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 
     if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 
-	logoutput("handle fsevent message: received an fsevent from client");
+	logoutput("handle fsevent message: received an fsevent from client: impossible");
+	goto error;
 
-    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+    } else if (typedata==NOTIFYFS_OWNERTYPE_BACKEND) {
 
-	logoutput("handle fsevent message: received an fsevent from server");
+	logoutput("handle fsevent message: received an fsevent from server/backend");
 
     } else {
 
@@ -964,20 +1689,8 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
 
 	clientcommand->unique=fsevent_message->unique;
-
-	if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
-
-	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
-
-	    clientcommand->owner.owner.localclient=(struct client_struct *) data;
-
-	} else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
-
-	    clientcommand->owner.type=NOTIFYFS_OWNERTYPE_SERVER;
-
-	    clientcommand->owner.owner.remoteserver=(struct notifyfs_server_struct *) data;
-
-	}
+	clientcommand->owner.type=NOTIFYFS_OWNERTYPE_BACKEND;
+	clientcommand->owner.owner.backend=(struct notifyfs_backend_struct *) data;
 
 	clientcommand->type=NOTIFYFS_COMMAND_FSEVENT;
 
@@ -1025,7 +1738,7 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 
 	}
 
-	workerthread=get_workerthread(global_workerthreads_queue);
+	workerthread=get_workerthread(workerthreads_queue);
 
 	if (workerthread) {
 
@@ -1055,6 +1768,19 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 
     if (clientcommand) {
 
+	if (clientcommand->command.fsevent.nameallocated==1) {
+
+	    if (clientcommand->command.fsevent.name) {
+
+		free(clientcommand->command.fsevent.name);
+		clientcommand->command.fsevent.name=NULL;
+
+	    }
+
+	    clientcommand->command.fsevent.nameallocated=0;
+
+	}
+
 	free(clientcommand);
 	clientcommand=NULL;
 
@@ -1064,15 +1790,105 @@ void handle_fsevent_message(int fd, void *data, struct notifyfs_fsevent_message 
 
 }
 
-void init_handleclientmessage(struct workerthreads_queue_struct *workerthreads_queue)
+void handle_view_message(int fd, void *data, struct notifyfs_view_message *view_message, void *buff, int len, unsigned char typedata)
+{
+    struct clientcommand_struct *clientcommand=NULL;
+
+    if (typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
+
+	logoutput("handle view message: received a view from client");
+
+    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER || typedata==NOTIFYFS_OWNERTYPE_BACKEND) {
+
+	logoutput("handle view message: received a view from server");
+
+	/*  view messages only from a client */
+
+	goto error;
+
+    } else {
+
+	logoutput("handle view message: received a view from unknown sender, cannot continue");
+	goto error;
+
+    }
+
+    /* some sanity checks */
+
+    if (view_message->view<0) {
+
+	logoutput("handle view message: error: view index not positive..");
+	goto error;
+
+    }
+
+    clientcommand=malloc(sizeof(struct clientcommand_struct));
+
+    if (clientcommand) {
+	struct workerthread_struct *workerthread;
+
+	memset(clientcommand, 0, sizeof(struct clientcommand_struct));
+
+	clientcommand->unique=view_message->unique;
+
+	/* owner is always a (local) client */
+
+	clientcommand->owner.type=NOTIFYFS_OWNERTYPE_CLIENT;
+	clientcommand->owner.owner.localclient=(struct client_struct *) data;
+	clientcommand->type=NOTIFYFS_COMMAND_VIEW;
+
+	clientcommand->command.view.view=view_message->view;
+
+	workerthread=get_workerthread(workerthreads_queue);
+
+	if (workerthread) {
+
+	    workerthread->processevent_cb=process_command;
+	    workerthread->data=(void *) clientcommand;
+
+	    signal_workerthread(workerthread);
+
+	} else {
+
+	    /* no free thread.... what now ?? */
+
+	    logoutput("handle_view_message: no free thread...");
+	    goto error;
+
+	}
+
+    } else {
+
+	logoutput("handle_view_message: cannot allocate clientcommand");
+
+    }
+
+    return;
+
+    error:
+
+    if (clientcommand) {
+
+	free(clientcommand);
+	clientcommand=NULL;
+
+    }
+
+    return;
+
+}
+
+
+void init_handleclientmessage(struct workerthreads_queue_struct *threads_queue)
 {
 
-    global_workerthreads_queue=workerthreads_queue;
+    workerthreads_queue=threads_queue;
 
     assign_notifyfs_message_cb_register(handle_register_message);
     assign_notifyfs_message_cb_signoff(handle_signoff_message);
     assign_notifyfs_message_cb_update(handle_update_message);
     assign_notifyfs_message_cb_setwatch(handle_setwatch_message);
     assign_notifyfs_message_cb_fsevent(handle_fsevent_message);
+    assign_notifyfs_message_cb_view(handle_view_message);
 
 }

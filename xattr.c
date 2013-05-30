@@ -35,7 +35,6 @@
 
 #include <sys/stat.h>
 #include <sys/param.h>
-#include <sys/inotify.h>
 
 #include <pthread.h>
 
@@ -48,30 +47,31 @@
 #include <fuse/fuse_lowlevel.h>
 
 #include "logging.h"
+
+#include "notifyfs-fsevent.h"
+#include "notifyfs-io.h"
 #include "notifyfs.h"
+
 #include "entry-management.h"
 #include "path-resolution.h"
 #include "xattr.h"
 #include "options.h"
 
-
 extern struct notifyfs_options_struct notifyfs_options;
 
-int setxattr4workspace(struct call_info_struct *call_info, const char *name, const char *value)
+int setxattr4workspace(struct notifyfs_entry_struct *entry, const char *name, const char *value)
 {
     int nvalue, nreturn=-ENOATTR;
 
-    if ( isrootentry(call_info->entry)==1 ) {
+    if ( isrootentry(entry)==1 ) {
 
-	// setting system values only on root entry
+#ifdef LOGGING
 
 	if ( strcmp(name, "logging")==0 ) {
 
 	    nvalue=atoi(value);
 
 	    if ( nvalue>=0 ) {
-
-		logoutput1("setxattr: value found %i", nvalue);
 
 		loglevel=nvalue;
 		nreturn=0;
@@ -92,8 +92,6 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
 
 	    if ( nvalue>=0 ) {
 
-		logoutput1("setxattr: value found %i", nvalue);
-
 		logarea=nvalue;
 		nreturn=0;
 
@@ -106,6 +104,8 @@ int setxattr4workspace(struct call_info_struct *call_info, const char *name, con
             goto out;
 
 	}
+
+#endif
 
     }
 
@@ -172,21 +172,16 @@ static void fill_in_simplestring(struct xattr_workspace_struct *xattr_workspace,
 
 }
 
-void getxattr4workspace(struct call_info_struct *call_info, const char *name, struct xattr_workspace_struct *xattr_workspace)
+void getxattr4workspace(struct notifyfs_entry_struct *entry, const char *name, struct xattr_workspace_struct *xattr_workspace)
 {
 
     xattr_workspace->nerror=-ENOATTR; /* start with attr not found */
 
+    if ( isrootentry(entry)==1 ) {
 
-    logoutput2("getxattr4workspace, name: %s, size: %i", name, xattr_workspace->size);
-
-    if ( isrootentry(call_info->entry)==1 ) {
-
-	// only the system related
+#ifdef LOGGING 
 
 	if ( strcmp(name, "logging")==0 ) {
-
-            logoutput3("getxattr4workspace, found: logging");
 
 	    xattr_workspace->nerror=0;
 
@@ -194,9 +189,9 @@ void getxattr4workspace(struct call_info_struct *call_info, const char *name, st
 
             return;
 
-	} else	if ( strcmp(name, "logarea")==0 ) {
+	}
 
-            logoutput3("getxattr4workspace, found: logarea");
+	if ( strcmp(name, "logarea")==0 ) {
 
 	    xattr_workspace->nerror=0;
 
@@ -204,23 +199,15 @@ void getxattr4workspace(struct call_info_struct *call_info, const char *name, st
 
             return;
 
-	} else if ( strcmp(name, "socket")==0 ) {
+	}
 
-            logoutput3("getxattr4workspace, found: socket");
+#endif
+
+	if ( strcmp(name, "socket")==0 ) {
 
 	    xattr_workspace->nerror=0;
 
 	    fill_in_simplestring(xattr_workspace, notifyfs_options.socket);
-
-            return;
-
-        } else if ( strcmp(name, "accessmode")==0 ) {
-
-            logoutput3("getxattr4workspace, found: accessmode");
-
-	    xattr_workspace->nerror=0;
-
-	    fill_in_simpleinteger(xattr_workspace, notifyfs_options.accessmode);
 
             return;
 
@@ -239,8 +226,6 @@ static int add_xattr_to_list(struct xattr_workspace_struct *xattr_workspace, cha
     unsigned nlenxattr=0;
 
     nlenxattr=strlen(xattr_workspace->name);
-
-    // logoutput2("add_xattr_to_list, name : %s, size: %zd, len so far: %i", xattr_workspace->name, xattr_workspace->size, xattr_workspace->nlen);
 
     if ( xattr_workspace->size==0 ) {
 
@@ -277,14 +262,10 @@ static int add_xattr_to_list(struct xattr_workspace_struct *xattr_workspace, cha
 }
 
 
-int listxattr4workspace(struct call_info_struct *call_info, char *list, size_t size)
+int listxattr4workspace(struct notifyfs_entry_struct *entry, char *list, size_t size)
 {
     unsigned nlenlist=0;
     struct xattr_workspace_struct *xattr_workspace;
-
-
-    logoutput2("listxattr4workspace");
-
 
     xattr_workspace=malloc(sizeof(struct xattr_workspace_struct));
 
@@ -314,12 +295,10 @@ int listxattr4workspace(struct call_info_struct *call_info, char *list, size_t s
 
     if ( ! list ) size=0;
 
+    if ( isrootentry(entry)==1 ) {
 
-    // system related attributes, only available on root
 
-    if ( isrootentry(call_info->entry)==1 ) {
-
-	// level of logging
+#ifdef LOGGING
 
 	memset(xattr_workspace->name, '\0', LINE_MAXLEN);
 	snprintf(xattr_workspace->name, LINE_MAXLEN, "system.%s_logging", XATTR_SYSTEM_NAME);
@@ -327,26 +306,16 @@ int listxattr4workspace(struct call_info_struct *call_info, char *list, size_t s
 	nlenlist=add_xattr_to_list(xattr_workspace, list);
 	if ( size > 0 && nlenlist > size ) goto out;
 
-	// area to log
-
 	memset(xattr_workspace->name, '\0', LINE_MAXLEN);
 	snprintf(xattr_workspace->name, LINE_MAXLEN, "system.%s_logarea", XATTR_SYSTEM_NAME);
 
 	nlenlist=add_xattr_to_list(xattr_workspace, list);
 	if ( size > 0 && nlenlist > size ) goto out;
 
-	// socket
+#endif
 
 	memset(xattr_workspace->name, '\0', LINE_MAXLEN);
 	snprintf(xattr_workspace->name, LINE_MAXLEN, "system.%s_socket", XATTR_SYSTEM_NAME);
-
-	nlenlist=add_xattr_to_list(xattr_workspace, list);
-	if ( size > 0 && nlenlist > size ) goto out;
-
-	// accessmode
-
-	memset(xattr_workspace->name, '\0', LINE_MAXLEN);
-	snprintf(xattr_workspace->name, LINE_MAXLEN, "system.%s_accessmode", XATTR_SYSTEM_NAME);
 
 	nlenlist=add_xattr_to_list(xattr_workspace, list);
 	if ( size > 0 && nlenlist > size ) goto out;

@@ -20,13 +20,6 @@
 #ifndef NOTIFYFS_WATCHES_H
 #define NOTIFYFS_WATCHES_H
 
-#define NOTIFYFS_FSEVENT_DATANAME_LEN				255
-
-#define NOTIFYFS_FSEVENT_STATUS_NONE				0
-#define NOTIFYFS_FSEVENT_STATUS_WAITING				1
-#define NOTIFYFS_FSEVENT_STATUS_PROCESSED			2
-#define NOTIFYFS_FSEVENT_STATUS_DONE				3
-
 /*
     create a structure to distinguish the different watch masks
 
@@ -51,18 +44,17 @@
 
 */
 
-#define NOTIFYFS_WATCHMASK_SELF					1
-#define NOTIFYFS_WATCHMASK_CHILDS				2
-
 struct watch_struct {
     unsigned long ctr;
     struct notifyfs_inode_struct *inode;
+    struct pathinfo_struct pathinfo;
     struct fseventmask_struct fseventmask;
     unsigned int nrwatches;
     struct clientwatch_struct *clientwatches;
     pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    unsigned char lock;
+    unsigned long long count;
+    struct timespec create_time;
+    struct timespec change_time;
     struct watch_struct *next_hash;
     struct watch_struct *prev_hash;
     struct watch_struct *next;
@@ -71,42 +63,17 @@ struct watch_struct {
 
 struct clientwatch_struct {
     struct fseventmask_struct fseventmask;
-    int view;
     struct watch_struct *watch;
     struct notifyfs_owner_struct notifyfs_owner;
     int owner_watch_id;
+    struct view_struct *view;
     struct clientwatch_struct *next_per_watch;
     struct clientwatch_struct *prev_per_watch;
     struct clientwatch_struct *next_per_owner;
     struct clientwatch_struct *prev_per_owner;
 };
 
-/* struct to identify and process an event 
-    like:
-    a create, change or delete of a file/directory
-    a mount or unmount
-    a lock
-*/
-
-struct notifyfs_fsevent_struct {
-    unsigned char status;
-    struct fseventmask_struct fseventmask;
-    struct notifyfs_entry_struct *entry;
-    char *path;
-    unsigned char pathallocated;
-    struct timespec detect_time;
-    struct timespec process_time;
-    struct lock_entry_struct *lock_entry;
-    struct watch_struct *watch;
-    struct mount_entry_struct *mount_entry;
-    struct notifyfs_fsevent_struct *next;
-    struct notifyfs_fsevent_struct *prev;
-};
-
-
 // Prototypes
-
-char *determine_path_entry(struct notifyfs_entry_struct *entry);
 
 void init_watch_hashtables();
 
@@ -121,7 +88,7 @@ struct watch_struct *lookup_watch_list(unsigned long ctr);
 void add_watch_to_list(struct watch_struct *watch);
 void remove_watch_from_list(struct watch_struct *watch);
 
-void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *owner, char *path, int mount);
+struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, struct pathinfo_struct *pathinfo, struct timespec *update_time);
 void remove_clientwatch_from_owner(struct clientwatch_struct *clientwatch, unsigned char sendmessage);
 
 void remove_clientwatches(struct notifyfs_owner_struct *owner);
@@ -131,18 +98,12 @@ void remove_clientwatches_server(struct notifyfs_server_struct *server);
 void initialize_fsnotify_backends();
 void close_fsnotify_backends();
 
-void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
-void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
-
-void set_watch_backend_os_specific(struct watch_struct *watch, char *path);
-void change_watch_backend_os_specific(struct watch_struct *watch, char *path);
+int set_watch_backend_os_specific(struct watch_struct *watch);
+int change_watch_backend_os_specific(struct watch_struct *watch);
 void remove_watch_backend_os_specific(struct watch_struct *watch);
 
-int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time);
-void remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time);
-void sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time);
-
-unsigned char merge_fseventmasks(struct fseventmask_struct *maska, struct fseventmask_struct *maskb);
-void replace_fseventmask(struct fseventmask_struct *maska, struct fseventmask_struct *maskb);
+int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent);
+unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent);
+unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time);
 
 #endif

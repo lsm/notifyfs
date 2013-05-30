@@ -44,13 +44,12 @@
 #include <pthread.h>
 #include <syslog.h>
 
-#define LOGGING
-
 #define LOG_LOGAREA LOG_LOGAREA_MAINLOOP
 
 #include "logging.h"
 #include "epoll-utils.h"
 #include "workerthreads.h"
+#include "mountinfo.h"
 #include "mountinfo-monitor.h"
 #include "handlemountinfoevent.h"
 
@@ -67,7 +66,7 @@ static void process_mountinfo(void *data)
 
 /*
  * process an event the mountinfo
- */
+*/
 
 int process_mountinfo_event(int fd, void *data, uint32_t events)
 {

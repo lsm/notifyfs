@@ -38,19 +38,16 @@
 #include <pthread.h>
 #include <time.h>
 
-#include "notifyfs-io.h"
-#include "notifyfs.h"
-
-#include "entry-management.h"
 #include "logging.h"
 #include "utils.h"
-#include "path-resolution.h"
 #include "epoll-utils.h"
-#include "message.h"
-#include "watches.h"
+
 #include "socket.h"
-#include "client-io.h"
 #include "client.h"
+#include "simple-list.h"
+
+
+extern unsigned long new_owner_id();
 
 struct client_struct *clients_list=NULL;
 pthread_mutex_t clients_list_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -80,11 +77,13 @@ struct client_struct *create_client(unsigned int fd, pid_t pid, uid_t uid, gid_t
 	pthread_mutex_init(&client->mutex, NULL);
 
 	client->status=NOTIFYFS_CLIENTSTATUS_NOTSET;
+	client->mode=0;
 
 	client->buffer=NULL;
 	client->lenbuffer=0;
 
 	client->clientwatches=NULL;
+	client->data=NULL;
 
     }
 
@@ -111,6 +110,24 @@ void remove_client(struct client_struct *client)
 
 }
 
+void add_client_to_list(struct client_struct *client)
+{
+    if ( clients_list ) clients_list->prev=client;
+    client->next=clients_list;
+    client->prev=NULL;
+    clients_list=client;
+}
+
+void remove_client_from_list(struct client_struct *client)
+{
+    if (client->next) client->next->prev=client->prev;
+    if (client->prev) client->prev->next=client->next;
+
+    if (client==clients_list) clients_list=client->next;
+
+}
+
+
 /* function to register a client
 
    important to first check the client is already in the list, so registered befor
@@ -118,13 +135,13 @@ void remove_client(struct client_struct *client)
 
 */
 
-struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid_t gid, unsigned char type)
+struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid_t gid, unsigned char type, int mode)
 {
     struct client_struct *client=NULL;
 
     logoutput("register_client: for pid %i", (int) pid);
 
-    pthread_mutex_lock(&clients_list_mutex);
+    lock_clientslist();
 
     /* check existing clients */
 
@@ -137,7 +154,7 @@ struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid
 
     }
 
-    pthread_mutex_unlock(&clients_list_mutex);
+    unlock_clientslist();
 
     if ( client ) {
 
@@ -151,14 +168,14 @@ struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid
 
 	if ( client) {
 
-	    pthread_mutex_lock(&clients_list_mutex);
+	    lock_clientslist();
 
-	    if ( clients_list ) clients_list->prev=client;
-	    client->next=clients_list;
-	    client->prev=NULL;
-	    clients_list=client;
+	    add_client_to_list(client);
 
-	    pthread_mutex_unlock(&clients_list_mutex);
+	    unlock_clientslist();
+
+	    client->owner_id=new_owner_id();
+	    client->mode=mode;
 
 	}
 

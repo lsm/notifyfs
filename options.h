@@ -19,6 +19,8 @@
 #ifndef NOTIFYFS_OPTIONS_H
 #define NOTIFYFS_OPTIONS_H
 
+#define NOTIFYFS_REMOTESERVERS_FILE_DEFAULT	"/etc/notifyfs/servers"
+
 struct notifyfs_options_struct {
     pathstring socket;
     char *mountpoint;
@@ -29,10 +31,13 @@ struct notifyfs_options_struct {
     int logarea;
     unsigned char accessmode;
     unsigned char testmode;
+    unsigned char enablefusefs;
     unsigned char forwardlocal;
     unsigned char forwardnetwork;
     unsigned char listennetwork;
     unsigned char hidesystemfiles;
+    unsigned char ipv6;
+    gid_t shm_gid;
     int networkport;
     double attr_timeout;
     double entry_timeout;

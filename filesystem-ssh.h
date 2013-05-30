@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -17,16 +17,12 @@
 
 */
 
-#ifndef NOTIFYFS_MESSAGE_SERVER_H
-#define NOTIFYFS_MESSAGE_SERVER_H
+#ifndef NOTIFYFS_FILESYSTEM_SSH_H
+#define NOTIFYFS_FILESYSTEM_SSH_H
 
 
 // Prototypes
 
-void send_reply_message(int fd, uint64_t unique, int error, void *buffer, size_t size);
-void send_delwatch_message(int fd, uint64_t unique, unsigned long id);
-void send_changewatch_message(int fd, uint64_t unique, unsigned long id, unsigned char action);
-void send_fsevent_message(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, int entryindex, struct timespec *detect_time, unsigned char indir);
-void send_fsevent_message_remote(int fd, uint64_t unique, unsigned long id, struct fseventmask_struct *fseventmask, char *name, struct timespec *detect_time);
+void register_ssh_functions();
 
 #endif

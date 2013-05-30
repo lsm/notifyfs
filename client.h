@@ -24,7 +24,9 @@
 #define NOTIFYFS_CLIENTSTATUS_DOWN      2
 #define NOTIFYFS_CLIENTSTATUS_SLEEP     3
 
+
 struct client_struct {
+    unsigned long owner_id;
     unsigned char type;
     pid_t pid;
     pid_t tid;
@@ -34,15 +36,17 @@ struct client_struct {
     struct client_struct *prev;
     pthread_mutex_t mutex;
     unsigned char status;
+    int mode;
     void *clientwatches;
     struct notifyfs_connection_struct *connection;
     char *buffer;
     size_t lenbuffer;
+    void *data;
 };
 
 // Prototypes
 
-struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid_t gid, unsigned char type);
+struct client_struct *register_client(unsigned int fd, pid_t pid, uid_t uid, gid_t gid, unsigned char type, int mode);
 struct client_struct *lookup_client(pid_t pid, unsigned char lockset);
 void remove_client(struct client_struct *client);
 
@@ -53,5 +57,8 @@ struct client_struct *get_next_client(struct client_struct *client);
 
 void lock_client(struct client_struct *client);
 void unlock_client(struct client_struct *client);
+
+void add_client_to_list(struct client_struct *client);
+void remove_client_from_list(struct client_struct *client);
 
 #endif

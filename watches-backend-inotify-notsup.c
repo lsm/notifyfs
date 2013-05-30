@@ -17,13 +17,13 @@
 
 */
 
-static inline void set_watch_backend_inotify(struct watch_struct *watch, char *path)
+static inline int set_watch_backend_inotify(struct watch_struct *watch, char *path)
 {
-    return;
+    return 0;
 }
-static inline void change_watch_backend_inotify(struct watch_struct *watch, char *path)
+static inline int change_watch_backend_inotify(struct watch_struct *watch, char *path)
 {
-    return;
+    return 0;
 }
 static inline void remove_watch_backend_inotify(struct watch_struct *watch)
 {

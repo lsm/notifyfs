@@ -39,11 +39,10 @@
 
 #include <glib.h>
 
-#include <fuse/fuse_lowlevel.h>
-
 #define LOG_LOGAREA LOG_LOGAREA_MOUNTMONITOR
 
 #include "logging.h"
+#include "notifyfs-fsevent.h"
 #include "notifyfs-io.h"
 #include "entry-management.h"
 #include "path-resolution.h"
@@ -405,9 +404,10 @@ static struct notifyfs_entry_struct *get_notifyfs_entry(ino_t ino, pid_t pid)
 
 	    init_call_info(&call_info, NULL);
 
-	    call_info.path=sympath;
+	    call_info.pathinfo.path=sympath;
+	    call_info.strict=0;
 
-	    create_notifyfs_path(&call_info, NULL);
+	    create_notifyfs_path(&call_info);
 
 	    entry=call_info.entry;
 

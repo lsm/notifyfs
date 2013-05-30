@@ -22,5 +22,6 @@
 // Prototypes
 
 void init_handleclientmessage(struct workerthreads_queue_struct *workerthreads_queue);
+int determine_path_entry(struct notifyfs_entry_struct *entry, struct pathinfo_struct *pathinfo);
 
 #endif

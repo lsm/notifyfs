@@ -38,36 +38,46 @@
 #include <dirent.h>
 #include <pthread.h>
 
-#include <fuse/fuse_lowlevel.h>
-
-#include "entry-management.h"
-#include "path-resolution.h"
 #include "logging.h"
+
+#include "utils.h"
+#include "simple-list.h"
+#include "workerthreads.h"
+
+#include "notifyfs-fsevent.h"
 #include "notifyfs.h"
 #include "notifyfs-io.h"
-#include "utils.h"
-#include "message.h"
-#include "client-io.h"
+
+#include "mountinfo.h"
+#include "filesystem.h"
+
+#include "epoll-utils.h"
+#include "socket.h"
+#include "entry-management.h"
+#include "path-resolution.h"
+
+#include "backend.h"
+#include "networkservers.h"
+
+#include "message-base.h"
+#include "message-send.h"
+
 #include "client.h"
 #include "watches.h"
-#include "mountinfo.h"
-#include "epoll-utils.h"
-#include "message-server.h"
-#include "path-resolution.h"
-#include "socket.h"
 
-#include "workerthreads.h"
-#include "networkutils.h"
-
+#include "options.h"
 #include "changestate.h"
+
 
 #define LOG_LOGAREA LOG_LOGAREA_FILESYSTEM
 #define MAXIMUM_PROCESS_FSEVENTS_NRTHREADS	4
 
 extern struct notifyfs_options_struct notifyfs_options;
 extern struct fuse_chan *notifyfs_chan;
+extern struct simple_group_struct group_view;
 
 static struct workerthreads_queue_struct *global_workerthreads_queue=NULL;
+static char *rootpath="/";
 
 struct fsevents_queue_struct {
     struct notifyfs_fsevent_struct *first;
@@ -76,182 +86,76 @@ struct fsevents_queue_struct {
     int nrthreads;
 };
 
-/* initialize the main queue for fsevents */
-
 struct fsevents_queue_struct main_fsevents_queue={NULL, NULL, PTHREAD_MUTEX_INITIALIZER, 0};
 
-static int check_pathlen(struct notifyfs_entry_struct *entry)
+static void remove_fsevent_from_queue(struct notifyfs_fsevent_struct *fsevent)
 {
-    int len=1;
-    struct notifyfs_inode_struct *inode;
-    char *name;
+    /* remove the previous event from queue */
 
-    while(entry) {
+    if (main_fsevents_queue.first==fsevent) main_fsevents_queue.first=fsevent->next;
 
-	inode=get_inode(entry->inode);
+    if (fsevent->prev) fsevent->prev->next=fsevent->next;
+    if (fsevent->next) fsevent->next->prev=fsevent->prev;
 
-	if (inode) {
-
-	    /* check the inode status: if pending to be removed or already removed then ready */
-
-	    if (inode->status==FSEVENT_INODE_STATUS_TOBEREMOVED || inode->status==FSEVENT_INODE_STATUS_REMOVED ) {
-
-		/* if a part of the path is removed already or to be removed assume it's already in progress */
-
-		len=-EINPROGRESS;
-		break;
-
-	    } else if (entry->parent>=0 && (inode->status==FSEVENT_INODE_STATUS_TOBEUNMOUNTED || inode->status==FSEVENT_INODE_STATUS_UNMOUNTED)) {
-
-		/* if a parent is (to be) unmounted then assume it's already in  progress 
-		TEST THIS !!! it's possible that events are mixed up like:
-		unmount, then direct a create of a new file in this directory
-		this event may not be ignored !! */
-
-		len=-EINPROGRESS;
-		break;
-
-	    }
-
-	}
-
-	/* add the lenght of entry->name plus a slash for every name */
-
-	name=get_data(entry->name);
-
-	len+=strlen(name)+1;
-
-	entry=get_entry(entry->parent);
-
-	if (isrootentry(entry)==1) break;
-
-    }
-
-    return len;
+    if (main_fsevents_queue.last==fsevent) main_fsevents_queue.last=fsevent->prev;
 
 }
 
-static int determine_path_custom(struct notifyfs_fsevent_struct *fsevent)
+struct notifyfs_fsevent_struct *create_fsevent(struct notifyfs_entry_struct *entry)
 {
-    struct notifyfs_entry_struct *entry=fsevent->entry;
-    char *pos;
-    int nreturn=0, len;
-    char *name;
-    char *path;
+    struct notifyfs_fsevent_struct *fsevent=NULL;
 
-    if (isrootentry(entry)==1) {
+    fsevent=malloc(sizeof(struct notifyfs_fsevent_struct));
 
-	nreturn=3;
+    if (fsevent) {
 
-    } else {
-
-	nreturn=check_pathlen(entry);
-	if (nreturn<0) goto error;
+	init_notifyfs_fsevent(fsevent);
+	fsevent->data=(void *)entry;
 
     }
 
-    fsevent->path=malloc(nreturn);
-
-    if ( ! fsevent->path) {
-
-	nreturn=-ENOMEM;
-	goto error;
-
-    }
-
-    fsevent->pathallocated=1;
-
-    pos=fsevent->path+nreturn-1;
-    *pos='\0';
-
-    while (entry) {
-
-	name=get_data(entry->name);
-
-	len=strlen(name);
-	pos-=len;
-
-	memcpy(pos, name, len);
-
-	pos--;
-	*pos='/';
-
-	entry=get_entry(entry->parent);
-
-	if (isrootentry(entry)==1) break;
-
-    }
-
-    return nreturn;
-
-    error:
-
-    if (fsevent->path) {
-
-	free(fsevent->path);
-	fsevent->path=NULL;
-	fsevent->pathallocated=0;
-
-    }
-
-    return nreturn;
+    return fsevent;
 
 }
 
-/* check an entry is in the view
-    in case this is a view part of a clientwatch, it's possible that the name boundaries are not set yet ...
-    normally when a watch is set, it's part of a monitor message
-    after this the client will get the contents of the directory 
-    and then it will "know" the boundaries, ie the first and the last name
-    untill then these names are not set
-*/
-
-static unsigned char entry_in_view(struct notifyfs_entry_struct *entry, struct view_struct *view)
+void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
 {
 
-    if (!view) return 1;
+    fsevent->status=0;
 
-    if (view->order==NOTIFYFS_INDEX_TYPE_NAME) {
+    fsevent->fseventmask.cache_event=0;
+    fsevent->fseventmask.attrib_event=0;
+    fsevent->fseventmask.xattr_event=0;
+    fsevent->fseventmask.file_event=0;
+    fsevent->fseventmask.move_event=0;
+    fsevent->fseventmask.fs_event=0;
 
-	if (view->first_entry>=0) {
-	    struct notifyfs_entry_struct *first_entry=get_entry(view->first_entry);
+    fsevent->pathinfo.path=NULL;
+    fsevent->pathinfo.flags=0;
+    fsevent->pathinfo.len=0;
 
-	    if (entry->nameindex_value<first_entry->nameindex_value) {
+    fsevent->detect_time.tv_sec=0;
+    fsevent->detect_time.tv_nsec=0;
+    fsevent->process_time.tv_sec=0;
+    fsevent->process_time.tv_nsec=0;
 
-		return 0;
+    fsevent->data=NULL;
+    fsevent->flags=0;
 
-	    } else if (entry->nameindex_value==first_entry->nameindex_value) {
-		char *name=get_data(entry->name);
-		char *first_name=get_data(first_entry->name);
-
-		if (strcmp(first_name, name)>0) return 0;
-
-	    }
-
-	}
-
-	if (view->last_entry>=0) {
-	    struct notifyfs_entry_struct *last_entry=get_entry(view->last_entry);
-
-	    if (entry->nameindex_value>last_entry->nameindex_value) {
-
-		return 0;
-
-	    } else if (entry->nameindex_value==last_entry->nameindex_value) {
-		char *name=get_data(entry->name);
-		char *last_name=get_data(last_entry->name);
-
-		if (strcmp(last_name, name)<0) return 0;
-
-	    }
-
-	}
-
-    }
-
-    return 1;
+    fsevent->next=NULL;
+    fsevent->prev=NULL;
 
 }
+
+void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
+{
+
+    free_path_pathinfo(&fsevent->pathinfo);
+    free(fsevent);
+
+}
+
+/* function to test a fsevent (fseventmaskb) applies to the mask of a (clientwatch) fseventmask (fseventmaska) */
 
 static unsigned char check_fsevent_applies(struct fseventmask_struct *fseventmaska, struct fseventmask_struct *fseventmaskb, unsigned char indir)
 {
@@ -347,12 +251,132 @@ static unsigned char check_fsevent_applies(struct fseventmask_struct *fseventmas
 }
 
 /*
-    TODO: add the situation fsevent is on watch
+
+    update the count (of entries) in a directory
+
+    determine the views by walking in the hashtable group_view
+
 */
 
-static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_fsevent_struct *fsevent, unsigned char indir)
+void update_directory_count(struct watch_struct *watch, unsigned int count)
 {
     struct clientwatch_struct *clientwatch=NULL;
+
+    lock_watch(watch);
+
+    watch->count=count;
+    clientwatch=watch->clientwatches;
+
+    while(clientwatch) {
+
+	if (clientwatch->view) {
+	    struct view_struct *view=clientwatch->view;
+
+	    pthread_mutex_lock(&view->mutex);
+
+	    if (view->count != count) {
+
+		logoutput("update_directory_count: refresh count of view from %i to %i", view->count, count);
+
+		view->count=count;
+		pthread_cond_broadcast(&view->cond);
+
+	    }
+
+	    pthread_mutex_unlock(&view->mutex);
+
+	}
+
+	clientwatch=clientwatch->next_per_watch;
+
+    }
+
+    unlock_watch(watch);
+
+}
+
+unsigned char directory_is_viewed(struct watch_struct *watch)
+{
+    struct clientwatch_struct *clientwatch=NULL;
+    unsigned char is_viewed=0;
+
+    lock_watch(watch);
+
+    clientwatch=watch->clientwatches;
+
+    while(clientwatch) {
+
+	if (clientwatch->view) {
+
+	    is_viewed=1;
+	    break;
+
+	}
+
+	clientwatch=clientwatch->next_per_watch;
+
+    }
+
+    unlock_watch(watch);
+
+    return is_viewed;
+
+}
+
+
+void change_status_view(struct view_struct *view, unsigned char status)
+{
+
+    pthread_mutex_lock(&view->mutex);
+
+    view->status=status;
+
+    pthread_cond_broadcast(&view->cond);
+    pthread_mutex_unlock(&view->mutex);
+
+}
+
+static void signalviewaboutfsevent(struct view_struct *view, struct notifyfs_fsevent_struct *fsevent)
+{
+    int mode=0;
+    struct client_struct *client=NULL;
+    struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *) fsevent->data;
+
+    pthread_mutex_lock(&view->mutex);
+
+    client=lookup_client(view->pid, 0);
+    if (client) mode=client->mode;
+
+    if (entry_in_view(entry, view)==1) {
+	int j=view->queue_index;
+
+	view->eventqueue[j].fseventmask.cache_event=fsevent->fseventmask.cache_event;
+	view->eventqueue[j].fseventmask.attrib_event=fsevent->fseventmask.attrib_event;
+	view->eventqueue[j].fseventmask.xattr_event=fsevent->fseventmask.xattr_event;
+	view->eventqueue[j].fseventmask.file_event=fsevent->fseventmask.file_event;
+	view->eventqueue[j].fseventmask.move_event=fsevent->fseventmask.move_event;
+	view->eventqueue[j].fseventmask.fs_event=0;
+
+	view->eventqueue[j].entry=entry->index;
+
+	logoutput("notiyfs_clients: broadcast for view %i, entry %i, index queue %i", view->index, entry->index, j);
+
+	view->queue_index=(view->queue_index + 1) % NOTIFYFS_VIEWQUEUE_LEN;
+
+	pthread_cond_broadcast(&view->cond);
+
+    }
+
+    pthread_mutex_unlock(&view->mutex);
+
+}
+
+
+static void send_fsevent_to_owners(struct watch_struct *watch, struct notifyfs_fsevent_struct *fsevent, unsigned char indir, struct simple_group_struct *group_owner)
+{
+    struct clientwatch_struct *clientwatch=NULL;
+
+    logoutput("send_fsevent_to_owners: watch id %li", watch->ctr);
 
     pthread_mutex_lock(&watch->mutex);
 
@@ -361,101 +385,98 @@ static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_
     while (clientwatch) {
 
 	if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
-	    struct client_struct *client;
+	    struct client_struct *client=clientwatch->notifyfs_owner.owner.localclient;
 
-	    client=clientwatch->notifyfs_owner.owner.localclient;
+	    if (clientwatch->view) {
 
-    	    if ( client ) {
+		signalviewaboutfsevent(clientwatch->view, fsevent);
 
-		logoutput("send_fsevent_to_clients: test client %i is up", (int) client->pid);
+	    } else if (group_owner) {
 
-        	if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
+		/* check the event is not already send to the client */
 
-		    logoutput("send_fsevent_to_clients: test client watch of %i applies", (int) client->pid);
+		if ( ! lookup_simple_list(group_owner, (void *) &clientwatch->notifyfs_owner)) {
 
-		    if (indir==1) {
+		    if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask, indir)==1) {
+			uint64_t unique=new_uniquectr();
+			struct notifyfs_connection_struct *connection=client->connection;
+			struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *) fsevent->data;
 
-			/* test here the client is interested in the event */
+			/* send message */
 
-			if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask, 1)==1) {
-			    struct view_struct *view=get_view(clientwatch->view);
-
-			    if (entry_in_view(fsevent->entry, view)==1) {
-				struct notifyfs_connection_struct *connection=client->connection;
-
-				logoutput("send_fsevent_to_clients: entry part of view, check for connection");
-
-				if (connection) {
-    				    uint64_t unique=new_uniquectr();
-
-				    /* send message */
-
-				    send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time, 1);
-
-				}
-
-			    }
-
-			}
-
-		    } else {
-
-			/* event on watch */
-
-			if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask, 0)==1) {
-			    struct notifyfs_connection_struct *connection=client->connection;
-
-			    logoutput("send_fsevent_to_clients: entry part of view, check for connection");
-
-			    if (connection) {
-    				uint64_t unique=new_uniquectr();
-
-				/* send message */
-
-				send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, fsevent->entry->index, &fsevent->detect_time, 0);
-
-			    }
-
-			}
+			send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, entry->index, &fsevent->detect_time, indir);
 
 		    }
 
 		}
 
+	    } else {
+
+		if (check_fsevent_applies(&clientwatch->fseventmask, &fsevent->fseventmask, indir)==1) {
+		    uint64_t unique=new_uniquectr();
+		    struct notifyfs_connection_struct *connection=client->connection;
+		    struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *) fsevent->data;
+
+		    /* send message */
+
+		    send_fsevent_message(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, entry->index, &fsevent->detect_time, indir);
+
+		}
+
 	    }
 
-	} else if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
-	    struct notifyfs_server_struct *server;
 
-	    server=clientwatch->notifyfs_owner.owner.remoteserver;
+	} else if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+	    struct notifyfs_server_struct *server=clientwatch->notifyfs_owner.owner.remoteserver;
 
 	    /* when the watch is set/owned by a remote server: always send a message, don't test it's in a view etcetera
 	    */
 
-	    if (server) {
+	    if (server->type==NOTIFYFS_SERVERTYPE_NETWORK) {
+		struct notifyfs_connection_struct *connection=server->connection;
 
-		if (server->status==NOTIFYFS_SERVERSTATUS_UP) {
-		    struct notifyfs_connection_struct *connection=server->connection;
+		if (server->status==NOTIFYFS_SERVERSTATUS_UP && connection) {
+    		    uint64_t unique=new_uniquectr();
 
-		    logoutput("send_fsevent_to_clients: remote server up, check for connection");
+		    if (indir==1) {
+			struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *) fsevent->data;
+			char *name=get_data(entry->name);
 
-		    if (connection) {
-    			uint64_t unique=new_uniquectr();
+			/* send message */
 
-			if (indir==1) {
-			    char *name=get_data(fsevent->entry->name);
+			send_fsevent_message_remote(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, name, &fsevent->detect_time);
 
-			    /* send message */
+		    } else {
 
-			    send_fsevent_message_remote(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, name, &fsevent->detect_time);
-
-			} else {
-
-			    send_fsevent_message_remote(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, NULL, &fsevent->detect_time);
-
-			}
+			send_fsevent_message_remote(connection->fd, unique, clientwatch->owner_watch_id, &fsevent->fseventmask, NULL, &fsevent->detect_time);
 
 		    }
+
+		}
+
+	    } else if (server->type==NOTIFYFS_SERVERTYPE_LOCALHOST) {
+		struct watch_struct *orig_watch=lookup_watch_list(clientwatch->owner_watch_id);
+
+		if (orig_watch) {
+		    struct notifyfs_fsevent_struct *related_fsevent=NULL;
+
+		    if (indir==0) {
+
+			/* event on watch, so this also counts on the corresponding watch */
+
+			related_fsevent=evaluate_remote_fsevent(orig_watch, &fsevent->fseventmask, NULL);
+
+		    } else {
+			struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *) fsevent->data;
+			char *name=get_data(entry->name);
+
+			/* event "in" directory of watch */
+
+			related_fsevent=evaluate_remote_fsevent(orig_watch, &fsevent->fseventmask, name);
+
+		    }
+
+		    if (related_fsevent) queue_fsevent(related_fsevent);
 
 		}
 
@@ -471,38 +492,81 @@ static void send_fsevent_to_clients(struct watch_struct *watch, struct notifyfs_
 
 }
 
-/*
-    function which looks for watches which have to be notified when fsevent occurs
-    it's possible that there is a watch set on the fsevent->entry, but also
-    on the parent of that one
+/* hash function to identify the owner, by using the connection with the unique fd
 */
 
-static void check_for_watches(struct notifyfs_fsevent_struct *fsevent)
+int owner_hashfunction(void *data)
+{
+    struct notifyfs_owner_struct *owner=(struct notifyfs_owner_struct *) data;
+    struct notifyfs_connection_struct *connection=NULL;
+
+    if (owner->type==NOTIFYFS_OWNERTYPE_CLIENT) {
+	struct client_struct *client=owner->owner.localclient;
+
+	if (client) connection=client->connection;
+
+    } else if (owner->type==NOTIFYFS_OWNERTYPE_SERVER) {
+	struct notifyfs_server_struct *server=owner->owner.remoteserver;
+
+	if (server) connection=server->connection;
+
+    }
+
+    if (connection) return connection->fd;
+
+    return 0;
+
+}
+
+static void notify_clients_mountevent(struct notifyfs_fsevent_struct *fsevent, struct notifyfs_mount_struct *mount)
+{
+    struct client_struct *client;
+
+    lock_clientslist();
+
+    client=get_next_client(NULL);
+
+    while(client) {
+
+	if (client->mode & NOTIFYFS_CLIENTMODE_RECEIVEMOUNTS) {
+
+	    logoutput("notifyfs_clients_mountevent: send (u)mount (TODO)");
+
+	}
+
+	client=get_next_client(client);
+
+    }
+
+    unlock_clientslist();
+
+}
+
+
+
+static void notify_clients(struct notifyfs_fsevent_struct *fsevent, struct simple_group_struct *group_owner)
 {
 
-    if (fsevent->entry) {
-	struct notifyfs_inode_struct *inode=get_inode(fsevent->entry->inode);
-	struct watch_struct *watch=lookup_watch_inode(inode);
+    logoutput("notiyfs_clients");
 
-	/* event on watch self */
+    if (fsevent->data) {
+	struct notifyfs_inode_struct *inode=NULL;
+        struct watch_struct *watch=NULL;
+	struct notifyfs_entry_struct *entry=NULL;
 
-	if (watch) send_fsevent_to_clients(watch, fsevent, 0);
+	entry=(struct notifyfs_entry_struct *) fsevent->data;
+	inode=get_inode(entry->inode);
+	watch=lookup_watch_inode(inode);
 
-	if (isrootentry(fsevent->entry)==0) {
-	    struct notifyfs_entry_struct *entry;
+	if (watch) send_fsevent_to_owners(watch, fsevent, 0, group_owner);
 
-	    entry=get_entry(fsevent->entry->parent);
+	if (isrootentry(entry)==0) {
+
+	    entry=get_entry(entry->parent);
 	    inode=get_inode(entry->inode);
-
 	    watch=lookup_watch_inode(inode);
 
-	    if (watch) {
-
-		/* event in directory of watch */
-
-		send_fsevent_to_clients(watch, fsevent, 1);
-
-	    }
+	    if (watch) send_fsevent_to_owners(watch, fsevent, 1, group_owner);
 
 	}
 
@@ -510,28 +574,9 @@ static void check_for_watches(struct notifyfs_fsevent_struct *fsevent)
 
 }
 
-static void remove_fsevent_from_queue(struct notifyfs_fsevent_struct *fsevent)
-{
-    /* remove the previous event from queue */
-
-    if (main_fsevents_queue.first==fsevent) main_fsevents_queue.first=fsevent->next;
-
-    if (fsevent->prev) fsevent->prev->next=fsevent->next;
-    if (fsevent->next) fsevent->next->prev=fsevent->prev;
-
-    if (main_fsevents_queue.last==fsevent) main_fsevents_queue.last=fsevent->prev;
-
-}
-
-/* function to remove every clientwatch attached to a watch 
-   watch must be locked
-   when a watch is removed, a message is send to the client/server owning the watch
-*/
-
-static void remove_clientwatches_message(struct watch_struct *watch)
+static void change_clientwatches(struct watch_struct *watch, unsigned char action, unsigned char sendmessage, struct simple_group_struct *group_owner, char *basepath, struct notifyfs_entry_struct *baseentry)
 {
     struct clientwatch_struct *clientwatch, *next_clientwatch;
-    struct client_struct *client=NULL;
 
     pthread_mutex_lock(&watch->mutex);
 
@@ -541,16 +586,79 @@ static void remove_clientwatches_message(struct watch_struct *watch)
 
 	next_clientwatch=clientwatch->next_per_watch;
 
-	/* remove from owner (client or server) (and send a message to the owner) */
+	if (sendmessage==1) {
 
-	remove_clientwatch_from_owner(clientwatch, 1);
+	    if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
+		struct client_struct *client=clientwatch->notifyfs_owner.owner.localclient;
 
+    		if ( client ) {
 
-	clientwatch->next_per_watch=NULL;
-	clientwatch->prev_per_watch=NULL;
-        free(clientwatch);
+		    if ( ! lookup_simple_list(group_owner, (void *) &clientwatch->notifyfs_owner)) {
 
-	watch->nrwatches--;
+			add_element_to_group(group_owner, (void *) &clientwatch->notifyfs_owner);
+
+        		if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
+			    struct notifyfs_connection_struct *connection=client->connection;
+
+			    if (connection) {
+				uint64_t unique=new_uniquectr();
+				struct notifyfs_inode_struct *inode=get_inode(baseentry->inode);
+				char *name=get_data(baseentry->name);
+
+				send_fsevent_message_remove(connection->fd, unique, inode->ino, baseentry->parent, baseentry->index, name, basepath);
+
+			    }
+
+			}
+
+		    }
+
+		}
+
+	    } else if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
+		struct notifyfs_server_struct *server=clientwatch->notifyfs_owner.owner.remoteserver;
+
+		if (server->type==NOTIFYFS_SERVERTYPE_NETWORK) {
+
+        	    if (server->status==NOTIFYFS_SERVERSTATUS_UP) {
+
+			if ( ! lookup_simple_list(group_owner, (void *) &clientwatch->notifyfs_owner)) {
+			    struct notifyfs_connection_struct *connection=server->connection;
+
+			    add_element_to_group(group_owner, (void *) &clientwatch->notifyfs_owner);
+
+			    if (connection) {
+				uint64_t unique=new_uniquectr();
+				struct notifyfs_inode_struct *inode=get_inode(baseentry->inode);
+				char *name=get_data(baseentry->name);
+
+				send_fsevent_message_remove(connection->fd, unique, inode->ino, baseentry->parent, baseentry->index, name, basepath);
+
+			    }
+
+			}
+
+		    }
+
+		}
+
+	    }
+
+	}
+
+	if (action==FSEVENT_INODE_ACTION_REMOVE) {
+
+	    remove_clientwatch_from_owner(clientwatch, 0);
+
+	    clientwatch->next_per_watch=NULL;
+	    clientwatch->prev_per_watch=NULL;
+    	    free(clientwatch);
+
+	    watch->nrwatches--;
+
+	    /* what to do when the number of watches becomes zero */
+
+	}
 
         clientwatch=next_clientwatch;
 
@@ -560,87 +668,90 @@ static void remove_clientwatches_message(struct watch_struct *watch)
 
 }
 
-static void change_clientwatches(struct watch_struct *watch, unsigned char action)
-{
-    struct clientwatch_struct *clientwatch;
+/*
+    process a change recursive 
 
-    pthread_mutex_lock(&watch->mutex);
-
-    clientwatch=watch->clientwatches;
-
-    while (clientwatch) {
-
-	if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
-	    struct client_struct *client=NULL;
-
-	    client=clientwatch->notifyfs_owner.owner.localclient;
-
-    	    if ( client ) {
-
-        	if ( client->status==NOTIFYFS_CLIENTSTATUS_UP ) {
-		    struct notifyfs_connection_struct *connection=client->connection;
-
-		    if (connection) {
-			uint64_t unique=new_uniquectr();
-
-			send_changewatch_message(connection->fd, unique, clientwatch->owner_watch_id, action);
-
-		    }
-
-		}
-
-	    }
-
-	} else 	if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
-	    struct notifyfs_server_struct *server=NULL;
-
-	    server=clientwatch->notifyfs_owner.owner.remoteserver;
-
-    	    if ( server ) {
-
-        	if ( server->status==NOTIFYFS_SERVERSTATUS_UP ) {
-		    struct notifyfs_connection_struct *connection=server->connection;
-
-		    if (connection) {
-			uint64_t unique=new_uniquectr();
-
-			send_changewatch_message(connection->fd, unique, clientwatch->owner_watch_id, action);
-
-		    }
-
-		}
-
-	    }
-	}
-
-        clientwatch=clientwatch->next_per_watch;
-
-    }
-
-    pthread_mutex_unlock(&watch->mutex);
-
-}
-
-/* process a change recursive 
-
+    it's about a remove of a directory, an unmount (permanent or autofs)
+    in these cases the whole tree is removed or set to sleep (autofs)
 
 */
 
-static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *parent, unsigned char self, unsigned char action, char *path)
+static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *parent, unsigned char self, unsigned char action, char *workpath, unsigned char sendmessage, struct simple_group_struct *group_owner, char *basepath, struct notifyfs_entry_struct *baseentry)
 {
     int res, nlen;
-    struct notifyfs_entry_struct *entry, *next_entry;
+
     struct notifyfs_inode_struct *inode;
 
     logoutput("process_remove_fsevent_recursive");
 
     inode=get_inode(parent->inode);
-    nlen=strlen(path);
+    nlen=strlen(workpath);
 
     if (inode) {
 	struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
 	if (self==1) {
+	    struct watch_struct *watch=lookup_watch_inode(inode);
+
+	    if (watch) {
+
+		lock_watch(watch);
+
+		if (action==FSEVENT_INODE_ACTION_REMOVE) {
+
+		    /* remove the watch */
+
+		    change_clientwatches(watch, FSEVENT_INODE_ACTION_REMOVE, sendmessage, group_owner, basepath, baseentry);
+		    remove_watch_backend_os_specific(watch);
+
+		} else if (action==FSEVENT_INODE_ACTION_SLEEP) {
+
+		    /* set watch to sleep modus */
+
+		    change_clientwatches(watch, FSEVENT_INODE_ACTION_SLEEP, sendmessage, group_owner, basepath, baseentry);
+		    remove_watch_backend_os_specific(watch);
+
+		    /* inform the backend...*/
+
+		    /* backend: 
+			- remote server: inform once
+			- fuse fs : inform once only when up (it's unmounted!)
+			- local server: inform once??
+		    */
+
+		} else if (action==FSEVENT_INODE_ACTION_WAKEUP) {
+
+		    /* wakeup the watch*/
+
+		    change_clientwatches(watch, FSEVENT_INODE_ACTION_WAKEUP, sendmessage, group_owner, basepath, baseentry);
+		    set_watch_backend_os_specific(watch);
+
+		    /* inform the backend...*/
+
+		    /* backend: 
+			- remote server: inform once
+			- fuse fs : inform once only when up (it's unmounted!)
+			- local server: inform once??
+		    */
+
+		}
+
+		unlock_watch(watch);
+
+		if (action==FSEVENT_INODE_ACTION_REMOVE) {
+
+		    remove_watch_from_list(watch);
+		    remove_watch_from_table(watch);
+
+		    pthread_mutex_destroy(&watch->mutex);
+
+		    free_path_pathinfo(&watch->pathinfo);
+
+		    free(watch);
+
+		}
+
+	    }
 
 	    if (action==FSEVENT_INODE_ACTION_REMOVE) {
 
@@ -663,6 +774,7 @@ static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *
 	    if (S_ISDIR(attr->cached_st.st_mode)) {
 		char *name=NULL;
 		int lenname=0;
+		struct notifyfs_entry_struct *entry, *next_entry;
 
 		/* when a directory: first remove contents (recursive) */
 
@@ -675,13 +787,13 @@ static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *
 		    name=get_data(entry->name);
 		    lenname=strlen(name);
 
-		    *(path+nlen)='/';
-		    memcpy(path+nlen+1, name, lenname);
-		    *(path+nlen+lenname)='\0';
+		    *(workpath+nlen)='/';
+		    memcpy(workpath+nlen+1, name, lenname);
+		    *(workpath+nlen+lenname)='\0';
 
-    		    process_changestate_fsevent_recursive(entry, 1, action, path);
+    		    process_changestate_fsevent_recursive(entry, 1, action, workpath, sendmessage, group_owner, basepath, baseentry);
 
-		    *(path+nlen)='\0';
+		    *(workpath+nlen)='\0';
 
 		    entry=next_entry;
 
@@ -692,52 +804,8 @@ static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *
 	}
 
 	if (self==1) {
-	    struct watch_struct *watch=lookup_watch_inode(inode);
 
-	    if (watch) {
-
-		lock_watch(watch);
-
-		if (action==FSEVENT_INODE_ACTION_REMOVE) {
-
-		    /* here remove the clientwatches and send all the clientwatches a del_watch message */
-
-		    remove_clientwatches_message(watch);
-		    remove_watch_backend_os_specific(watch);
-
-		} else if (action==FSEVENT_INODE_ACTION_SLEEP) {
-
-		    change_clientwatches(watch, FSEVENT_INODE_ACTION_SLEEP);
-		    remove_watch_backend_os_specific(watch);
-
-		} else if (action==FSEVENT_INODE_ACTION_WAKEUP) {
-
-		    change_clientwatches(watch, FSEVENT_INODE_ACTION_WAKEUP);
-		    set_watch_backend_os_specific(watch, path);
-
-		}
-
-		unlock_watch(watch);
-
-		if (action==FSEVENT_INODE_ACTION_REMOVE) {
-
-		    remove_watch_from_list(watch);
-		    remove_watch_from_table(watch);
-
-		    pthread_mutex_destroy(&watch->mutex);
-		    pthread_cond_destroy(&watch->cond);
-
-		    free(watch);
-
-		}
-
-	    }
-
-	    if (action==FSEVENT_INODE_ACTION_REMOVE) {
-
-		inode->status=FSEVENT_INODE_STATUS_REMOVED;
-
-	    }
+	    if (action==FSEVENT_INODE_ACTION_REMOVE) inode->status=FSEVENT_INODE_STATUS_REMOVED;
 
 	}
 
@@ -757,218 +825,274 @@ static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *
 
 }
 
+static void process_changestate_fsevent(struct notifyfs_entry_struct *entry, unsigned char action)
+{
+
+    logoutput("process_changestate_fsevent");
+
+    if (action==FSEVENT_INODE_ACTION_REMOVE) {
+
+	notify_kernel_delete(notifyfs_chan, entry);
+	remove_entry_from_name_hash(entry);
+	remove_entry(entry);
+
+    }
+
+}
+
 static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 {
     unsigned char catched=0;
 
     logoutput("process_one_fsevent");
 
-    /* do the actual action */
+    if (fsevent->fseventmask.cache_event & (NOTIFYFS_FSEVENT_CACHE_ADDED | NOTIFYFS_FSEVENT_CACHE_REMOVED)) {
+	struct simple_group_struct group_owner;
 
-    if (fsevent->fseventmask.fs_event & (NOTIFYFS_FSEVENT_FS_UNMOUNT|NOTIFYFS_FSEVENT_FS_MOUNT)) {
+	initialize_group(&group_owner, owner_hashfunction, 64);
+	notify_clients(fsevent, &group_owner);
 
-	/* an mount or a unmount */
+	catched=1;
+
+    } else if (fsevent->fseventmask.fs_event & (NOTIFYFS_FSEVENT_FS_UNMOUNT | NOTIFYFS_FSEVENT_FS_MOUNT)) {
+	struct supermount_struct *supermount=(struct supermount_struct *) fsevent->data;
+
+	if (! supermount) goto out;
 
 	if (fsevent->fseventmask.fs_event & NOTIFYFS_FSEVENT_FS_UNMOUNT) {
-	    struct mount_entry_struct *mount_entry=NULL;
-	    struct notifyfs_entry_struct *entry;
+	    struct notifyfs_entry_struct *entry=NULL;
+	    struct stat st;
+	    int error=0;
 
 	    catched=1;
 
-	    mount_entry=fsevent->mount_entry;
-	    entry=(struct notifyfs_entry_struct *) mount_entry->entry;
-
-	    /* here additional??: when entry not set here, determine it */
+	    entry=create_notifyfs_path(&fsevent->pathinfo, &st, 0, 0, &error, 0, 0, 0);
 
 	    if (entry) {
+		struct notifyfs_mount_struct *mount=NULL;
 
-		/* notifyfs mount */
+		mount=get_mount(entry->mount);
 
-		if (entry->mount>=0) {
-		    struct notifyfs_mount_struct *mount=get_mount(entry->mount);
+		if (mount) {
 
-		    /* TODO: handle sleeping mount */
+		    /*
+			existing mount found, what's happening?
+			TODO:
+			    - when mounting over an existing mountpoint, and then unmounted again, how to find the first mount?
+		    */
 
-		    if (mount_entry->status==MOUNT_STATUS_REMOVE) {
+		    if (mount->major==supermount->major && mount->minor==supermount->minor) {
 
-			logoutput("process_one_fsevent: disable mount");
+			if (fsevent->flags & MOUNTENTRY_FLAG_BY_AUTOFS) {
+			    pathstring path;
 
-			mount->status=NOTIFYFS_MOUNTSTATUS_DOWN;
-			mount->entry=-1;
+			    /*
+				unmount done by automounter
+				set the whole tree into sleep
+			    */
 
-			unset_mount_backend(mount);
+			    strcpy(path, fsevent->pathinfo.path);
 
-			remove_mount(mount);
-			entry->mount=-1;
+			    process_changestate_fsevent_recursive(entry, 0, FSEVENT_INODE_ACTION_SLEEP, path, 0, NULL, NULL, 0);
 
-		    } else if (mount_entry->status==MOUNT_STATUS_SLEEP) {
+			    logoutput("process_one_fsevent: device %i:%i still mounted", mount->major, mount->minor);
 
-			logoutput("process_one_fsevent: sleep mount");
+			    mount->status=NOTIFYFS_MOUNTSTATUS_SLEEP;
+			    notify_clients_mountevent(fsevent, mount);
 
-			mount->status=NOTIFYFS_MOUNTSTATUS_SLEEP;
+			} else {
+			    pathstring path;
+			    int refcount=0, major, minor;
+			    struct notifyfs_entry_struct *parent=NULL;
+
+			    /*
+				normal permanent umount
+			    */
+
+			    strcpy(path, fsevent->pathinfo.path);
+
+			    process_changestate_fsevent_recursive(entry, 0, FSEVENT_INODE_ACTION_REMOVE, path, 0, NULL, NULL, 0);
+
+			    major=supermount->major;
+			    minor=supermount->minor;
+
+			    refcount=remove_mount_supermount(supermount);
+
+			    /* send message to clients */
+
+			    if (refcount<=0) {
+
+				logoutput("process_one_fsevent: device %i:%i not mounted", major, minor);
+
+			    } else {
+
+				logoutput("process_one_fsevent: device %i:%i still %i mounted", major, minor, refcount);
+
+			    }
+
+			    remove_mount(mount);
+
+			    parent=get_entry(entry->parent);
+
+			    if (parent) {
+
+				entry->mount=parent->mount;
+
+			    } else {
+
+				entry->mount=-1;
+
+			    }
+
+			}
+
+			notify_clients_mountevent(fsevent, mount);
+
+		    } else {
+
+			logoutput("process_one_fsevent: existing mount %i:%i found, is not the same as %i:%i", mount->major, mount->minor, supermount->major, supermount->minor);
 
 		    }
 
 		} else {
 
-		    logoutput("process_one_fsevent: entry has no mount??");
+		    logoutput("process_one_fsevent: no mount %i:%i found at %s in notifyfs", supermount->major, supermount->minor, fsevent->pathinfo.path);
 
 		}
 
-		/* correct the fs and send messages in tree */
+	    } else {
 
-		if (mount_entry->status==MOUNT_STATUS_REMOVE) {
-		    pathstring path;
-
-		    strcpy(path, mount_entry->mountpoint);
-
-		    /* remove the contents of the directory (but not the directory self), 
-                       and send messages to clients when watches are also removed */
-
-		    process_changestate_fsevent_recursive(entry, 0, FSEVENT_INODE_ACTION_REMOVE, path);
-
-		} else if (mount_entry->status==MOUNT_STATUS_SLEEP) {
-		    pathstring path;
-
-		    strcpy(path, mount_entry->mountpoint);
-
-		    /* set the whole tree (including watches) to sleep */
-
-		    process_changestate_fsevent_recursive(entry, 0, FSEVENT_INODE_ACTION_SLEEP, path);
-
-		}
-
-		/* here additional: adjust the attributes of the entry since an umount affects these 
-		maybe store it in mount_entry?? */
-
-		/* lookup watch ... this entry and parent */
-
-		check_for_watches(fsevent);
-
-		/* here send a message to the client anyway... */
-
-		/* configurable ??? can a client set somewhere an option it wants to receive always mount events */
-
-		/* here also send a message to a local process or remote server when dealing with a special fs like nfs and cifs */ 
+		logoutput("process_one_fsevent: unable to create %s in notifyfs for mount %i:%i", fsevent->pathinfo.path, supermount->major, supermount->minor);
 
 	    }
 
 	} else if (fsevent->fseventmask.fs_event & NOTIFYFS_FSEVENT_FS_MOUNT) {
-	    struct mount_entry_struct *mount_entry=NULL;
 	    struct notifyfs_entry_struct *entry=NULL;
-	    int parent_mount=-1;
+	    struct stat st;
+	    int error=0;
 
 	    catched=1;
 
-	    mount_entry=fsevent->mount_entry;
-
-	    if (is_rootmount(mount_entry)==1) {
+	    if (strcmp(fsevent->pathinfo.path, "/")==0) {
 
 		entry=get_rootentry();
 
 	    } else {
-		struct call_info_struct call_info;
 
-		init_call_info(&call_info, NULL);
-
-		call_info.path=mount_entry->mountpoint;
-
-		create_notifyfs_path(&call_info, NULL);
-
-		entry=call_info.entry;
-		parent_mount=call_info.mount;
+		entry=create_notifyfs_path(&fsevent->pathinfo, &st, 0, 0, &error, 0, 0, 0);
 
 	    }
 
 	    if (entry) {
-		char *name=get_data(entry->name);
+		struct notifyfs_mount_struct *mount=NULL;
 
-		logoutput("process_one_fsevent: got entry %s (index: %i), entry mountindex %i path %s", name, entry->index, entry->mount, mount_entry->mountpoint);
+		mount=get_mount(entry->mount);
 
-		fsevent->entry=entry;
+		if (mount) {
 
-		mount_entry->entry=(void *) entry;
-		mount_entry->status=MOUNT_STATUS_UP;
-
-		if (mount_entry->autofs_mounted && mount_entry->remount==1) {
-		    pathstring path;
-
-		    strcpy(path, mount_entry->mountpoint);
-
-		    /* set the whole tree (including watches) to sleep */
-
-		    process_changestate_fsevent_recursive(entry, 0, FSEVENT_INODE_ACTION_WAKEUP, path);
+		    if (mount->entry!=entry->index) mount=NULL;
 
 		}
 
-		if (entry->mount>=0) {
-		    struct notifyfs_mount_struct *mount=get_mount(entry->mount);
+		if (mount) {
 
-		    /* TODO: compare this existing mount and the new mount */
+		    /* existing mount found, what's happening? */
 
-		    mount->status=NOTIFYFS_MOUNTSTATUS_UP;
+		    if (mount->major==supermount->major && mount->minor==supermount->minor) {
 
-		    set_mount_backend(mount);
+			/* already mounted: is it a remount/autofs? */
 
-		} else {
-		    struct notifyfs_mount_struct *mount=create_mount(mount_entry->fstype, mount_entry->mountsource, mount_entry->superoptions, entry);
+			if (mount->status==NOTIFYFS_MOUNTSTATUS_SLEEP) {
+			    pathstring workpath;
 
-		    if (mount) {
+			    /* bring back */
 
-			mount->major=mount_entry->major;
-			mount->minor=mount_entry->minor;
-			mount->mode=0;
-			mount->status=NOTIFYFS_MOUNTSTATUS_UP;
+			    strcpy(workpath, fsevent->pathinfo.path);
 
-			if (mount_entry->isbind==1) mount->mode|=NOTIFYFS_MOUNTMODE_ISBIND;
-			if (mount_entry->isroot==1) mount->mode|=NOTIFYFS_MOUNTMODE_ISROOT;
-			if (mount_entry->isautofs==1) mount->mode|=NOTIFYFS_MOUNTMODE_AUTOFS;
-			if (mount_entry->autofs_indirect==1) mount->mode|=NOTIFYFS_MOUNTMODE_AUTOFS_INDIRECT;
-			if (mount_entry->autofs_mounted==1) mount->mode|=NOTIFYFS_MOUNTMODE_AUTOFS_MOUNTED;
-			if (mount_entry->remount==1) mount->mode|=NOTIFYFS_MOUNTMODE_REMOUNT;
-			if (mount_entry->fstab==1) mount->mode|=NOTIFYFS_MOUNTMODE_FSTAB;
+			    /* wake the whole tree (including watches) */
 
-			set_mount_backend(mount);
+			    process_changestate_fsevent_recursive(entry, 0, FSEVENT_INODE_ACTION_WAKEUP, workpath, 0, NULL, NULL, 0);
+
+			    mount->status=NOTIFYFS_MOUNTSTATUS_UP;
+			    notify_clients_mountevent(fsevent, mount);
+
+			} else {
+
+			    logoutput("process_one_fsevent: %i:%i already mounted at %s", supermount->major, supermount->minor, fsevent->pathinfo.path);
+			    goto out;
+
+			}
+
+		    } else {
+
+			mount=NULL;
+			logoutput("process_one_fsevent: another mount %i:%i mounted at %s", mount->major, mount->minor, fsevent->pathinfo.path);
 
 		    }
 
 		}
 
-		check_for_watches(fsevent);
+		if (! mount) {
 
-		/* here send a message to the client anyway... */
+		    logoutput("process_one_fsevent: creating new mount");
 
-		/* configurable ??? can a client set somewhere an option it wants to receive always mount events */
+		    mount=create_mount(entry, supermount->major, supermount->minor);
 
-		/* here also send a message to a local process or remote server when dealing with a special fs like nfs and cifs */ 
+		    if (mount) {
 
-	    } else {
+			mount->status=NOTIFYFS_MOUNTSTATUS_UP;
+			set_supermount_backend(supermount, mount, fsevent->pathinfo.path);
+			notify_clients_mountevent(fsevent, mount);
 
-		mount_entry->status=MOUNT_STATUS_NOTSET;
+		    }
+
+		}
 
 	    }
 
 	    /* here additional: adjust the attributes of the entry since an umount affects these 
-		maybe store it in mount_entry?? */
+		maybe store it in mountentry?? */
 
 	}
 
     } else if (fsevent->fseventmask.move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED )) {
-	pathstring path;
+	struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *)fsevent->data;
+	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 
-	logoutput("process_one_fsevent: remove/moved, handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
+	if (inode) {
+	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
-	strcpy(path, fsevent->path);
+	    if (S_ISDIR(attr->cached_st.st_mode)) {
+		pathstring workpath;
+		struct simple_group_struct group_owner;
 
-	catched=1;
+		logoutput("process_one_fsevent: remove/moved, handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
 
-	/* here test the watch(es) interested in this event and send eventually a message*/
+		strcpy(workpath, fsevent->pathinfo.path);
 
-	check_for_watches(fsevent);
+		initialize_group(&group_owner, owner_hashfunction, 64);
 
-	/* do this also for the parent */
+		catched=1;
 
-	process_changestate_fsevent_recursive(fsevent->entry, 1, FSEVENT_INODE_ACTION_REMOVE, path);
+		/* here test the watch(es) interested in this event and send eventually a message*/
+
+		notify_clients(fsevent, &group_owner);
+		process_changestate_fsevent_recursive(entry, 1, FSEVENT_INODE_ACTION_REMOVE, workpath, 1, &group_owner, fsevent->pathinfo.path, entry);
+
+		free_group(&group_owner);
+
+	    }
+
+	}
+
+	if (catched==0) {
+
+	    catched=1;
+
+	    notify_clients(fsevent, NULL);
+	    process_changestate_fsevent(entry, FSEVENT_INODE_ACTION_REMOVE);
+
+	}
 
     } else {
 
@@ -977,8 +1101,9 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 	    (fsevent->fseventmask.xattr_event & NOTIFYFS_FSEVENT_XATTR_CA) || 
 	    (fsevent->fseventmask.file_event & (NOTIFYFS_FSEVENT_FILE_MODIFIED | NOTIFYFS_FSEVENT_FILE_SIZE | NOTIFYFS_FSEVENT_FILE_LOCK_CA))) {
 
-	    struct notifyfs_entry_struct *entry=fsevent->entry;
+	    struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *)fsevent->data;
 	    struct notifyfs_inode_struct *inode=NULL;
+	    struct simple_group_struct group_owner;
 
 	    /* it's possible that the entry does not have an inode yet */
 
@@ -992,7 +1117,7 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 		if (! attr) {
 		    struct stat st;
 
-		    if (lstat(fsevent->path, &st)==0) {
+		    if (lstat(fsevent->pathinfo.path, &st)==0) {
 
 			attr=assign_attr(&st, inode);
 
@@ -1032,15 +1157,24 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
 	    }
 
+	    if (fsevent->fseventmask.move_event & (NOTIFYFS_FSEVENT_MOVE_CREATED | NOTIFYFS_FSEVENT_MOVE_MOVED_TO)) {
+
+		add_to_name_hash_table(entry);
+
+	    }
+
 	    catched=1;
+	    initialize_group(&group_owner, owner_hashfunction, 64);
 
 	    logoutput("process_one_fsevent: new/changed, handle %i:%i:%i:%i", fsevent->fseventmask.attrib_event, fsevent->fseventmask.xattr_event, fsevent->fseventmask.file_event, fsevent->fseventmask.move_event);
 
-	    check_for_watches(fsevent);
+	    notify_clients(fsevent, &group_owner);
 
 	}
 
     }
+
+    out:
 
     if (catched==0) {
 
@@ -1091,7 +1225,11 @@ static void process_fsevent(void *data)
 		/* while walking in the queue remove old fsevents */
 
 		/* events long ago are expired and of no use anymore: remove 
-		make this period configurable ..*/
+		make this period configurable ..
+
+		TODO: add the 5 in the config
+
+		*/
 
 		if ( is_later(&rightnow, &fsevent->process_time, 5, 0)==1) {
 		    struct notifyfs_fsevent_struct *next_fsevent=fsevent->next;
@@ -1128,6 +1266,8 @@ static void process_fsevent(void *data)
 
     if (fsevent) {
 
+	logoutput("process_fsevent: got fsevent");
+
 	fsevent->process_time.tv_sec=rightnow.tv_sec;
 	fsevent->process_time.tv_nsec=rightnow.tv_nsec;
 
@@ -1145,6 +1285,8 @@ static void process_fsevent(void *data)
 
 	/* jump back to look for another fsevent */
 
+	logoutput("process_fsevent: jump back!");
+
 	goto process;
 
     }
@@ -1158,7 +1300,7 @@ static void process_fsevent(void *data)
    note the queue has to be locked 
     TODO: take in account the type of the action, sleep versus remove, what to
     do when both in queue
-   */
+*/
 
 static unsigned char queue_required(struct notifyfs_fsevent_struct *fsevent)
 {
@@ -1173,14 +1315,14 @@ static unsigned char queue_required(struct notifyfs_fsevent_struct *fsevent)
 	main_fsevents_queue.first=fsevent;
 	main_fsevents_queue.last=fsevent;
 
-	logoutput("queue_required: path %s, queue is empty", fsevent->path);
+	logoutput("queue_required: path %s, queue is empty", fsevent->pathinfo.path);
 
     } else {
 	struct notifyfs_fsevent_struct *fsevent_walk=main_fsevents_queue.last;
-        char *path2, *path1=fsevent->path;
+        char *path2, *path1=fsevent->pathinfo.path;
         int len1=strlen(path1), len2;
 
-	logoutput("queue_required: path %s, check the queue", fsevent->path);
+	logoutput("queue_required: path %s, check the queue", path1);
 
         doqueue=1;
 
@@ -1188,9 +1330,16 @@ static unsigned char queue_required(struct notifyfs_fsevent_struct *fsevent)
 
         while(fsevent_walk) {
 
+	    if ( ! fsevent_walk->pathinfo.path) {
+
+		fsevent_walk=fsevent_walk->prev;
+		continue;
+
+	    }
+
 	    /* compare this previous event with the new one */
 
-            path2=fsevent_walk->path;
+            path2=fsevent_walk->pathinfo.path;
             len2=strlen(path2);
 
             if ( len1>len2 ) {
@@ -1217,13 +1366,13 @@ static unsigned char queue_required(struct notifyfs_fsevent_struct *fsevent)
 
 	    } else if (len1==len2) {
 
-		if (strcmp(fsevent_walk->path, fsevent->path)==0) {
+		if (strcmp(path2, path1)==0) {
 
 		    /* paths are the same, but it may be another entry ... */
 
-		    if (fsevent_walk->fseventmask.fs_event & NOTIFYFS_FSEVENT_FS_UNMOUNT) {
+		    if (fsevent_walk->fseventmask.fs_event & (NOTIFYFS_FSEVENT_FS_UNMOUNT_REMOVE | NOTIFYFS_FSEVENT_FS_UNMOUNT_AUTOFS)) {
 
-			if (fsevent->fseventmask.fs_event & NOTIFYFS_FSEVENT_FS_UNMOUNT) {
+			if (fsevent->fseventmask.fs_event & (NOTIFYFS_FSEVENT_FS_UNMOUNT_REMOVE | NOTIFYFS_FSEVENT_FS_UNMOUNT_AUTOFS)) {
 
 			    /* there is a previous umount event waiting: anything else here is ignored */
 
@@ -1243,7 +1392,7 @@ static unsigned char queue_required(struct notifyfs_fsevent_struct *fsevent)
 
 		    } else if (fsevent_walk->fseventmask.move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED )) {
 
-			if (fsevent->entry==fsevent_walk->entry) {
+			if (fsevent->data==fsevent_walk->data) {
 
 			    /* ignore everything else on this entry here */
 
@@ -1354,18 +1503,23 @@ static unsigned char queue_required(struct notifyfs_fsevent_struct *fsevent)
 
 */
 
-void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent)
+void queue_fsevent(struct notifyfs_fsevent_struct *fsevent)
 {
-    struct fseventmask_struct *fseventmask=&notifyfs_fsevent->fseventmask;
-    int res;
+    struct fseventmask_struct *fseventmask=&fsevent->fseventmask;
+    int res=0;
+    struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *)fsevent->data;
 
     logoutput("queue_fsevent");
 
-    /* in some cases the path is already set */
+    /* 
+	in some cases the path is already set 
+	and in some cases it's not required that the data is set..
 
-    if (! notifyfs_fsevent->path) {
+    */
 
-	res=determine_path_custom(notifyfs_fsevent);
+    if (! fsevent->pathinfo.path && (fseventmask->move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED | NOTIFYFS_FSEVENT_FS_UNMOUNT))) {
+
+	res=determine_path(entry, &fsevent->pathinfo);
 
 	if (res<0) {
 
@@ -1395,43 +1549,60 @@ void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent)
 
     /* adjust the status of this inode in case of an remove or unmount */
 
-
     if (fseventmask->move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED)) {
-	struct notifyfs_entry_struct *entry=notifyfs_fsevent->entry;
 	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 
 	if (inode) inode->status=FSEVENT_INODE_STATUS_TOBEREMOVED;
 
     }
 
-    if (fseventmask->fs_event & NOTIFYFS_FSEVENT_FS_UNMOUNT) {
-	struct notifyfs_entry_struct *entry=notifyfs_fsevent->entry;
+    if (fseventmask->fs_event & NOTIFYFS_FSEVENT_FS_UNMOUNT_REMOVE) {
 	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
 
 	if (inode) inode->status=FSEVENT_INODE_STATUS_TOBEUNMOUNTED;
 
     }
 
-    notifyfs_fsevent->status=NOTIFYFS_FSEVENT_STATUS_WAITING;
-
-    /* lock the queue */
+    fsevent->status=NOTIFYFS_FSEVENT_STATUS_WAITING;
 
     pthread_mutex_lock(&main_fsevents_queue.mutex);
 
-    res=queue_required(notifyfs_fsevent);
+    if (fsevent->pathinfo.path) {
+
+	res=queue_required(fsevent);
+
+    } else {
+
+	if ( ! main_fsevents_queue.first ) {
+
+	    main_fsevents_queue.first=fsevent;
+	    main_fsevents_queue.last=fsevent;
+
+	} else {
+
+	    main_fsevents_queue.last->next=fsevent;
+	    fsevent->next=NULL;
+	    fsevent->prev=main_fsevents_queue.last;
+	    main_fsevents_queue.last=fsevent;
+
+	}
+
+	res=1;
+
+    }
 
     pthread_mutex_unlock(&main_fsevents_queue.mutex);
 
     if (res==1) {
 
-	logoutput("queue_fsevent: path: %s, fsevent queued", notifyfs_fsevent->path);
+	logoutput("queue_fsevent: path: %s, fsevent queued", fsevent->pathinfo.path);
 
 	/* possibly activate a workerthread */
 
 	if (main_fsevents_queue.nrthreads<MAXIMUM_PROCESS_FSEVENTS_NRTHREADS) {
 	    struct workerthread_struct *workerthread=NULL;
 
-	    logoutput("queue_fsevent: path: %s, nr threads %i, starting a new thread", notifyfs_fsevent->path, main_fsevents_queue.nrthreads);
+	    logoutput("queue_fsevent: path: %s, nr threads %i, starting a new thread", fsevent->pathinfo.path, main_fsevents_queue.nrthreads);
 
 	    /* get a thread to do the work */
 
@@ -1460,26 +1631,9 @@ void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent)
 
     } else {
 
-	destroy_notifyfs_fsevent(notifyfs_fsevent);
+	destroy_notifyfs_fsevent(fsevent);
 
     }
-
-}
-
-struct notifyfs_fsevent_struct *create_fsevent(struct notifyfs_entry_struct *entry)
-{
-    struct notifyfs_fsevent_struct *fsevent=NULL;
-
-    fsevent=malloc(sizeof(struct notifyfs_fsevent_struct));
-
-    if (fsevent) {
-
-	init_notifyfs_fsevent(fsevent);
-	fsevent->entry=entry;
-
-    }
-
-    return fsevent;
 
 }
 
@@ -1496,7 +1650,7 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
     struct notifyfs_entry_struct *entry=NULL;
     struct notifyfs_inode_struct *inode=NULL;
     struct stat st;
-    char *path=NULL;
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
 
     if (name) {
 	struct notifyfs_entry_struct *parent=NULL;
@@ -1527,23 +1681,60 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 
 	}
 
+	if (watch->pathinfo.path) {
+	    int len1=strlen(name), len0=watch->pathinfo.len;
+
+	    pathinfo.path=malloc(len0 + 2 + len1);
+
+	    if (pathinfo.path) {
+
+		memcpy(pathinfo.path, watch->pathinfo.path, len0);
+		*(pathinfo.path + len0)='/';
+		len0++;
+		memcpy(pathinfo.path+len0, name, len1);
+		len0+=len1;
+		*(pathinfo.path + len0)='\0';
+
+		pathinfo.len=len0;
+		pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
+	    }
+
+	}
+
     } else {
 
 	inode=watch->inode;
 	entry=get_entry(inode->alias);
 
+	if (watch->pathinfo.path) {
+
+	    pathinfo.path=watch->pathinfo.path;
+	    pathinfo.len=watch->pathinfo.len;
+	    pathinfo.flags=0;
+
+	}
+
     }
 
-    path=determine_path_entry(entry);
+    if (!pathinfo.path) {
 
-    if ( ! path) {
+	int res=determine_path(entry, &pathinfo);
 
-	logoutput("evaluate_remote_fsevent: unable to create an path for %s, cannot continue", name);
-	goto out;
+	if (res<0) {
+
+	    logoutput("evaluate_remote_fsevent: unable to create an path for %s, error %i, cannot continue", name, res);
+	    goto out;
+
+	}
+
+	pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
 
     }
 
-    if (lstat(path, &st)==-1) {
+    logoutput("evaluate_remote_fsevent: check path %s", pathinfo.path);
+
+    if (lstat(pathinfo.path, &st)==-1) {
 
 	/* path does not exist anymore */
 
@@ -1552,8 +1743,13 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 	if (fsevent) {
 
 	    fsevent->fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
-	    fsevent->path=path;
-	    fsevent->pathallocated=1;
+	    fsevent->pathinfo.path=pathinfo.path;
+	    fsevent->pathinfo.flags=pathinfo.flags;
+	    fsevent->pathinfo.len=pathinfo.len;
+
+	    pathinfo.path=NULL;
+	    pathinfo.len=0;
+	    pathinfo.flags=0;
 
 	    get_current_time(&fsevent->detect_time);
 
@@ -1579,9 +1775,6 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 	    attr=assign_attr(&st, inode);
 
 	    if (attr) {
-
-		copy_stat(&attr->cached_st, &st);
-		copy_stat_times(&attr->cached_st, &st);
 
 		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
 		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
@@ -1611,8 +1804,13 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 
 	    if (fsevent) {
 
-		fsevent->path=path;
-		fsevent->pathallocated=1;
+		fsevent->pathinfo.path=pathinfo.path;
+		fsevent->pathinfo.len=pathinfo.len;
+		fsevent->pathinfo.flags=pathinfo.flags;
+
+		pathinfo.path=NULL;
+		pathinfo.len=0;
+		pathinfo.flags=0;
 
 		get_current_time(&fsevent->detect_time);
 
@@ -1694,9 +1892,13 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 
 		if (fsevent) {
 
-		    fsevent->fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
-		    fsevent->path=path;
-		    fsevent->pathallocated=1;
+		    fsevent->pathinfo.path=pathinfo.path;
+		    fsevent->pathinfo.len=pathinfo.len;
+		    fsevent->pathinfo.flags=pathinfo.flags;
+
+		    pathinfo.path=NULL;
+		    pathinfo.len=0;
+		    pathinfo.flags=0;
 
 		    get_current_time(&fsevent->detect_time);
 
@@ -1724,15 +1926,7 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 
     out:
 
-    if ( ! fsevent) {
-
-	if (path) {
-
-	    free(path);
-	    path=NULL;
-	}
-
-    }
+    free_path_pathinfo(&pathinfo);
 
     return fsevent;
 

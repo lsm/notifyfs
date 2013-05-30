@@ -44,8 +44,6 @@
 #include <pthread.h>
 #include <syslog.h>
 
-#define LOGGING
-
 #define LOG_LOGAREA LOG_LOGAREA_MAINLOOP
 
 #include "logging.h"

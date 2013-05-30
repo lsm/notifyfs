@@ -36,9 +36,39 @@
 #define FSEVENT_INODE_ACTION_SLEEP		3
 #define FSEVENT_INODE_ACTION_WAKEUP		4
 
+struct notifyfs_backend_struct {
+    unsigned char type;
+    char *buffer;
+    size_t lenbuffer;
+    struct notifyfs_connection_struct *connection;
+    unsigned char status;
+    int error;
+    struct timespec connect_time;
+    pthread_mutex_t mutex;
+    void *data;
+    int refcount;
+    struct notifyfs_backend_struct *next;
+    struct notifyfs_backend_struct *prev;
+};
+
+struct supermount_struct {
+    int major;
+    int minor;
+    int refcount;
+    struct notifyfs_filesystem_struct *fs;
+    char *source;
+    char *options;
+    struct notifyfs_backend_struct *backend;
+    struct backendfunctions_struct *backendfunctions;
+    struct supermount_struct *next;
+    struct supermount_struct *prev;
+};
+
 // Prototypes
 
-int create_root();
+int init_entry_management();
+
+unsigned long new_owner_id();
 
 struct notifyfs_inode_struct *find_inode(fuse_ino_t ino);
 struct notifyfs_entry_struct *find_entry_by_ino(fuse_ino_t ino, const char *name);
@@ -46,15 +76,28 @@ struct notifyfs_entry_struct *find_entry_by_entry(struct notifyfs_entry_struct *
 
 struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent, const char *name);
 void remove_entry(struct notifyfs_entry_struct *entry);
-void assign_inode(struct notifyfs_entry_struct *entry);
-struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_struct *inode);
 
-struct notifyfs_mount_struct *create_mount(char *fs, char *mountsource, char *superoptions, struct notifyfs_entry_struct *entry);
+void assign_inode(struct notifyfs_entry_struct *entry);
+
+struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_struct *inode);
+void remove_attr(struct notifyfs_attr_struct *attr);
+
+struct notifyfs_mount_struct *create_mount(struct notifyfs_entry_struct *entry, int major, int minor);
 void remove_mount(struct notifyfs_mount_struct *mount);
+struct notifyfs_mount_struct *find_mount_majorminor(int major, int minor, struct notifyfs_mount_struct *new_mount);
+struct notifyfs_backend_struct *get_mount_backend(struct notifyfs_mount_struct *mount);
+
+struct supermount_struct *add_supermount(int major, int minor, char *source, char *options);
+struct supermount_struct *find_supermount_majorminor(int major, int minor);
+int remove_mount_supermount(struct supermount_struct *supermount);
+
+void activate_view(struct view_struct *view);
+struct view_struct *get_next_view(pid_t pid, void **index);
 
 unsigned char isrootinode(struct notifyfs_inode_struct *inode);
 unsigned char isrootentry(struct notifyfs_entry_struct *entry);
 
+int create_root();
 unsigned long long get_inoctr();
 struct notifyfs_inode_struct *get_rootinode();
 struct notifyfs_entry_struct *get_rootentry();

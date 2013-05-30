@@ -60,81 +60,51 @@
 #include "utils.h"
 #include "workerthreads.h"
 
+#include "epoll-utils.h"
+
+#include "notifyfs-fsevent.h"
 #include "notifyfs-io.h"
-#include "client-io.h"
+
+#include "socket.h"
 
 #include "entry-management.h"
 #include "path-resolution.h"
 #include "logging.h"
-#include "epoll-utils.h"
-#include "message.h"
+
+#include "networkutils.h"
+#include "backend.h"
+#include "networkservers.h"
+
+#include "message-base.h"
+#include "message-receive.h"
+#include "message-send.h"
+
 #include "handlefuseevent.h"
 #include "handlemountinfoevent.h"
 #include "handlelockinfoevent.h"
-#include "handlemessage.h"
+#include "handleclientmessage.h"
+
 #include "options.h"
 #include "xattr.h"
-#include "socket.h"
 #include "client.h"
-#include "handleclientmessage.h"
-#include "socket.h"
-#include "networkutils.h"
 #include "access.h"
 #include "mountinfo.h"
 #include "mountinfo-monitor.h"
-#include "lock-monitor.h"
+#include "filesystem.h"
 #include "watches.h"
 #include "changestate.h"
-
 
 struct notifyfs_options_struct notifyfs_options;
 
 struct fuse_chan *notifyfs_chan;
 extern struct notifyfs_entry_struct *rootentry;
-extern struct mount_entry_struct *root_mount;
+extern struct mountentry_struct *rootmount;
 unsigned char loglevel=0;
 int logarea=0;
 
-unsigned char test_access_fsuser(struct call_info_struct *call_info)
-{
-    unsigned char accessdeny=1;
-
-    /* check access */
-
-    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_ROOT ) {
-
-	/* when accessmode allows root, and user is root, allow */
-
-    	if ( call_info->ctx->uid==0 ) {
-
-    	    accessdeny=0;
-    	    goto out;
-
-	}
-
-    }
+static unsigned long long last_generation_id=0;
 
 
-    if ( notifyfs_options.accessmode & NOTIFYFS_ACCESS_CLIENT) {
-	struct client_struct *client=lookup_client(call_info->ctx->pid, 0);
-
-	if ( client ) {
-
-	    accessdeny=0;
-	    goto out;
-
-	}
-
-    }
-
-
-    logoutput("access denied for pid %i", (int) call_info->ctx->pid);
-
-    out:
-
-    return accessdeny;
-
-}
 
 static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name)
 {
@@ -142,24 +112,12 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
     struct notifyfs_entry_struct *entry;
     struct notifyfs_inode_struct *inode;
     int nreturn=0;
-    unsigned char entryexists=0, dostat=0;
-    struct call_info_struct call_info;
+    unsigned char dostat=0;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct stat st;
 
     logoutput("LOOKUP, name: %s", name);
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     entry=find_entry_by_ino(parentino, name);
 
@@ -172,14 +130,15 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     inode=get_inode(entry->inode);
 
-    call_info.entry=entry;
-
-    entryexists=1;
-
     /* translate entry into path */
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_NONE);
-    if ( nreturn<0 ) goto out;
+    nreturn=determine_path(entry, &pathinfo);
+    if (nreturn<0) goto out;
+
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
+    if (nreturn<0) goto out;
 
 
     /* if dealing with an autofs managed fs do not stat
@@ -189,23 +148,17 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     dostat=1;
 
-    /* if watch attached then not stat , this action will cause a notify action (inotify: IN_ACCESS) */
+    if ( entry->mount>=0 ) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
-    if (inode->attr>=0) {
+    	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
-	if ( call_info.mount>=0 ) {
-	    struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+	    /* mount is down, so do not stat
+            what with DFS like constructions ?? */
 
-    	    if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
+    	    dostat=0;
 
-		/* mount is down, so do not stat
-            	   what with DFS like constructions ?? */
-
-        	dostat=0;
-
-        	/* here something with times and mount times?? */
-
-	    }
+	    /* here something with times and mount times?? */
 
         }
 
@@ -213,7 +166,7 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     if ( dostat==1 ) {
 
-        nreturn=lstat(call_info.path, &(e.attr));
+        nreturn=lstat(pathinfo.path, &(e.attr));
 
         if (nreturn==0) {
 	    struct notifyfs_attr_struct *attr;
@@ -273,7 +226,7 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
 	} else {
 
-	    logoutput("notifyfs_lookup: stat on %s gives error %i", call_info.path, errno);
+	    logoutput("notifyfs_lookup: stat on %s gives error %i", pathinfo.path, errno);
 
 	}
 
@@ -284,7 +237,6 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
         /* no stat: here copy the stat from inode */
 
 	get_stat_from_notifyfs(&(e.attr), entry);
-
         nreturn=0;
 
     }
@@ -331,25 +283,28 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    if ( nreturn==-ENOENT && pathinfo.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
 	/* here change the action to DOWN and leave it to changestate what to do?
 	   REMOVE of SLEEP */
 
-        if ( entryexists==1 ) {
+        if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
 		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
 
-		if (call_info.path) {
+		if (pathinfo.path) {
 
-		    fsevent->path=call_info.path;
-		    fsevent->pathallocated=1;
-		    call_info.freepath=0;
+		    /* take over the path */
+
+		    fsevent->pathinfo.path=pathinfo.path;
+		    fsevent->pathinfo.flags=pathinfo.flags;
+		    fsevent->pathinfo.len=pathinfo.len;
+		    pathinfo.flags=0;
 
 		}
 
@@ -362,7 +317,7 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     }
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
@@ -400,28 +355,15 @@ static void notifyfs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlooku
 
 static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    struct stat st;
     struct notifyfs_entry_struct *entry;
     struct notifyfs_inode_struct *inode;
     int nreturn=0;
-    unsigned char entryexists=0, dostat;
-    struct call_info_struct call_info;
+    unsigned char dostat;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct stat st;
 
     logoutput("GETATTR");
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     // get the inode and the entry, they have to exist
 
@@ -443,13 +385,16 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     }
 
-    entryexists=1;
-    call_info.entry=entry;
-
     /* translate entry into path */
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_NONE);
+    nreturn=determine_path(entry, &pathinfo);
     if (nreturn<0) goto out;
+
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
+    if (nreturn<0) goto out;
+
 
     /* if dealing with an autofs managed fs do not stat
        but what to do when there is no cached stat??
@@ -458,21 +403,16 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     dostat=1;
 
-    if (inode->attr>=0) {
+    if ( entry->mount>=0 ) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
-	if ( call_info.mount>=0 ) {
-	    struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+    	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
-    	    if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
+	    /* mount is down, so do not stat
+             what with DFS like constructions ?? */
 
-		/* mount is down, so do not stat
-            	   what with DFS like constructions ?? */
+    	    dostat=0;
 
-        	dostat=0;
-
-        	/* here something with times and mount times?? */
-
-	    }
 
         }
 
@@ -484,7 +424,7 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
         /* get the stat from the underlying fs */
 
-        nreturn=lstat(call_info.path, &st);
+        nreturn=lstat(pathinfo.path, &st);
 
         /* copy the st -> inode->st */
 
@@ -565,22 +505,23 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    if ( nreturn==-ENOENT && pathinfo.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) {
+        if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
 		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
 
-		if (call_info.path) {
+		if (pathinfo.path) {
 
-		    fsevent->path=call_info.path;
-		    fsevent->pathallocated=1;
-		    call_info.freepath=0;
+		    fsevent->pathinfo.path=pathinfo.path;
+		    fsevent->pathinfo.flags=pathinfo.flags;
+		    fsevent->pathinfo.len=pathinfo.len;
+		    pathinfo.flags=0;
 
 		}
 
@@ -593,34 +534,21 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     }
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
 static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 {
-    struct stat st;
     struct notifyfs_entry_struct *entry;
     struct notifyfs_inode_struct *inode;
     int nreturn=0,  res;
-    unsigned char entryexists=0, dostat;
-    struct call_info_struct call_info;
+    unsigned char dostat;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct stat st;
 
     logoutput("ACCESS, mask: %i", mask);
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     // get the inode and the entry, they have to exist
 
@@ -642,36 +570,31 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
     }
 
-    call_info.entry=entry;
-    entryexists=1;
-
     /* translate entry into path */
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_NONE);
+    nreturn=determine_path(entry, &pathinfo);
     if (nreturn<0) goto out;
+
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
+    if (nreturn<0) goto out;
+
 
     dostat=1;
 
-    /* if dealing with an autofs managed fs do not stat
-       but what to do when there is no cached stat??
-       caching???
-    */
+    if (entry->mount>=0) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
-    if (inode->attr>=0) {
+    	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
-	if ( call_info.mount>=0 ) {
-	    struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+	    /* mount is down, so do not stat
+            what with DFS like constructions ?? */
 
-    	    if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
+    	    dostat=0;
 
-		/* mount is down, so do not stat
-            	   what with DFS like constructions ?? */
+    	    /* here something with times and mount times?? */
 
-        	dostat=0;
-
-        	/* here something with times and mount times?? */
-
-	    }
 
         }
 
@@ -681,7 +604,7 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
         /* get the stat from the root fs */
 
-        res=lstat(call_info.path, &st);
+        res=lstat(pathinfo.path, &st);
 
         /* copy the st to inode->st */
 
@@ -765,18 +688,30 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
             nreturn=-ENOENT;
 
         } else {
+	    struct gidlist_struct gidlist={0, 0, NULL};
 
-    	    nreturn=check_access(req, &st, mask);
+	    res=check_access_process(ctx->pid, ctx->uid, ctx->gid, &st, mask, &gidlist);
 
-    	    if ( nreturn==1 ) {
+    	    if ( res==1 ) {
 
         	nreturn=0; /* grant access */
 
-    	    } else if ( nreturn==0 ) {
+    	    } else if ( res==0 ) {
 
         	nreturn=-EACCES; /* access denied */
 
-    	    }
+    	    } else if (res<0) {
+
+		nreturn=res;
+
+	    }
+
+	    if (gidlist.list) {
+
+		free(gidlist.list);
+		gidlist.list=NULL;
+
+	    }
 
 	}
 
@@ -790,22 +725,23 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path ) {
+    if ( nreturn==-ENOENT && pathinfo.path ) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) {
+        if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
 		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
 
-		if (call_info.path) {
+		if (pathinfo.path) {
 
-		    fsevent->path=call_info.path;
-		    fsevent->pathallocated=1;
-		    call_info.freepath=0;
+		    fsevent->pathinfo.path=pathinfo.path;
+		    fsevent->pathinfo.flags=pathinfo.flags;
+		    fsevent->pathinfo.len=pathinfo.len;
+		    pathinfo.flags=0;
 
 		}
 
@@ -818,7 +754,7 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
     }
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
@@ -829,26 +765,11 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
     struct fuse_entry_param e;
     struct notifyfs_entry_struct *entry;
     int nreturn=0;
-    unsigned char entrycreated=0;
-    struct call_info_struct call_info;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct stat st;
 
     logoutput("MKDIR, name: %s", name);
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     entry=find_entry_by_ino(parentino, name);
 
@@ -862,12 +783,10 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
 	    pentry=get_entry(pinode->alias);
 	    entry=create_entry(pentry, name);
-	    entrycreated=1;
 
 	    if ( !entry ) {
 
 		nreturn=-ENOMEM; /* not able to create due to memory problems */
-		entrycreated=0;
 		goto error;
 
 	    } 
@@ -888,17 +807,20 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     }
 
-    call_info.entry=entry;
-
     /* check r permissions of entry */
 
     /* translate entry into path */
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_NONE);
-    if ( nreturn<0 ) goto out;
+    nreturn=determine_path(entry, &pathinfo);
+    if (nreturn<0) goto out;
 
-    if ( call_info.mount>=0 ) {
-	struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
+    if (nreturn<0) goto out;
+
+    if (entry->mount>=0 ) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
     	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
@@ -914,11 +836,9 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     }
 
-
-
     /* only create directory here when it does exist in the underlying fs */
 
-    nreturn=lstat(call_info.path, &(e.attr));
+    nreturn=lstat(pathinfo.path, &(e.attr));
 
     if ( nreturn==-1 ) {
 
@@ -933,22 +853,6 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
             /* TODO additional action */
 
             nreturn=-ENOTDIR; /* not a directory */ 
-
-        } else {
-
-    	    /* check read access : sufficient to create a directory in this fs ... */
-
-    	    nreturn=check_access(req, &(e.attr), R_OK);
-
-    	    if ( nreturn==1 ) {
-
-        	nreturn=0; /* grant access */
-
-    	    } else if ( nreturn==0 ) {
-
-        	nreturn=-EACCES; /* access denied */
-
-    	    }
 
 	}
 
@@ -995,10 +899,9 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
         add_to_name_hash_table(entry);
 
-        logoutput("mkdir successfull");
-
         fuse_reply_entry(req, &e);
-        if ( call_info.path ) free(call_info.path);
+
+	free_path_pathinfo(&pathinfo);
 
         return;
 
@@ -1007,16 +910,16 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     error:
 
-    logoutput("mkdir: error %i", nreturn);
+    logoutput("MKDIR: error %i", nreturn);
 
-    if ( entrycreated==1 ) remove_entry(entry);
+    if (entry) remove_entry(entry);
 
     e.ino = 0;
     e.entry_timeout = notifyfs_options.negative_timeout;
 
     fuse_reply_err(req, abs(nreturn));
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
@@ -1027,27 +930,12 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
     struct fuse_entry_param e;
     struct notifyfs_entry_struct *entry;
     int nreturn=0;
-    unsigned char entrycreated=0;
     struct client_struct *client=NULL;
-    struct call_info_struct call_info;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct stat st;
 
     logoutput("MKNOD, name: %s", name);
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     entry=find_entry_by_ino(parentino, name);
 
@@ -1061,12 +949,10 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
 	    pentry=get_entry(pinode->alias);
 	    entry=create_entry(pentry, name);
-	    entrycreated=1;
 
 	    if ( !entry ) {
 
-		nreturn=-ENOMEM; /* not able to create due to memory problems */
-		entrycreated=0;
+		nreturn=-ENOMEM;
 		goto error;
 
 	    } 
@@ -1087,17 +973,21 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     }
 
-    call_info.entry=entry;
 
     /* translate entry into path */
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_NONE);
-    if ( nreturn<0 ) goto out;
+    nreturn=determine_path(entry, &pathinfo);
+    if (nreturn<0) goto out;
+
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
+    if (nreturn<0) goto out;
 
     /* TODO: check when underlying fs is "sleeping": no access allowed */
 
-    if ( call_info.mount>=0 ) {
-	struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+    if ( entry->mount>=0 ) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
     	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
@@ -1116,7 +1006,7 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     /* only create something here when it does exist in the underlying fs */
 
-    nreturn=lstat(call_info.path, &(e.attr));
+    nreturn=lstat(pathinfo.path, &(e.attr));
 
     if ( nreturn==-1 ) {
 
@@ -1128,20 +1018,6 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
             nreturn=-ENOENT; /* not the same mode */ 
             goto out;
-
-        }
-
-        /* check read access in underlying fs: sufficient to create something in this fs ... */
-
-        nreturn=check_access(req, &(e.attr), R_OK);
-
-        if ( nreturn==1 ) {
-
-            nreturn=0; /* grant access */
-
-        } else if ( nreturn==0 ) {
-
-            nreturn=-EACCES; /* access denied */
 
         }
 
@@ -1185,10 +1061,8 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
         add_to_name_hash_table(entry);
 
-        logoutput("mknod succesfull");
-
         fuse_reply_entry(req, &e);
-        if ( call_info.path ) free(call_info.path);
+        free_path_pathinfo(&pathinfo);
 
         return;
 
@@ -1196,16 +1070,16 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
     error:
 
-    logoutput("mknod: error %i", nreturn);
+    logoutput("MKNOD: error %i", nreturn);
 
-    if ( entrycreated==1 ) remove_entry(entry);
+    if (entry) remove_entry(entry);
 
     e.ino = 0;
     e.entry_timeout = notifyfs_options.negative_timeout;
 
     fuse_reply_err(req, abs(nreturn));
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
@@ -1240,7 +1114,9 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
     int nreturn=0;
     struct notifyfs_entry_struct *entry;
     struct notifyfs_inode_struct *inode;
-    struct call_info_struct call_info;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct stat st;
 
     logoutput("OPENDIR");
 
@@ -1262,28 +1138,15 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     }
 
-    /* register call */
-
-    init_call_info(&call_info, entry);
-    call_info.ctx=fuse_req_ctx(req);
-
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
-
     /* translate entry into path */
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_NONE);
-    if ( nreturn<0 ) goto out;
+    nreturn=determine_path(entry, &pathinfo);
+    if (nreturn<0) goto out;
+
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
+    if (nreturn<0) goto out;
 
     dirp = malloc(sizeof(struct notifyfs_generic_dirp_struct));
 
@@ -1298,10 +1161,7 @@ static void notifyfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     dirp->entry=NULL;
     dirp->upperfs_offset=0;
-
     dirp->generic_fh.entry=entry;
-
-    // assign this object to fi->fh
 
     fi->fh = (unsigned long) dirp;
 
@@ -1359,20 +1219,18 @@ static void notifyfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t 
         if ( dirp->upperfs_offset == 0 ) {
 	    struct notifyfs_inode_struct *inode=get_inode(dirp->generic_fh.entry->inode);
 
-	    logoutput("notifyfs_readdir: got %s", entryname);
-
             /* the . entry */
 
             dirp->st.st_ino = inode->ino;
 	    dirp->st.st_mode=S_IFDIR;
 	    entryname=(char *) dotname;
 
+	    logoutput("notifyfs_readdir: got %s", entryname);
+
         } else if ( dirp->upperfs_offset == 1 ) {
 	    struct notifyfs_inode_struct *inode=get_inode(dirp->generic_fh.entry->inode);
 
             /* the .. entry */
-
-	    logoutput("notifyfs_readdir: got %s", entryname);
 
 	    if (isrootinode(inode) == 1 ) {
 
@@ -1390,6 +1248,8 @@ static void notifyfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t 
 
 	    entryname=(char *) dotdotname;
 	    dirp->st.st_mode=S_IFDIR;
+
+	    logoutput("notifyfs_readdir: got %s", entryname);
 
         } else {
 
@@ -1469,9 +1329,6 @@ static void notifyfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t 
 
 }
 
-
-
-
 static void notifyfs_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     struct notifyfs_generic_dirp_struct *dirp = get_dirp(fi);
@@ -1493,26 +1350,9 @@ static void notifyfs_statfs(fuse_req_t req, fuse_ino_t ino)
     int nreturn=0, res;
     struct notifyfs_entry_struct *entry; 
     struct notifyfs_inode_struct *inode;
-    struct call_info_struct call_info;
-
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("STATFS");
-
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     inode=find_inode(ino);
 
@@ -1590,26 +1430,11 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     struct notifyfs_inode_struct *inode;
     char *basexattr=NULL;
     struct stat st;
-    struct call_info_struct call_info;
-    unsigned char entryexists=0, dostat;
+    unsigned dostat;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
 
     logoutput("SETXATTR");
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     /* find the inode and entry */
 
@@ -1631,12 +1456,14 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    call_info.entry=entry;
-    entryexists=1;
+    /* translate entry into path */
 
-    /* translate entry to path..... and try to determine the backend */
+    nreturn=determine_path(entry, &pathinfo);
+    if (nreturn<0) goto out;
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_BACKEND);
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
     if (nreturn<0) goto out;
 
     dostat=1;
@@ -1650,23 +1477,19 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
        caching???
     */
 
-    if (inode->attr>=0) {
+    if ( entry->mount>=0 ) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
-	if ( call_info.mount>=0 ) {
-	    struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+    	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
-    	    if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
+	    /* mount is down, so do not stat
+            what with DFS like constructions ?? */
 
-		/* mount is down, so do not stat
-            	   what with DFS like constructions ?? */
+    	    dostat=0;
 
-        	dostat=0;
+    	    /* here something with times and mount times?? */
 
-        	/* here something with times and mount times?? */
-
-	    }
-
-        }
+	}
 
     }
 
@@ -1675,7 +1498,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
         /* user must have read access */
 
-        res=lstat(call_info.path, &st);
+        res=lstat(pathinfo.path, &st);
 
         if (res==0) {
 	    struct notifyfs_attr_struct *attr;
@@ -1729,7 +1552,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
 	} else {
 
-	    logoutput("notifyfs_setxattr: error %i stat %s", errno, call_info.path);
+	    logoutput("notifyfs_setxattr: error %i stat %s", errno, pathinfo.path);
 
 	    /* here some action */
 
@@ -1752,23 +1575,35 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
         goto out;
 
     } else {
+	struct gidlist_struct gidlist={0, 0, NULL};
 
-        /* check read access */
+    	/* check read access : sufficient to create a directory in this fs ... 
+	    note this is an overlays fs, the entry does exist in the underlying fs, so the question here
+	    is has the client has enough permissions to read the entry
+	*/
 
-        nreturn=check_access(req, &st, R_OK);
+	res=check_access_process(ctx->pid, ctx->uid, ctx->gid, &st, R_OK|W_OK, &gidlist);
 
-	logoutput("setxattr: got %i from check_access", nreturn);
+    	if ( res==1 ) {
 
-        if ( nreturn>=1 ) {
+    	    nreturn=0; /* grant access */
 
-            nreturn=0; /* grant access */
+    	} else if ( res==0 ) {
 
-        } else if ( nreturn==0 ) {
+    	    nreturn=-EACCES; /* access denied */
 
-            nreturn=-EACCES; /* access denied */
-            goto out;
+    	} else if (res<0) {
 
-        }
+	    nreturn=res;
+
+	}
+
+	if (gidlist.list) {
+
+	    free(gidlist.list);
+	    gidlist.list=NULL;
+
+	}
 
     }
 
@@ -1789,7 +1624,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     if ( strlen(name) > strlen(basexattr) && strncmp(name, basexattr, strlen(basexattr))==0 ) {
 
-	nreturn=setxattr4workspace(&call_info, name + strlen(basexattr), value);
+	nreturn=setxattr4workspace(entry, name + strlen(basexattr), value);
 
     } else {
 
@@ -1815,22 +1650,23 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    if ( nreturn==-ENOENT && pathinfo.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) {
+        if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
 		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
 
-		if (call_info.path) {
+		if (pathinfo.path) {
 
-		    fsevent->path=call_info.path;
-		    fsevent->pathallocated=1;
-		    call_info.freepath=0;
+		    fsevent->pathinfo.path=pathinfo.path;
+		    fsevent->pathinfo.flags=pathinfo.flags;
+		    fsevent->pathinfo.len=pathinfo.len;
+		    pathinfo.flags=0;
 
 		}
 
@@ -1843,7 +1679,7 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
@@ -1857,26 +1693,11 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     struct xattr_workspace_struct *xattr_workspace;
     char *basexattr=NULL;
     struct stat st;
-    struct call_info_struct call_info;
-    unsigned char entryexists=0, dostat;
+    unsigned char dostat;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
 
     logoutput("GETXATTR, name: %s, size: %i", name, size);
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     /* find inode and entry */
 
@@ -1898,13 +1719,14 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    call_info.entry=entry;
+    /* translate entry into path */
 
-    entryexists=1;
+    nreturn=determine_path(entry, &pathinfo);
+    if (nreturn<0) goto out;
 
-    /* translate entry to path..... */
+    /* test permissions */
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_BACKEND);
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
     if (nreturn<0) goto out;
 
     dostat=1;
@@ -1918,24 +1740,19 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
        caching???
     */
 
+    if ( entry->mount>=0 ) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
-    if (inode->attr>=0) {
+    	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
-	if ( call_info.mount>=0 ) {
-	    struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+	    /* mount is down, so do not stat
+            what with DFS like constructions ?? */
 
-    	    if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
+    	    dostat=0;
 
-		/* mount is down, so do not stat
-            	   what with DFS like constructions ?? */
+    	    /* here something with times and mount times?? */
 
-        	dostat=0;
-
-        	/* here something with times and mount times?? */
-
-	    }
-
-        }
+	}
 
     }
 
@@ -1944,7 +1761,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
         /* user must have read access */
 
-        res=lstat(call_info.path, &st);
+        res=lstat(pathinfo.path, &st);
 
         /* copy the st to inode->st */
 
@@ -2000,7 +1817,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
 	} else {
 
-	    logoutput("notifyfs_getxattr: error %i stat %s", errno, call_info.path);
+	    logoutput("notifyfs_getxattr: error %i stat %s", errno, pathinfo.path);
 
 	    /* here some action */
 
@@ -2024,21 +1841,35 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
         goto out;
 
     } else {
+	struct gidlist_struct gidlist={0, 0, NULL};
 
-        /* check read access */
+    	/* check read access : sufficient to create a directory in this fs ... 
+	    note this is an overlays fs, the entry does exist in the underlying fs, so the question here
+	    is has the client has enough permissions to read the entry
+	*/
 
-        nreturn=check_access(req, &st, R_OK);
+	res=check_access_process(ctx->pid, ctx->uid, ctx->gid, &st, R_OK, &gidlist);
 
-        if ( nreturn==1 ) {
+    	if ( res==1 ) {
 
-            nreturn=0; /* grant access */
+    	    nreturn=0; /* grant access */
 
-        } else if ( nreturn==0 ) {
+    	} else if ( res==0 ) {
 
-            nreturn=-EACCES; /* access denied */
-            goto out;
+    	    nreturn=-EACCES; /* access denied */
 
-        }
+    	} else if (res<0) {
+
+	    nreturn=res;
+
+	}
+
+	if (gidlist.list) {
+
+	    free(gidlist.list);
+	    gidlist.list=NULL;
+
+	}
 
     }
 
@@ -2079,7 +1910,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 	xattr_workspace->value=NULL;
 	xattr_workspace->nlen=0;
 
-	getxattr4workspace(&call_info, name + strlen(basexattr), xattr_workspace);
+	getxattr4workspace(entry, name + strlen(basexattr), xattr_workspace);
 
 	if ( xattr_workspace->nerror<0 ) {
 
@@ -2152,22 +1983,23 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path ) {
+    if ( nreturn==-ENOENT && pathinfo.path ) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) {
+        if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
 		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
 
-		if (call_info.path) {
+		if (pathinfo.path) {
 
-		    fsevent->path=call_info.path;
-		    fsevent->pathallocated=0;
-		    call_info.freepath=0;
+		    fsevent->pathinfo.path=pathinfo.path;
+		    fsevent->pathinfo.flags=pathinfo.flags;
+		    fsevent->pathinfo.len=pathinfo.len;
+		    pathinfo.flags=0;
 
 		}
 
@@ -2180,7 +2012,7 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
@@ -2192,26 +2024,11 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     struct notifyfs_entry_struct *entry;
     struct notifyfs_inode_struct *inode;
     struct stat st;
-    struct call_info_struct call_info;
-    unsigned char entryexists=0, dostat;
+    unsigned char dostat;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
 
     logoutput("LISTXATTR, size: %li", (long) size);
-
-    init_call_info(&call_info, NULL);
-    call_info.ctx=fuse_req_ctx(req);
-
-    /* check client access */
-
-    if ( notifyfs_options.accessmode!=0 ) {
-
-        if ( test_access_fsuser(&call_info)==1 ) {
-
-            nreturn=-EACCES;
-            goto out;
-
-        }
-
-    }
 
     /* find inode and entry */
 
@@ -2233,12 +2050,14 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     }
 
-    call_info.entry=entry;
-    entryexists=1;
+    /* translate entry into path */
 
-    /* translate entry to path..... */
+    nreturn=determine_path(entry, &pathinfo);
+    if (nreturn<0) goto out;
 
-    nreturn=determine_path(&call_info, NOTIFYFS_PATH_BACKEND);
+    /* test permissions */
+
+    nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
     if (nreturn<0) goto out;
 
     dostat=1;
@@ -2252,23 +2071,19 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
        caching???
     */
 
-    if (inode->attr>=0) {
+    if (entry->mount>=0 ) {
+	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
-	if ( call_info.mount>=0 ) {
-	    struct notifyfs_mount_struct *mount=get_mount(call_info.mount);
+    	if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
 
-    	    if ( mount->status!=NOTIFYFS_MOUNTSTATUS_UP ) {
+	    /* mount is down, so do not stat
+            what with DFS like constructions ?? */
 
-		/* mount is down, so do not stat
-            	   what with DFS like constructions ?? */
+    	    dostat=0;
 
-        	dostat=0;
+    	    /* here something with times and mount times?? */
 
-        	/* here something with times and mount times?? */
-
-	    }
-
-        }
+	}
 
     }
 
@@ -2276,7 +2091,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
         /* user must have read access */
 
-        res=lstat(call_info.path, &st);
+        res=lstat(pathinfo.path, &st);
 
         /* copy the st to inode->st */
 
@@ -2332,7 +2147,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
 	} else {
 
-	    logoutput("notifyfs_listxattr: error %i stat %s", errno, call_info.path);
+	    logoutput("notifyfs_listxattr: error %i stat %s", errno, pathinfo.path);
 
 	    /* here some action */
 
@@ -2355,21 +2170,35 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
         goto out;
 
     } else {
+	struct gidlist_struct gidlist={0, 0, NULL};
 
-        /* check read access */
+    	/* check read access : sufficient to create a directory in this fs ... 
+	    note this is an overlays fs, the entry does exist in the underlying fs, so the question here
+	    is has the client has enough permissions to read the entry
+	*/
 
-        nreturn=check_access(req, &st, R_OK);
+	res=check_access_process(ctx->pid, ctx->uid, ctx->gid, &st, R_OK, &gidlist);
 
-        if ( nreturn==1 ) {
+    	if ( res==1 ) {
 
-            nreturn=0; /* grant access */
+    	    nreturn=0; /* grant access */
 
-        } else if ( nreturn==0 ) {
+    	} else if ( res==0 ) {
 
-            nreturn=-EACCES; /* access denied */
-            goto out;
+    	    nreturn=-EACCES; /* access denied */
 
-        }
+    	} else if (res<0) {
+
+	    nreturn=res;
+
+	}
+
+	if (gidlist.list) {
+
+	    free(gidlist.list);
+	    gidlist.list=NULL;
+
+	}
 
     }
 
@@ -2394,7 +2223,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
 	}
 
-	nlenlist=listxattr4workspace(&call_info, list, size);
+	nlenlist=listxattr4workspace(entry, list, size);
 
 	if ( nlenlist<0 ) {
 
@@ -2432,43 +2261,37 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
 	if ( size == 0 ) {
 
-	    // reply with the requested size
-
 	    fuse_reply_xattr(req, nlenlist);
 
 	} else {
 
-	    // here a security check the list exists??
-
 	    fuse_reply_buf(req, list, size);
-
-	    // should the list be freed ???
 
 	}
 
     }
 
-    // if ( list ) free(list);
     logoutput("listxattr, nreturn: %i, nlenlist: %i", nreturn, nlenlist);
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && call_info.path) {
+    if ( nreturn==-ENOENT && pathinfo.path) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
-        if ( entryexists==1 ) {
+        if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
 		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
 
-		if (call_info.path) {
+		if (pathinfo.path) {
 
-		    fsevent->path=call_info.path;
-		    fsevent->pathallocated=1;
-		    call_info.freepath=0;
+		    fsevent->pathinfo.path=pathinfo.path;
+		    fsevent->pathinfo.flags=pathinfo.flags;
+		    fsevent->pathinfo.len=pathinfo.len;
+		    pathinfo.flags=0;
 
 		}
 
@@ -2481,7 +2304,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     }
 
-    if ( call_info.freepath==1 ) free(call_info.path);
+    free_path_pathinfo(&pathinfo);
 
 }
 
@@ -2695,32 +2518,27 @@ static void notifyfs_destroy (void *userdata)
    (mountpoint, mountsource, fstype)
    */
 
-void update_notifyfs(unsigned char firstrun)
+int update_notifyfs(unsigned long long generation_id, struct mountentry_struct *(*next) (void **index, unsigned char type))
 {
-    struct mount_entry_struct *mount_entry=NULL;
+    struct mountentry_struct *mountentry=NULL;
     struct notifyfs_entry_struct *entry;
-    struct client_struct *client;
     int nreturn=0, res;
+    void *index=NULL;
+    struct notifyfs_fsevent_struct *fsevent=NULL;
+    struct supermount_struct *supermount=NULL;
 
     logoutput("update_notifyfs");
 
-    /* walk through removed mounts to see it affects the fs */
+    index=NULL;
+    mountentry=next(&index, MOUNTLIST_REMOVED);
 
-    res=lock_mountlist();
+    while (mountentry) {
 
-    /* start with last: the list is sorted, bigger/longer (also submounts) mounts are first this way */
+	supermount=find_supermount_majorminor(mountentry->major, mountentry->minor);
 
-    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_REMOVED);
+	if (supermount) {
 
-    while (mount_entry) {
-
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
-
-        /* if normal umount then remove the tree... 
-               if umounted by autofs then set tree to sleep */
-
-        if ( entry ) {
-	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
+	    fsevent=create_fsevent(entry);
 
 	    if (! fsevent) {
 
@@ -2730,105 +2548,55 @@ void update_notifyfs(unsigned char firstrun)
 
 		fsevent->fseventmask.fs_event=NOTIFYFS_FSEVENT_FS_UNMOUNT;
 
-		fsevent->path=mount_entry->mountpoint;
-		fsevent->pathallocated=0; /* do not free it! */
+		fsevent->pathinfo.path=strdup(mountentry->mountpoint);
+		fsevent->pathinfo.flags=0;
+
+		if (fsevent->pathinfo.path) {
+
+		    fsevent->pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+		    fsevent->pathinfo.len=strlen(mountentry->mountpoint);
+
+		} else {
+
+		    fsevent->pathinfo.flags=0;
+		    fsevent->pathinfo.len=0;
+
+		}
 
 		get_current_time(&fsevent->detect_time);
 
-		fsevent->mount_entry=mount_entry;
+		fsevent->data=(void *) supermount;
+		fsevent->flags=mountentry->flags;
 
 		queue_fsevent(fsevent);
 
 	    }
-
-        }
-
-        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_REMOVED);
-
-    }
-
-    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_AUTOFS_KEEP);
-
-    while (mount_entry) {
-
-	/* it's possible this mount entry has been processed already 
-	    possible other sollution like the generation id, unique, time...???*/
-
-	if ( mount_entry->processed==1 ) {
-
-	    mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_AUTOFS_KEEP);
-	    continue;
-
-	}
-
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
-
-        if ( entry ) {
-	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
-
-	    if (! fsevent) {
-
-		logoutput("update_notifyfs: unable to allocate memory for unmount fsevent (autofs)");
-
-	    } else {
-
-		fsevent->fseventmask.fs_event=NOTIFYFS_FSEVENT_FS_UNMOUNT;
-
-		fsevent->path=mount_entry->mountpoint;
-		fsevent->pathallocated=0; /* do not free it! */
-
-		get_current_time(&fsevent->detect_time);
-
-		fsevent->mount_entry=mount_entry;
-
-		queue_fsevent(fsevent);
-
-	    }
-
-        }
-
-	mount_entry->processed=1;
-
-        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_AUTOFS_KEEP);
-
-    }
-
-    /* in any case the watches set on an autofs managed fs, get out of "sleep" mode */
-
-    mount_entry=get_next_mount_entry(NULL, 1, MOUNTENTRY_ADDED);
-
-    while (mount_entry) {
-
-	logoutput("update_notifyfs: found mount entry %s", mount_entry->mountpoint);
-
-	if ( is_rootmount(mount_entry) ) {
-
-	    /* link rootmount and rootentry */
-
-	    if ( ! mount_entry->entry ) {
-
-		/* not already assigned */
-
-		entry=get_rootentry();
-
-		mount_entry->entry=(void *) entry;
-
-	    }
-
-	}
-
-        entry=(struct notifyfs_entry_struct *) mount_entry->entry;
-
-	if ( strcmp(notifyfs_options.mountpoint, mount_entry->mountpoint)==0 ) {
-
-		/* skip the mountpoint of this fs, caused deadlocks in the past... 
-		   this will be not the case anymore since the threads for handling the fuse
-		   events are up and running independent of this thread... needs testing */
-
-	    goto next;
 
 	} else {
+
+	    logoutput("update_notifyfs: unable to find the supermount %i:%i", mountentry->major, mountentry->minor);
+
+	}
+
+        mountentry=next(&index, MOUNTLIST_REMOVED);
+
+    }
+
+
+    index=NULL;
+    mountentry=next(&index, MOUNTLIST_ADDED);
+
+    while (mountentry) {
+
+	logoutput("update_notifyfs: found mount entry, unique %lli, generation %lli, path %s", mountentry->unique, mountentry->generation, mountentry->mountpoint);
+
+	supermount=find_supermount_majorminor(mountentry->major, mountentry->minor);
+	if (! supermount) supermount=add_supermount(mountentry->major, mountentry->minor, mountentry->source, mountentry->options);
+
+	if (supermount) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(NULL);
+
+	    supermount->fs=lookup_filesystem(mountentry->fs);
 
 	    if (! fsevent) {
 
@@ -2838,12 +2606,24 @@ void update_notifyfs(unsigned char firstrun)
 
 		fsevent->fseventmask.fs_event=NOTIFYFS_FSEVENT_FS_MOUNT;
 
-		fsevent->path=mount_entry->mountpoint;
-		fsevent->pathallocated=0; /* do not free it! */
+		fsevent->pathinfo.path=strdup(mountentry->mountpoint);
+
+		if (fsevent->pathinfo.path) {
+
+		    fsevent->pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+		    fsevent->pathinfo.len=strlen(mountentry->mountpoint);
+
+		} else {
+
+		    fsevent->pathinfo.len=0;
+		    fsevent->pathinfo.flags=0;
+
+		}
 
 		get_current_time(&fsevent->detect_time);
 
-		fsevent->mount_entry=mount_entry;
+		fsevent->data=(void *) supermount;
+		fsevent->flags=mountentry->flags;
 
 		queue_fsevent(fsevent);
 
@@ -2851,16 +2631,15 @@ void update_notifyfs(unsigned char firstrun)
 
 	}
 
-
 	next:
 
-        mount_entry=get_next_mount_entry(mount_entry, 1, MOUNTENTRY_ADDED);
+	mountentry=next(&index, MOUNTLIST_ADDED);
 
     }
 
-    unlock:
+    last_generation_id=generation_id;
 
-    res=unlock_mountlist();
+    return 1;
 
 }
 
@@ -2868,156 +2647,103 @@ void update_notifyfs(unsigned char firstrun)
     TODO: read the supported filesystems 
 */
 
-unsigned char skip_mount_entry(char *source, char *fs, char *path)
+unsigned char skip_mountentry(char *source, char *fs, char *path)
 {
+    struct notifyfs_filesystem_struct *filesystem=NULL;
+    int error=0;
+    unsigned char doskip=0;
 
-    /* skip mounts in certain system directories */
+    /* skip the mountpoint of notifyfs self */
 
-    if (strncmp(path, "/proc/", 6)==0) {
+    if (strcmp(path, notifyfs_options.mountpoint)==0) {
 
-	return 1;
-
-    } else if (strncmp(path, "/sys/", 5)==0) {
-
-	return 1;
-
-    } else if (strncmp(path, "/dev/", 5)==0) {
-
-	return 1;
+	doskip=1;
+	goto out;
 
     }
 
-    /* skip various system filesystems */
+    /*
+	do not skip auto mounted mountpoints
+    */
 
-    if (strcmp(fs, "devtmpfs")==0) {
+    if (strcmp(fs, "autofs")==0) goto out;
 
-	return 1;
+    /*
+	determine the filesystem, to find out it's a system fs or not
+    */
 
-    } else if (strcmp(fs, "sysfs")==0) {
+    filesystem=lookup_filesystem(fs);
 
-	return 1;
+    if (! filesystem) {
 
-    } else if (strcmp(fs, "proc")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "cgroup")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "cpuset")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "binfmt_misc")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "sockfs")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "pipefs")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "anon_inodefs")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "rpc_pipefs")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "configfs")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "devpts")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "hugetlbfs")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "fusectl")==0) {
-
-	return 1;
-
-    } else if (strcmp(fs, "mqueue")==0) {
-
-	return 1;
+	filesystem=read_supported_filesystems(fs, &error);
 
     }
 
+    if (filesystem) {
 
+	if (filesystem->mode & (NOTIFYFS_FILESYSTEM_KERNEL | NOTIFYFS_FILESYSTEM_NODEV)) {
 
-    /* do not skip local filesystems */
+	    /* test it's a system filesystem or not */
 
-    if (strcmp(fs, "ext2")==0 || strcmp(fs, "ext3")==0 || strncmp(fs, "ext4", 4)==0) {
+	    if (! (filesystem->mode & NOTIFYFS_FILESYSTEM_STAT)) {
+		struct statvfs stvfs;
 
-	return 0;
+		if (statvfs(path, &stvfs)==0) {
 
-    } else if (strcmp(fs, "reiserfs")==0) {
+		    if (stvfs.f_bfree==0) filesystem->mode|=NOTIFYFS_FILESYSTEM_SYSTEM;
 
-	return 0;
+		}
 
-    } else if (strcmp(fs, "xfs")==0) {
+		filesystem->mode|=NOTIFYFS_FILESYSTEM_STAT;
 
-	return 0;
+	    }
 
-    } else if (strcmp(fs, "vfat")==0 || strcmp(fs, "msdos")==0 || strcmp(fs, "ntfs")==0 ) {
+	}
 
-	return 0;
+	/* skip system filesystems like proc, mqueue, sysfs, cgroup etc */
 
-    } else if (strcmp(fs, "iso9660")==0) {
+	if (filesystem->mode&NOTIFYFS_FILESYSTEM_SYSTEM) {
 
-	return 0;
+	    doskip=1;
+	    goto out;
 
-    } else if (strcmp(fs, "udf")==0) {
+	}
 
-	return 0;
+    } else if (error>0) {
 
-    } else if (strcmp(fs, "btrfs")==0) {
+	if (error==ENOMEM) {
 
-	return 0;
+	    logoutput("skip_mountentry: memory allocation error");
 
-    } else if (strncmp(fs, "fuse.", 5)==0) {
+	} else {
 
-	return 0;
+	    logoutput("skip_mountentry: unknown error (%i)", error);
+
+	}
+
+    } else {
+
+	/*
+	    not a kernel fs
+	    (with linux: a fuse fs)
+
+	*/
+
+	filesystem=create_filesystem();
+
+	if (filesystem) {
+
+	    strncpy(filesystem->filesystem, fs, 32);
+	    add_filesystem(filesystem, 0);
+
+	}
 
     }
 
-    /* allow autofs */
+    out:
 
-    if (strcmp(fs, "autofs")==0) {
-
-	return 0;
-
-    }
-
-    /* network filesystems */
-
-    if (strcmp(fs, "cifs")==0) {
-
-	return 0;
-
-    } else if (strcmp(fs, "nfs")==0) {
-
-	return 0;
-
-    } else if (strcmp(fs, "afs")==0) {
-
-	return 0;
-
-    }
-
-
-
-    /* all other allow ... */
-
-    return 0;
+    return doskip;
 
 }
 
@@ -3028,6 +2754,7 @@ int process_connection_event(struct notifyfs_connection_struct *connection, uint
     if (events & EPOLLIN) {
 	char *buffer=NULL;
 	size_t lenbuffer=0;
+	unsigned char isremote=0;
 
 	if (connection->typedata==NOTIFYFS_OWNERTYPE_CLIENT) {
 	    struct client_struct *client=(struct client_struct *) connection->data;
@@ -3069,15 +2796,36 @@ int process_connection_event(struct notifyfs_connection_struct *connection, uint
 	    buffer=notifyfs_server->buffer;
 	    lenbuffer=notifyfs_server->lenbuffer;
 
+	} else if (connection->typedata==NOTIFYFS_OWNERTYPE_BACKEND) {
+	    struct notifyfs_backend_struct *notifyfs_backend=(struct notifyfs_backend_struct *) connection->data;
+
+	    if ( ! notifyfs_backend->buffer) {
+
+		notifyfs_backend->buffer=malloc(NOTIFYFS_RECVBUFFERSIZE);
+
+		if (notifyfs_backend->buffer) {
+
+		    notifyfs_backend->lenbuffer=NOTIFYFS_RECVBUFFERSIZE;
+		    logoutput("process_connection_event: buffer created for backend (size: %i)", notifyfs_backend->lenbuffer);
+
+		}
+
+	    }
+
+	    buffer=notifyfs_backend->buffer;
+	    lenbuffer=notifyfs_backend->lenbuffer;
+
 	}
 
 	int res=receive_message(connection->fd, connection->data, events, connection->typedata, buffer, lenbuffer);
 
 	if (res==0) {
 
-	    /* in case of a connection with a remote server this means a hangup */
+	    /* 
+		in case of a connection with a remote server this means a hangup 
+	    */
 
-	    if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+	    if (is_remote(connection)==1) {
 
 		events|=EPOLLHUP;
 
@@ -3093,11 +2841,12 @@ int process_connection_event(struct notifyfs_connection_struct *connection, uint
 	    struct client_struct *client;
 
 	    close(connection->fd);
-	    connection->fd=0;
 
 	    client=(struct client_struct *) connection->data;
 
 	    if (client) {
+		struct view_struct *view=NULL;
+		void *view_index=NULL;
 
 		logoutput("process_connection_event: hangup of client %i, remove watches", client->pid);
 
@@ -3105,10 +2854,33 @@ int process_connection_event(struct notifyfs_connection_struct *connection, uint
 
 		client->connection=NULL;
 
+		/*
+		    bring all views used by this client down
+		*/
+
+		view=get_next_view(client->pid, &view_index);
+
+		while(view) {
+
+		    if (view->pid==client->pid) {
+
+			pthread_mutex_lock(&view->mutex);
+			view->status=NOTIFYFS_VIEWSTATUS_CLIENTDOWN;
+			pthread_cond_broadcast(&view->cond);
+			pthread_mutex_unlock(&view->mutex);
+
+		    }
+
+		    view=get_next_view(client->pid, &view_index);
+
+		}
+
 		remove_clientwatches_client(client);
 		remove_client(client);
 
 	    }
+
+	    connection->fd=0;
 
 	} else if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 	    struct notifyfs_server_struct *notifyfs_server=(struct notifyfs_server_struct *) connection->data;
@@ -3126,6 +2898,30 @@ int process_connection_event(struct notifyfs_connection_struct *connection, uint
 		notifyfs_server->connection=NULL;
 
 		remove_clientwatches_server(notifyfs_server);
+
+	    }
+
+	} else if (connection->typedata==NOTIFYFS_OWNERTYPE_BACKEND) {
+	    struct notifyfs_backend_struct *notifyfs_backend=(struct notifyfs_backend_struct *) connection->data;
+
+	    close(connection->fd);
+	    connection->fd=0;
+
+	    /* what to do here ?? 
+
+		with a remote server as backend?
+		with a fuse fs as backend? this will also be reported when the fs is unmounted 
+		with the kernel... this will not happen
+
+		in general: there is nothing here when a watch is forwarded to the backend
+	    */
+
+	    if (notifyfs_backend) {
+
+		logoutput("process_connection_event: hangup of backend");
+
+		notifyfs_backend->status=NOTIFYFS_BACKENDSTATUS_DOWN;
+		notifyfs_backend->connection=NULL;
 
 	    }
 
@@ -3155,7 +2951,7 @@ int add_localclient(struct notifyfs_connection_struct *connection, uint32_t even
 
 	if (! client) {
 
-	    client=register_client(connection->fd, credentials.pid, credentials.uid, credentials.gid, NOTIFYFS_CLIENTTYPE_NONE);
+	    client=register_client(connection->fd, credentials.pid, credentials.uid, credentials.gid, 0, 0);
 
 	    if (client) {
 
@@ -3186,60 +2982,44 @@ int add_localclient(struct notifyfs_connection_struct *connection, uint32_t even
 
 }
 
-int add_networkserver(struct notifyfs_connection_struct *connection, uint32_t events)
+int add_networkserver(struct notifyfs_connection_struct *new_connection, uint32_t events)
 {
     int nreturn=0;
 
     /* what to match against the connection ?? */
 
-    if (is_remote(connection)==1) {
+    if (is_remote(new_connection)==1) {
+	struct notifyfs_connection_struct *connection=NULL;
 
-	/* here look for a notifyfs server */
+	connection=compare_notifyfs_connections(new_connection);
 
-	/* check in the existing notifyfs servers */
-	/* if it exists: deny the connection */
+	if (connection) {
 
-	/* what to compare ???
+	    /* existing connection found */
 
-	    compare the peername ??
+	    if (connection->typedata==NOTIFYFS_OWNERTYPE_SERVER) {
+		struct notifyfs_server_struct *notifyfs_server=NULL;
 
-	*/
+		notifyfs_server=(struct notifyfs_server_struct *) connection->data;
 
-	struct notifyfs_server_struct *notifyfs_server=compare_notifyfs_servers(connection->fd);
+		if (notifyfs_server) {
 
-	if (notifyfs_server) {
+		    /* there is already a connection to the same host */
 
-	    if (notifyfs_server->connection) {
+		    nreturn=-1;
 
-		/* there is already a connection to the same host */
-
-		nreturn=-1;
-
-	    } else {
-
-		/* there is already a reference to this server, but no connection, so use the new one */
-
-		notifyfs_server->connection=connection;
-		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
-		notifyfs_server->error=0;
-
-		get_current_time(&notifyfs_server->connect_time);
-
-		connection->data=(void *) notifyfs_server;
-		connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
-		connection->process_event=process_connection_event;
+		}
 
 	    }
 
 	} else {
+	    struct notifyfs_server_struct *notifyfs_server=NULL;
 
 	    /* get a new notifyfs server */
 
 	    notifyfs_server=create_notifyfs_server();
 
 	    if (notifyfs_server) {
-
-		init_notifyfs_server(notifyfs_server);
 
 		notifyfs_server->connection=connection;
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
@@ -3287,7 +3067,7 @@ int main(int argc, char *argv[])
     struct epoll_extended_data_struct xdata_mountinfo=EPOLL_XDATA_INIT;
     struct epoll_extended_data_struct xdata_lockinfo=EPOLL_XDATA_INIT;
     struct fuse_args global_fuse_args = FUSE_ARGS_INIT(0, NULL);
-    struct workerthreads_queue_struct notifyfs_threads_queue=WORKERTHREADS_QUEUE_INIT;
+    struct workerthreads_queue_struct notifyfs_threadsqueue=WORKERTHREADS_QUEUE_INIT;
     struct notifyfs_connection_struct localserver_socket;
     struct notifyfs_connection_struct inetserver_socket;
 
@@ -3323,16 +3103,16 @@ int main(int argc, char *argv[])
 
     /* set the maximum number of threads */
 
-    set_max_nr_workerthreads(&notifyfs_threads_queue, 8);
-    add_workerthreads(&notifyfs_threads_queue, 8);
+    set_max_nr_workerthreads(&notifyfs_threadsqueue, 8);
+    add_workerthreads(&notifyfs_threadsqueue, 8);
 
-    init_changestate(&notifyfs_threads_queue);
+    init_changestate(&notifyfs_threadsqueue);
 
-    //
-    // init the shared memory blocks
-    //
+    /*
+	 create and init the shared memory blocks
+    */
 
-    res=initialize_sharedmemory_notifyfs();
+    res=initialize_sharedmemory_notifyfs(0, notifyfs_options.shm_gid);
 
     if ( res<0 ) {
 
@@ -3342,10 +3122,10 @@ int main(int argc, char *argv[])
     }
 
     /*
-     create the root inode and entry
+        create the root inode and entry
     */
 
-    res=create_root();
+    res=init_entry_management();
 
     if ( res<0 ) {
 
@@ -3377,6 +3157,11 @@ int main(int argc, char *argv[])
 
     }
 
+    /* read supported filesystems */
+
+    register_fsfunctions();
+    read_supported_filesystems(NULL, NULL);
+
     /* read fstab */
 
     read_fstab();
@@ -3384,6 +3169,8 @@ int main(int argc, char *argv[])
     /* initialize watch tables */
 
     init_watch_hashtables();
+
+    /* initialize the watches */
 
     epoll_fd=init_eventloop(NULL, 1, 0);
 
@@ -3402,7 +3189,7 @@ int main(int argc, char *argv[])
         create the socket clients can connect to
     */
 
-    init_handleclientmessage(&notifyfs_threads_queue);
+    init_handleclientmessage(&notifyfs_threadsqueue);
 
     localserver_socket.fd=0;
     init_xdata(&localserver_socket.xdata_socket);
@@ -3424,9 +3211,10 @@ int main(int argc, char *argv[])
 	if forwarding over network is enabled: listen to remote servers
     */
 
-    init_networkutils();
-
     if ( notifyfs_options.forwardnetwork==1) {
+
+	init_local_backend();
+	init_local_server();
 
 	if ( ! notifyfs_options.remoteserversfile ) {
 
@@ -3449,12 +3237,19 @@ int main(int argc, char *argv[])
     inetserver_socket.allocated=0;
     inetserver_socket.process_event=NULL;
 
-
     if (notifyfs_options.listennetwork==1) {
 
 	logoutput("main: listen on network port requested, but not yet supported");
 
-	inet_fd=create_inet_serversocket(notifyfs_options.networkport, &inetserver_socket, NULL, add_networkserver);
+	if (notifyfs_options.ipv6==0) {
+
+	    inet_fd=create_inet_serversocket(AF_INET, notifyfs_options.networkport, &inetserver_socket, NULL, add_networkserver);
+
+	} else {
+
+	    inet_fd=create_inet_serversocket(AF_INET6, notifyfs_options.networkport, &inetserver_socket, NULL, add_networkserver);
+
+	}
 
 	if ( inet_fd<=0 ) {
 
@@ -3469,18 +3264,18 @@ int main(int argc, char *argv[])
 	add mount monitor
     */
 
-    init_handlemountinfoevent(&notifyfs_threads_queue);
+    init_handlemountinfoevent(&notifyfs_threadsqueue);
 
-    mountinfo_fd=open(MOUNTINFO_FILE, O_RDONLY);
+    res=open_mountmonitor(&xdata_mountinfo, update_notifyfs, skip_mountentry);
 
-    if ( mountinfo_fd==-1 ) {
+    if ( res<0 ) {
 
-        logoutput("unable to open file %s", MOUNTINFO_FILE);
+        logoutput("main: unable to open mountmonitor");
         goto out;
 
     }
 
-    epoll_xdata=add_to_epoll(mountinfo_fd, EPOLLERR, process_mountinfo_event, NULL, &xdata_mountinfo, NULL);
+    epoll_xdata=add_to_epoll(xdata_mountinfo.fd, EPOLLERR, process_mountinfo_event, NULL, &xdata_mountinfo, NULL);
 
     if ( ! epoll_xdata ) {
 
@@ -3489,75 +3284,35 @@ int main(int argc, char *argv[])
 
     } else {
 
-        logoutput("mountinfo fd %i added to epoll", mountinfo_fd);
-
+        logoutput("mountinfo fd %i added to epoll", xdata_mountinfo.fd);
 	add_xdata_to_list(epoll_xdata);
 
     }
-
-    /* assign a callback when something changes */
-
-    register_mountinfo_callback(MOUNTINFO_CB_ONUPDATE, &update_notifyfs);
-    register_mountinfo_callback(MOUNTINFO_CB_IGNOREENTRY, &skip_mount_entry);
 
     /* read the mountinfo to initialize */
 
     process_mountinfo_event(0, NULL, 0);
 
-    /*
-     	add lock monitor
-    */
-
-    if (0) {
-
-	init_handlelockinfoevent(&notifyfs_threads_queue);
-
-	lockmonitor_fd=open_locksfile();
-
-	if ( lockmonitor_fd==-1 ) {
-
-    	    logoutput("unable to open locks file");
-    	    goto out;
-
-	}
-
-	epoll_xdata=add_to_epoll(lockmonitor_fd, EPOLLERR, process_lockinfo_event, NULL, &xdata_lockinfo, NULL);
-
-	if ( ! epoll_xdata ) {
-
-    	    logoutput("error adding lockinfo fd to mainloop");
-    	    goto out;
-
-	} else {
-
-    	    logoutput("lockinfo fd %i added to epoll", lockmonitor_fd);
-
-	    add_xdata_to_list(epoll_xdata);
-
-	}
-
-	/* process to initialize */
-
-	process_lockinfo_event(0, NULL, 0);
-
-    }
-
-
     /* fs notify backends */
 
     initialize_fsnotify_backends();
 
+    /* enable fuse or not */
 
-    /* start fuse */
+    if (notifyfs_options.enablefusefs==1) {
 
-    res=initialize_fuse(notifyfs_options.mountpoint, "notifyfs", &notifyfs_oper, sizeof(notifyfs_oper), &global_fuse_args, &notifyfs_threads_queue);
-    if (res<0) goto out;
+	/* start fuse */
 
-    res=start_epoll_eventloop(NULL);
+	res=initialize_fuse(notifyfs_options.mountpoint, "notifyfs", &notifyfs_oper, sizeof(notifyfs_oper), &global_fuse_args, &notifyfs_threadsqueue);
+	if (res<0) goto out;
+
+    }
+
+    res=start_epoll_eventloop(NULL, NULL);
 
     out:
 
-    finish_fuse();
+    if (notifyfs_options.enablefusefs==1) finish_fuse();
 
     close_fsnotify_backends();
 
@@ -3586,7 +3341,7 @@ int main(int argc, char *argv[])
     destroy_eventloop(NULL);
     fuse_opt_free_args(&global_fuse_args);
 
-    destroy_workerthreads_queue(&notifyfs_threads_queue);
+    destroy_workerthreads_queue(&notifyfs_threadsqueue);
 
     skipeverything:
 

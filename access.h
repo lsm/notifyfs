@@ -19,10 +19,20 @@
 #ifndef NOTIFYFS_ACCESS_H
 #define NOTIFYFS_ACCESS_H
 
+#define NOTIFYFS_ACCESS_NONE   0
+#define NOTIFYFS_ACCESS_ROOT   1
+#define NOTIFYFS_ACCESS_CLIENT 2
+#define NOTIFYFS_ACCESS_TEST   4
+
+struct gidlist_struct {
+    int nr;
+    int len;
+    gid_t *list;
+};
 
 // Prototypes
 
-int check_access(fuse_req_t req, struct stat *st, int mask);
+unsigned char check_access_process(pid_t pid, uid_t uid, gid_t gid, struct stat *st, int mask, struct gidlist_struct *gidlist);
 
 #endif
 

@@ -22,18 +22,34 @@
 
 typedef char pathstring[PATH_MAX+1];
 
-#define NOTIFYFS_PATH_NONE      0
-#define NOTIFYFS_PATH_FORCE     1
-#define NOTIFYFS_PATH_BACKEND   2
+#define NOTIFYFS_PATH_NONE      	0
+#define NOTIFYFS_PATH_FORCE     	1
+#define NOTIFYFS_PATH_ACCESS		2
+
+#define NOTIFYFS_PATHINFOFLAGS_NONE		0
+#define NOTIFYFS_PATHINFOFLAGS_ALLOCATED	1
+#define NOTIFYFS_PATHINFOFLAGS_INUSE		2
+
+struct pathinfo_struct {
+    char *path;
+    int len;
+    unsigned char flags;
+};
 
 struct call_info_struct {
     struct notifyfs_entry_struct *entry;
-    struct watch_struct *watch;
     pthread_t threadid;
-    char *path;
-    unsigned char freepath;
+    struct pathinfo_struct pathinfo;
+    struct stat *st;
+    unsigned char flags;
+    unsigned char entrycreated;
+    unsigned char strict;
     int mount;
-    const struct fuse_ctx *ctx;
+    pid_t pid;
+    uid_t uid;
+    gid_t gid;
+    unsigned char mask;
+    unsigned int error;
 };
 
 struct notifyfs_generic_fh_struct {
@@ -51,8 +67,13 @@ struct notifyfs_generic_dirp_struct {
 
 // Prototypes
 
-int determine_path(struct call_info_struct *call_info, unsigned char flags);
+int check_access_path(char *path, pid_t pid, uid_t uid, gid_t gid, struct stat *st, unsigned char mask);
+int determine_path(struct notifyfs_entry_struct *entry, struct pathinfo_struct *pathinfo);
+
 void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_struct *entry);
-void create_notifyfs_path(struct call_info_struct *call_info, struct stat *buff_st);
+
+struct notifyfs_entry_struct *create_notifyfs_path(struct pathinfo_struct *pathinfo, struct stat *st, unsigned char strict, int mask, int *error, pid_t pid, uid_t uid, gid_t gid);
+
+void free_path_pathinfo(struct pathinfo_struct *pathinfo);
 
 #endif

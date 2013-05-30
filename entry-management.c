@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 
+#include <linux/kdev_t.h>
 
 #ifndef ENOATTR
 #define ENOATTR ENODATA        /* No such attribute */
@@ -44,12 +45,18 @@
 
 #define LOG_LOGAREA LOG_LOGAREA_INODES
 
-#include <fuse/fuse_lowlevel.h>
 #include "logging.h"
-#include "notifyfs-io.h"
-#include "utils.h"
-#include "entry-management.h"
 
+#include "epoll-utils.h"
+
+#include "socket.h"
+#include "utils.h"
+
+#include "notifyfs-fsevent.h"
+#include "notifyfs-io.h"
+#include "entry-management.h"
+#include "backend.h"
+#include "simple-list.h"
 
 static unsigned long long inoctr = FUSE_ROOT_ID;
 static pthread_mutex_t inoctr_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -57,66 +64,95 @@ static pthread_mutex_t inoctr_mutex=PTHREAD_MUTEX_INITIALIZER;
 struct notifyfs_inode_struct *rootinode=NULL;
 struct notifyfs_entry_struct *rootentry=NULL;
 
-static int free_entries=-1;
-static pthread_mutex_t free_entries_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct simple_group_struct group_mount;
+static struct simple_group_struct group_entry;
+static struct simple_group_struct group_attr;
+struct simple_group_struct group_view;
 
-static int free_attributes=-1;
-static pthread_mutex_t free_attributes_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct supermount_struct *supermount_list[MOUNTTABLE_SIZE];
+static unsigned char initialized=0;
+static pthread_mutex_t supermount_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-static int free_mounts=-1;
-static pthread_mutex_t free_mounts_mutex=PTHREAD_MUTEX_INITIALIZER;
+static unsigned long global_owner_id=0;
+static pthread_mutex_t owner_id_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-struct notifyfs_mount_struct *create_mount(char *fs, char *mountsource, char *superoptions, struct notifyfs_entry_struct *entry)
+unsigned long new_owner_id()
+{
+    unsigned long owner_id;
+
+    pthread_mutex_lock(&owner_id_mutex);
+
+    owner_id=global_owner_id;
+    global_owner_id++;
+
+    pthread_mutex_unlock(&owner_id_mutex);
+
+    return owner_id;
+}
+
+
+int calculate_mount_hash(int major, int minor)
+{
+    return MKDEV(major, minor) % SIMPLE_LIST_HASHSIZE;
+}
+
+int mount_hashfunction(void *data)
+{
+    struct notifyfs_mount_struct *mount=(struct notifyfs_mount_struct *) data;
+    return calculate_mount_hash(mount->major, mount->minor);
+
+}
+
+struct notifyfs_mount_struct *create_mount(struct notifyfs_entry_struct *entry, int major, int minor)
 {
     struct notifyfs_mount_struct *mount=NULL;
+    struct simple_list_struct *element;
 
-    pthread_mutex_lock(&free_mounts_mutex);
+    pthread_mutex_lock(&group_mount.mutex);
 
-    if (free_mounts>=0) {
+    element=get_from_free(&group_mount);
 
-	mount=get_mount(free_mounts);
+    if (! element) {
 
-	if (mount->next>=0) {
-	    struct notifyfs_mount_struct *next=get_mount(mount->next);
+	element=create_simple_element();
 
-	    next->prev=mount->prev;
+	if (element) {
+
+	    mount=notifyfs_malloc_mount();
+
+	    if (! mount ) {
+
+		free(element);
+		element=NULL;
+
+	    } else {
+
+		element->data=(void *) mount;
+
+	    }
 
 	}
-
-	if (mount->prev>=0) {
-	    struct notifyfs_mount_struct *prev=get_mount(mount->prev);
-
-	    prev->next=mount->next;
-
-	}
-
-	free_mounts=mount->next;
 
     }
 
-    pthread_mutex_unlock(&free_mounts_mutex);
+    if (element) {
 
-    if (! mount) mount=notifyfs_malloc_mount();
+	mount=(struct notifyfs_mount_struct *) element->data;
 
-    if (mount) {
-
-	logoutput("create_mount: new mount fs %s, backend %s", fs, mountsource);
+	logoutput("create_mount: new mount %i:%i", major, minor);
 
 	mount->entry=entry->index;
 	entry->mount=mount->index;
-	mount->rootentry=-1;
-	mount->major=0;
-	mount->minor=0;
 
-	snprintf(mount->filesystem, 32, "%s", fs);
-	snprintf(mount->mountsource, 64, "%s", mountsource);
-	snprintf(mount->superoptions, 256, "%s", superoptions);
+	mount->rootentry=-1; /* TODO */
+	mount->major=major;
+	mount->minor=minor;
 
-	mount->mode=0;
-	mount->next=-1;
-	mount->prev=-1;
+	insert_in_used(&group_mount, element);
 
     }
+
+    pthread_mutex_unlock(&group_mount.mutex);
 
     return mount;
 
@@ -124,21 +160,230 @@ struct notifyfs_mount_struct *create_mount(char *fs, char *mountsource, char *su
 
 void remove_mount(struct notifyfs_mount_struct *mount)
 {
+    struct simple_list_struct *element;
 
-    pthread_mutex_lock(&free_mounts_mutex);
+    pthread_mutex_lock(&group_mount.mutex);
 
-    if (free_mounts>=0) {
-	struct notifyfs_mount_struct *first_mount=get_mount(free_mounts);
+    element=lookup_simple_list(&group_mount, (void *) mount);
 
-	first_mount->prev=mount->index;
+    if (element) {
+
+	move_from_used(&group_mount, element);
+	insert_in_free(&group_mount, element);
 
     }
 
-    mount->next=free_mounts;
-    mount->prev=-1;
-    free_mounts=mount->index;
+    mount->entry=-1;
+    mount->rootentry=-1;
 
-    pthread_mutex_unlock(&free_mounts_mutex);
+    mount->major=0;
+    mount->minor=0;
+
+    mount->status=NOTIFYFS_MOUNTSTATUS_NOTUSED;
+
+    pthread_mutex_unlock(&group_mount.mutex);
+
+}
+
+struct notifyfs_mount_struct *find_mount_majorminor(int major, int minor, struct notifyfs_mount_struct *new_mount)
+{
+    struct notifyfs_mount_struct *mount=NULL;
+    int hashvalue=calculate_mount_hash(major, minor) % group_mount.len;
+    struct simple_list_struct *element=group_mount.hash[hashvalue];
+
+    while(element) {
+
+	mount=(struct notifyfs_mount_struct *) element->data;
+
+	if (mount->entry>=0 && mount->major==major && mount->minor==minor) {
+
+	    if (new_mount) {
+
+		if (mount != new_mount) break;
+
+	    } else {
+
+		break;
+
+	    }
+
+	}
+
+	element=element->next;
+
+    }
+
+    return mount;
+
+}
+
+void lock_supermounts()
+{
+    pthread_mutex_lock(&supermount_mutex);
+}
+
+void unlock_supermounts()
+{
+    pthread_mutex_unlock(&supermount_mutex);
+}
+
+/*
+    function to get the supermount based upon major/minor
+*/
+
+struct supermount_struct *find_supermount_majorminor(int major, int minor)
+{
+    struct supermount_struct *supermount=NULL;
+
+    pthread_mutex_lock(&supermount_mutex);
+
+    supermount=supermount_list[calculate_mount_hash(major, minor)];
+
+    while(supermount) {
+
+	if (supermount->major==major && supermount->minor==minor) break;
+
+	supermount=supermount->next;
+
+    }
+
+    pthread_mutex_unlock(&supermount_mutex);
+
+    return supermount;
+
+}
+
+struct notifyfs_backend_struct *get_mount_backend(struct notifyfs_mount_struct *mount)
+{
+    struct notifyfs_backend_struct *backend=NULL;
+    struct supermount_struct *supermount=NULL;
+
+    logoutput("get_mount_backend: testing mount %i:%i", mount->major, mount->minor);
+
+    supermount=find_supermount_majorminor(mount->major, mount->minor);
+    if (supermount) backend=supermount->backend;
+
+    if (backend) {
+
+	logoutput("get_mount_backend: backend type %i found for %i:%i", backend->type, mount->major, mount->minor);
+
+    } else {
+
+	logoutput("get_mount_backend: no backend found for %i:%i", mount->major, mount->minor);
+
+    }
+
+    return backend;
+
+}
+
+struct supermount_struct *add_supermount(int major, int minor, char *source, char *options)
+{
+    struct supermount_struct *supermount=NULL;
+
+    supermount=malloc(sizeof(struct supermount_struct));
+
+    if (supermount) {
+	int hashvalue=MKDEV(major, minor) % MOUNTTABLE_SIZE;
+
+    	logoutput("add_supermount: creating supermount for %i:%i", major, minor);
+
+	supermount->major=major;
+	supermount->minor=minor;
+
+	supermount->refcount=1;
+
+	supermount->backend=NULL;
+	supermount->fs=NULL;
+
+	supermount->source=strdup(source);
+	supermount->options=strdup(options);
+
+	if (! supermount->source || ! supermount->options) {
+
+	    goto error;
+
+	}
+
+	supermount->next=NULL;
+	supermount->prev=NULL;
+
+	pthread_mutex_lock(&supermount_mutex);
+
+	if (supermount_list[hashvalue]) supermount_list[hashvalue]->prev=supermount;
+	supermount->next=supermount_list[hashvalue];
+	supermount_list[hashvalue]=supermount;
+
+	pthread_mutex_unlock(&supermount_mutex);
+
+    }
+
+    return supermount;
+
+    error:
+
+    if (supermount) {
+
+	if (supermount->options) {
+
+	    free(supermount->options);
+	    supermount->options=NULL;
+
+	}
+
+	if (supermount->source) {
+
+	    free(supermount->source);
+	    supermount->source=NULL;
+
+	}
+
+	free(supermount);
+	supermount=NULL;
+
+    }
+
+    return supermount;
+
+
+}
+
+int remove_mount_supermount(struct supermount_struct *supermount)
+{
+    int refcount=0;
+
+    pthread_mutex_lock(&supermount_mutex);
+
+    supermount->refcount--;
+
+    refcount=supermount->refcount;
+
+    if (supermount->refcount<=0) {
+	int hashvalue=MKDEV(supermount->major, supermount->minor) % MOUNTTABLE_SIZE;
+
+	if (supermount->next) supermount->next->prev=supermount->prev;
+	if (supermount->prev) supermount->prev->next=supermount->next;
+
+	if (supermount==supermount_list[hashvalue]) supermount_list[hashvalue]=supermount->next;
+
+	if (supermount->backend) {
+	    struct notifyfs_backend_struct *backend=supermount->backend;
+
+	    backend->refcount--;
+
+	    /* here do something when refcount becomes zero or less */
+
+	}
+
+	free(supermount);
+
+	refcount=0;
+
+    }
+
+    pthread_mutex_unlock(&supermount_mutex);
+
+    return refcount;
 
 }
 
@@ -166,41 +411,36 @@ static struct notifyfs_inode_struct *create_inode()
 
 }
 
+int entry_hashfunction(void *data)
+{
+    struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *) data;
+
+    /* index for now, any other value is possible */
+
+    return entry->index % SIMPLE_LIST_HASHSIZE;
+
+}
+
 struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent, const char *newname)
 {
     struct notifyfs_entry_struct *entry=NULL;
+    struct simple_list_struct *element;
 
     logoutput("create_entry: name %s", newname);
 
-    pthread_mutex_lock(&free_entries_mutex);
+    pthread_mutex_lock(&group_entry.mutex);
 
-    if (free_entries>=0) {
+    element=get_from_free(&group_entry);
 
-	entry=get_entry(free_entries);
+    if (element) {
 
-	if (entry->name_next>=0) {
-	    struct notifyfs_entry_struct *next=NULL;
+	entry=(struct notifyfs_entry_struct *) element->data;
 
-	    next=get_entry(entry->name_next);
-	    next->name_prev=entry->name_prev;
+    } else {
 
-	}
-
-	if (entry->name_prev>=0) {
-	    struct notifyfs_entry_struct *prev=NULL;
-
-	    prev=get_entry(entry->name_prev);
-	    prev->name_next=entry->name_next;
-
-	}
-
-	free_entries=entry->name_next;
+	entry = notifyfs_malloc_entry();
 
     }
-
-    pthread_mutex_unlock(&free_entries_mutex);
-
-    if (! entry) entry = notifyfs_malloc_entry();
 
     if (entry) {
 	int lenname=strlen(newname);
@@ -209,7 +449,9 @@ struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent,
 
 	if (entry->name==-1) {
 
-	    remove_entry(entry);
+	    /* unable to allocate space for name */
+
+	    insert_in_free(&group_entry, element);
 	    entry = NULL;
 
 	} else {
@@ -217,107 +459,40 @@ struct notifyfs_entry_struct *create_entry(struct notifyfs_entry_struct *parent,
 
 	    memcpy(name, newname, lenname);
 
-	    logoutput("create_entry: created name %s", name);
-
 	    if (parent) {
 
 		entry->parent = parent->index;
+		entry->mount = parent->mount;
 
 	    } else {
 
 		entry->parent=-1;
+		entry->mount=-1;
 
 	    }
 
 	    entry->inode=-1;
 	    entry->name_next=-1;
 	    entry->name_prev=-1;
-	    entry->mount=-1;
 	    entry->nameindex_value=0;
+
+	    if (element) free(element);
 
 	}
 
     }
+
+    pthread_mutex_unlock(&group_entry.mutex);
 
     return entry;
 
 }
 
-struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_struct *inode)
-{
-    struct notifyfs_attr_struct *attr=NULL;
-
-    pthread_mutex_lock(&free_attributes_mutex);
-
-    if (free_attributes>=0) {
-
-	attr=get_attr(free_attributes);
-
-	if (attr->next>=0) {
-	    struct notifyfs_attr_struct *next=NULL;
-
-	    next=get_attr(attr->next);
-	    next->prev=attr->prev;
-
-	}
-
-	if (attr->prev>=0) {
-	    struct notifyfs_attr_struct *prev=NULL;
-
-	    prev=get_attr(attr->prev);
-	    prev->next=attr->next;
-
-	}
-
-	free_attributes=attr->next;
-
-    }
-
-    pthread_mutex_unlock(&free_attributes_mutex);
-
-    if (! attr) attr=notifyfs_malloc_attr();
-
-    if (attr) {
-
-	inode->attr=attr->index;
-
-	if (st) {
-
-	    copy_stat(&attr->cached_st, st);
-	    copy_stat_times(&attr->cached_st, st);
-
-	}
-
-    }
-
-    return attr;
-
-}
-
-void remove_attr(struct notifyfs_attr_struct *attr)
-{
-
-    pthread_mutex_lock(&free_attributes_mutex);
-
-    if (free_attributes>=0) {
-	struct notifyfs_attr_struct *first_attr=get_attr(free_attributes);
-
-	first_attr->prev=attr->index;
-
-    }
-
-    attr->next=free_attributes;
-    attr->prev=-1;
-
-    free_attributes=attr->index;
-
-    pthread_mutex_unlock(&free_attributes_mutex);
-
-}
-
-
 void remove_entry(struct notifyfs_entry_struct *entry)
 {
+    struct simple_list_struct *element;
+
+    pthread_mutex_lock(&group_entry.mutex);
 
     if ( entry->inode>=0 ) {
 	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
@@ -333,21 +508,109 @@ void remove_entry(struct notifyfs_entry_struct *entry)
 
     }
 
-    pthread_mutex_lock(&free_entries_mutex);
+    element=create_simple_element();
 
-    if (free_entries>=0) {
-	struct notifyfs_entry_struct *first_entry=get_entry(free_entries);
+    if (element) {
 
-	first_entry->name_prev=entry->index;
+	element->data=(void *) entry;
+	insert_in_free(&group_entry, element);
 
     }
 
-    entry->name_next=free_entries;
+    entry->inode=-1;
+    // entry->name=-1;
+    entry->name_next=-1;
     entry->name_prev=-1;
+    entry->parent=-1;
+    entry->nameindex_value=0;
+    entry->mount=-1;
 
-    free_entries=entry->index;
+    pthread_mutex_unlock(&group_entry.mutex);
 
-    pthread_mutex_unlock(&free_entries_mutex);
+}
+
+int attr_hashfunction(void *data)
+{
+    struct notifyfs_attr_struct *attr=(struct notifyfs_attr_struct *) data;
+
+    /* index for now, could be any value */
+
+    return attr->index;
+
+}
+
+
+struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_struct *inode)
+{
+    struct notifyfs_attr_struct *attr=NULL;
+    struct simple_list_struct *element;
+
+    pthread_mutex_lock(&group_attr.mutex);
+
+    element=get_from_free(&group_attr);
+
+    if (! element) {
+
+	element=create_simple_element();
+
+	if (element) {
+
+	    attr=notifyfs_malloc_attr();
+
+	    if (! attr ) {
+
+		free(element);
+		element=NULL;
+
+	    } else {
+
+		element->data=(void *) attr;
+
+	    }
+
+	}
+
+    }
+
+    if (element) {
+
+	attr=(struct notifyfs_attr_struct *) element->data;
+
+	inode->attr=attr->index;
+
+	if (st) {
+
+	    copy_stat(&attr->cached_st, st);
+	    copy_stat_times(&attr->cached_st, st);
+
+	}
+
+	insert_in_used(&group_attr, element);
+
+    }
+
+    pthread_mutex_unlock(&group_attr.mutex);
+
+    return attr;
+
+}
+
+void remove_attr(struct notifyfs_attr_struct *attr)
+{
+    struct simple_list_struct *element;
+
+    pthread_mutex_lock(&group_attr.mutex);
+
+    element=lookup_simple_list(&group_attr, (void *) attr);
+
+    if (element) {
+
+	move_from_used(&group_attr, element);
+	insert_in_free(&group_attr, element);
+
+    }
+
+    pthread_mutex_unlock(&group_attr.mutex);
 
 }
 
@@ -364,24 +627,108 @@ void assign_inode(struct notifyfs_entry_struct *entry)
 
 }
 
+/* maintain a hash table of views per pid */
+
+int calculate_view_hash(pid_t pid)
+{
+    return (pid % group_view.len);
+}
+
+int view_hashfunction(void *data)
+{
+    struct view_struct *view=(struct view_struct *) data;
+
+    return calculate_view_hash(view->pid);
+
+}
+
+void activate_view(struct view_struct *view)
+{
+
+    pthread_mutex_lock(&group_view.mutex);
+
+    if ( ! lookup_simple_list(&group_view, (void *) view)) {
+	struct simple_list_struct *element=NULL;
+
+	element=create_simple_element();
+
+	if (element) {
+
+	    element->data=(void *) view;
+	    insert_in_used(&group_view, element);
+
+	}
+
+    }
+
+    pthread_mutex_unlock(&group_view.mutex);
+
+}
+
+struct view_struct *get_next_view(pid_t pid, void **index)
+{
+    struct view_struct *view=NULL;
+
+    pthread_mutex_lock(&group_view.mutex);
+
+    while(1) {
+
+	view=(struct view_struct *) get_next_element(&group_view, index, pid);
+
+	if (!view) {
+
+	    break;
+
+	} else {
+
+	    if (view->pid==pid) break;
+
+	}
+
+    }
+
+    pthread_mutex_unlock(&group_view.mutex);
+
+    return view;
+
+}
+
+int init_entry_management()
+{
+    int res;
+
+    res=initialize_group(&group_mount, mount_hashfunction, 512);
+    if (res<0) return res;
+
+    res=initialize_group(&group_entry, entry_hashfunction, 0);
+    if (res<0) return res;
+
+    res=initialize_group(&group_attr, attr_hashfunction, 512);
+    if (res<0) return res;
+
+    res=initialize_group(&group_view, view_hashfunction, 512);
+    if (res<0) return res;
+
+    res=create_root();
+
+    return res;
+
+}
+
 unsigned long long get_inoctr()
 {
     return inoctr;
 }
 
 /* lookup the inode in the inode array 
-    since there can be more than one arrays, which are in different shm chunks
-    it's the task to find the right array
-    the way to do this is to look at the modulo and the remainder
-    of the ino compared to the array size
+
     note that the relation between index in array and ino is that
-    index starts at 0, and ino at FUSE_ROOT_ID, which is 1 normally
+    index starts at 0, and ino at FUSE_ROOT_ID (which is 1 normally)
 */
 
 struct notifyfs_inode_struct *find_inode(fuse_ino_t ino)
 {
     struct notifyfs_inode_struct *inode=NULL;
-    int ctr=0;
     int index=0;
 
     index=ino-FUSE_ROOT_ID; /* correct the ino to fit with array index */
@@ -432,9 +779,13 @@ int create_root()
 
     /* rootentry (no parent) */
 
+    logoutput("create_root: create root entry");
+
     rootentry=create_entry(NULL, ".");
 
     /* rootinode */
+
+    logoutput("create_root: assign root inode");
 
     assign_inode(rootentry);
 

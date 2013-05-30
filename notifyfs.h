@@ -20,13 +20,12 @@
 #ifndef NOTIFYFS_MAIN_H
 #define NOTIFYFS_MAIN_H
 
-#define NOTIFYFS_REMOTESERVERS_FILE_DEFAULT	"/etc/notifyfs/servers"
-
 struct notifyfs_owner_struct {
     unsigned char type;
     union {
 	struct client_struct *localclient;
 	struct notifyfs_server_struct *remoteserver;
+	struct notifyfs_backend_struct *backend;
     } owner;
 };
 

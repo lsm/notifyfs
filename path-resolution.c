@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -45,9 +45,12 @@
 
 
 #include "logging.h"
+
+#include "notifyfs-fsevent.h"
 #include "notifyfs-io.h"
 
 #include "entry-management.h"
+#include "access.h"
 #include "path-resolution.h"
 #include "utils.h"
 
@@ -59,204 +62,235 @@ struct call_info_struct *call_info_list=NULL;
 struct call_info_struct *call_info_unused=NULL;
 pthread_mutex_t call_info_unused_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-struct pathinfo_struct {
-	char *path;
-	size_t maxsize;
-	char *pathstart;
-	size_t len;
-	int mount;
-};
+static const char *rootpath="/";
 
-
-
-/* function which adds a part of a path BEFORE another part of path 
-   the part to be added may be a single name or a subpath
-   return:
-   <0 : error
-   >0 : number of bytes added
-*/
-
-
-static int addtopath(struct pathinfo_struct *pathinfo, char *path)
+int check_access_path(char *path, pid_t pid, uid_t uid, gid_t gid, struct stat *st, unsigned char mask)
 {
-    int len=strlen(path), nreturn=0;
-    unsigned char addslash=0;
+    char *name=path, *slash;
+    int nreturn=0, res;
+    struct gidlist_struct gidlist={0, 0, NULL};
 
-    /* add a slash or not */
+    if (strcmp(path, "/")==0) {
 
-    if ( pathinfo->len>0 && *(path+len-1) != '/' ) {
+	res=lstat(path, st);
 
-	pathinfo->len+=len+1;
-	addslash=1;
+	if (res==-1) {
 
-    } else {
+	    /* something weird... */
 
-	pathinfo->len+=len;
+	    nreturn=-errno;
 
-    }
+	}
 
-    /* see it fits */
+	/* no futher permissions checking, asume everybody has access to root */
 
-    if ( pathinfo->len>pathinfo->maxsize ) {
-
-	nreturn=-ENAMETOOLONG;
 	goto out;
 
     }
 
-    if ( addslash ) {
+    while(1) {
 
-	pathinfo->pathstart--;
-	*(pathinfo->pathstart)='/';
-	pathinfo->len++;
-	nreturn=1;
+        slash=strchr(name, '/');
 
-    }
+        if ( slash==name ) {
 
-    pathinfo->pathstart-=len;
-    pathinfo->len+=len;
-    memcpy(pathinfo->pathstart, path, len);
-    nreturn+=len;
+            name++;
 
-    out:
+            if (strlen(name)==0) break;
 
-    return nreturn;
+            continue;
 
-}
+        }
 
-/* function to add extra pathinfo, from effective_watch and mount_entry 
-   it checks this extra pathinfo is available 
-   return:
-   <0: error
-   0 : no data available
-   1 : ready */
+        if (slash) {
 
-static int processextrapathinfo(struct notifyfs_entry_struct *entry, struct pathinfo_struct *pathinfo)
-{
-    int nreturn=0;
+	    *slash='\0';
 
+    	    if (lstat(path, st)==-1) {
 
-    /* second: check it's root */
+		nreturn=-errno;
+		*slash='/';
+		break;
 
-    if ( isrootentry(entry) ) {
+	    }
 
-        pathinfo->pathstart--;
-        *(pathinfo->pathstart)='/';
-	pathinfo->len++;
-	nreturn=1;
+	    *slash='/';
 
-    }
+	    res=check_access_process(pid, uid, gid, st, R_OK|X_OK, &gidlist);
 
-    out:
+	    if (res==0) {
 
-    return nreturn;
+		nreturn=-EACCES;
+		break;
 
-}
+	    } else if (res<0) {
 
-int determine_path(struct call_info_struct *call_info, unsigned char flags)
-{
-    char *pathstart=NULL, *name;
-    int nreturn=0;
-    struct notifyfs_entry_struct *entry=call_info->entry;
-    pathstring path;
-    struct pathinfo_struct pathinfo;
+		nreturn=res;
+		break;
 
-    pathinfo.path=path;
-    pathinfo.maxsize=sizeof(pathstring);
-    pathinfo.len=0;
-    pathinfo.pathstart = pathinfo.path + pathinfo.maxsize - 1;
-    *(pathinfo.pathstart) = '\0';
-    pathinfo.mount=-1;
+	    }
 
-    if ( isrootentry(entry) ) {
+	} else {
 
-        pathinfo.pathstart--;
-        *(pathinfo.pathstart)='/';
-	pathinfo.len++;
-	nreturn=1;
-	goto out;
+    	    if (lstat(path, st)==-1) {
 
-    }
+		nreturn=-errno;
 
-    if (entry->mount>0) pathinfo.mount=entry->mount;
+	    } else {
 
-    name=get_data(entry->name);
+		res=check_access_process(pid, uid, gid, st, mask, &gidlist);
 
-    nreturn=addtopath(&pathinfo, name);
+		if (res==0) {
 
-    while (entry->parent>=0) {
+		    nreturn=-EACCES;
 
-	entry=get_entry(entry->parent);
+		} else if (res<0) {
 
-	if ( isrootentry(entry) ) {
+		    nreturn=res;
 
-    	    pathinfo.pathstart--;
-    	    *(pathinfo.pathstart)='/';
-	    pathinfo.len++;
+		}
+
+	    }
+
 	    break;
 
 	}
 
-	if (entry->mount>0 && pathinfo.mount==-1) pathinfo.mount=entry->mount;
-
-	name=get_data(entry->name);
-	nreturn=addtopath(&pathinfo, name);
-	if ( nreturn<0 ) goto error;
+        name=slash+1;
 
     }
-
-    nreturn=1;
 
     out:
 
-    if (nreturn>=0) {
+    if (gidlist.list) {
 
-	if ( *(pathinfo.pathstart)!='/' ) {
+	free(gidlist.list);
+	gidlist.list=NULL;
 
-	    logoutput("determine_path, slash missing at start %s, adding it", pathinfo.pathstart);
+    }
 
-	    pathinfo.pathstart--;
-    	    *(pathinfo.pathstart)='/';
-	    pathinfo.len++;
+    return nreturn;
 
-	}
+}
 
-	call_info->mount=pathinfo.mount;
+static int check_pathlen(struct notifyfs_entry_struct *entry)
+{
+    int len=0;
+    char *name;
 
-	/* create a path just big enough */
+    while(entry) {
 
-	call_info->path=malloc(pathinfo.len+1);
+	/* add the lenght of entry->name plus a slash for every name */
 
-	if ( call_info->path ) {
+	name=get_data(entry->name);
 
-    	    memset(call_info->path, '\0', pathinfo.len+1);
-    	    memcpy(call_info->path, pathinfo.pathstart, pathinfo.len);
+	len+=strlen(name)+1;
 
-	    call_info->freepath=1;
+	entry=get_entry(entry->parent);
 
-	    if (call_info->mount>=0) {
-		struct notifyfs_mount_struct *mount=get_mount(call_info->mount);
+	if (isrootentry(entry)==1) break;
 
-    		logoutput("determine_path: at mount %s, result after memcpy: %s", mount->filesystem, call_info->path);
+    }
+
+    return len;
+
+}
+
+int determine_path_entry(struct notifyfs_entry_struct *entry, struct pathinfo_struct *pathinfo)
+{
+    char *pos;
+    int nreturn=0, len;
+    char *name;
+
+    pathinfo->len=check_pathlen(entry);
+    pathinfo->path=malloc(pathinfo->len+1);
+
+    if ( ! pathinfo->path ) {
+
+	nreturn=-ENOMEM;
+	goto out;
+
+    }
+
+    pathinfo->flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
+    pos=pathinfo->path+pathinfo->len;
+    *pos='\0';
+
+    while (entry) {
+
+	name=get_data(entry->name);
+
+	len=strlen(name);
+	pos-=len;
+
+	memcpy(pos, name, len);
+
+	pos--;
+	*pos='/';
+
+	entry=get_entry(entry->parent);
+
+	if (! entry || isrootentry(entry)==1) break;
+
+    }
+
+    out:
+
+    return nreturn;
+
+}
+
+
+/*
+
+    construct the path from the entry
+
+*/
+
+int determine_path(struct notifyfs_entry_struct *entry, struct pathinfo_struct *pathinfo)
+{
+    int nreturn=0;
+
+    if (isrootentry(entry)) {
+
+	pathinfo->path=(char *) rootpath;
+	pathinfo->flags=0;
+	pathinfo->len=strlen(rootpath);
+
+    } else {
+	struct notifyfs_entry_struct *parent=get_entry(entry->parent);
+
+	if (isrootentry(parent)) {
+	    char *name=get_data(entry->name);
+	    int len=strlen(name);
+
+	    pathinfo->path=malloc(len+2);
+
+	    if (pathinfo->path) {
+
+		*(pathinfo->path)='/';
+		memcpy(pathinfo->path+1, name, len);
+		*(pathinfo->path+1+len)='\0';
+
+		pathinfo->len=len+1;
 
 	    } else {
 
-    		logoutput("determine_path: at rootmount, result after memcpy: %s", call_info->path);
+		nreturn=-ENOMEM;
+		goto out;
 
 	    }
 
-
 	} else {
 
-    	    nreturn=-ENOMEM;
+	    nreturn=determine_path_entry(entry, pathinfo);
 
 	}
 
     }
 
-    error:
-
-    if ( nreturn<0 ) logoutput1("determine_path, error: %i", nreturn);
+    out:
 
     return nreturn;
 
@@ -264,17 +298,38 @@ int determine_path(struct call_info_struct *call_info, unsigned char flags)
 
 void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_struct *entry)
 {
-
     call_info->threadid=pthread_self();
     call_info->entry=entry;
-    call_info->watch=NULL;
-    call_info->path=NULL;
-    call_info->freepath=0;
+    call_info->entrycreated=0;
+    call_info->strict=0;
+    call_info->pathinfo.path=NULL;
+    call_info->pathinfo.len=0;
+    call_info->pathinfo.flags=0;
     call_info->mount=-1;
-    call_info->ctx=NULL;
-
+    call_info->pid=0;
+    call_info->uid=0;
+    call_info->gid=0;
+    call_info->mask=0;
+    call_info->st=NULL;
+    call_info->error=0;
 }
 
+void free_path_pathinfo(struct pathinfo_struct *pathinfo)
+{
+    if ((pathinfo->flags & NOTIFYFS_PATHINFOFLAGS_ALLOCATED) && ! (pathinfo->flags & NOTIFYFS_PATHINFOFLAGS_INUSE)) {
+
+	if (pathinfo->path) {
+
+	    free(pathinfo->path);
+	    pathinfo->path=NULL;
+
+	}
+
+	pathinfo->flags-=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
+    }
+
+}
 
 /* function which creates a path in notifyfs 
 
@@ -283,143 +338,165 @@ void init_call_info(struct call_info_struct *call_info, struct notifyfs_entry_st
 
 */
 
-void create_notifyfs_path(struct call_info_struct *call_info, struct stat *buff_st)
+struct notifyfs_entry_struct *create_notifyfs_path(struct pathinfo_struct *pathinfo, struct stat *st, unsigned char strict, int mask, int *error, pid_t pid, uid_t uid, gid_t gid)
 {
-    char *path, *slash;
+    char *name, *slash, *path;
     struct notifyfs_entry_struct *entry, *parent;
     struct notifyfs_inode_struct *inode;
     struct notifyfs_attr_struct *attr;
     int res;
-    char tmppath[strlen(call_info->path)+1];
-    struct stat st;
     struct timespec current_time;
-    unsigned char entrycreated=0;
+    struct gidlist_struct gidlist={0, 0, NULL};
+    unsigned char statdone=0;
 
-    get_current_time(&current_time);
+    current_time.tv_sec=0;
+    current_time.tv_nsec=0;
 
     parent=get_rootentry();
     entry=parent;
 
-    call_info->entry=NULL;
-    call_info->watch=NULL;
+    entry=NULL;
 
-    call_info->mount=parent->mount;
+    path=pathinfo->path;
+    name=path;
 
-    call_info->ctx=NULL;
-
-    strcpy(tmppath, call_info->path);
-    path=tmppath;
-
-    logoutput("create_notifyfs_path: creating %s", tmppath);
-
-    /*  translate path into entry 
-        suppose here safe that entry is a subdir of root entry...*/
+    logoutput("create_notifyfs_path: trying to create %s", path);
 
     while(1) {
 
         /*  walk through path from begin to end and 
             check every part */
 
-        slash=strchr(path, '/');
+        slash=strchr(name, '/');
 
-        if ( slash==path ) {
+        if (slash==name) {
 
-            /* ignore the starting slash*/
-
-            path++;
-
-            /* if nothing more (==only a slash) stop here */
-
-            if (strlen(path)==0) break;
-
+            name++;
+            if (strlen(name)==0) break;
             continue;
 
         }
 
-        if ( slash ) *slash='\0';
-
-	entrycreated=0;
+        if (slash) *slash='\0';
 
 	inode=get_inode(parent->inode);
+        entry=find_entry_by_entry(parent, name);
+	statdone=0;
 
-        entry=find_entry_by_entry(parent, path);
+        if (! entry || strict>0) {
 
-        if ( ! entry ) {
+	    /* only do a stat call when no entry found or strict mode */
 
-    	    /* check the stat */
+    	    res=lstat(path, st);
+	    statdone=1;
 
-    	    if (lstat(tmppath, &st)==-1) {
+	} else {
 
-		logoutput("create_notifyfs_path: error %i at %s", errno, tmppath);
+	    st->st_mode=0;
+	    res=0;
 
-		/* additional action.. */
+	}
 
-            	/* what to do here?? the path does not exist */
+	if (res==-1) {
 
-            	entry=NULL;
-            	break;
+	    /* error: (part of ) path does not exist */
 
-    	    }
+            entry=NULL;
+	    if (error) *error=errno;
+	    if (slash) *slash='/';
+            goto out;
 
-	    entry=create_entry(parent, path);
+    	}
 
-            if (entry) {
+	if (strict==2) {
+	    unsigned char lmask=mask;
 
-                assign_inode(entry);
+	    if (slash) lmask |= (R_OK | X_OK); /* directory: read and access bits must be set */
 
-		inode=get_inode(entry->inode);
+	    /* check the access to this object */
 
-		if (inode) {
+	    if (check_access_process(pid, uid, gid, st, lmask, &gidlist)==0) {
 
-            	    add_to_name_hash_table(entry);
+		if (error) *error=EACCES;
+		entry=NULL;
+		if (slash) *slash='/';
+		goto out;
 
-		    attr=assign_attr(&st, inode);
+	    }
 
-		    if (attr) {
+	}
 
-			attr->ctim.tv_sec=st.st_ctim.tv_sec;
-			attr->ctim.tv_nsec=st.st_ctim.tv_nsec;
+	if ( ! entry) {
 
-			if (S_ISDIR(attr->cached_st.st_mode)) {
+	    entry=create_entry(parent, name);
 
-			    attr->mtim.tv_sec=0;
-			    attr->mtim.tv_nsec=0;
+	    if (entry) {
 
-			} else {
+		add_to_name_hash_table(entry);
 
-			    attr->mtim.tv_sec=st.st_mtim.tv_sec;
-			    attr->mtim.tv_nsec=st.st_mtim.tv_nsec;
+	    } else {
 
-			}
+		if (error) *error=ENOMEM;
+		if (slash) *slash='/';
+		goto out;
 
-			attr->atim.tv_sec=current_time.tv_sec;
-			attr->atim.tv_nsec=current_time.tv_nsec;
+	    }
+
+	}
+
+	if (slash) *slash='/';
+
+        if (entry->inode<0) assign_inode(entry);
+
+	inode=get_inode(entry->inode);
+
+	if (inode) {
+
+	    attr=get_attr(inode->attr);
+
+	    if ( ! attr) {
+
+		attr=assign_attr(st, inode);
+
+		if (attr) {
+
+		    attr->ctim.tv_sec=st->st_ctim.tv_sec;
+		    attr->ctim.tv_nsec=st->st_ctim.tv_nsec;
+
+		    if (S_ISDIR(attr->cached_st.st_mode)) {
+
+			attr->mtim.tv_sec=0;
+			attr->mtim.tv_nsec=0;
+
+		    } else {
+
+			attr->mtim.tv_sec=st->st_mtim.tv_sec;
+			attr->mtim.tv_nsec=st->st_mtim.tv_nsec;
 
 		    }
 
-		    entrycreated=1;
+		    if (current_time.tv_sec==0) get_current_time(&current_time);
 
-		} else {
-
-		    remove_entry(entry);
-		    entry=NULL;
-		    break;
+		    attr->atim.tv_sec=current_time.tv_sec;
+		    attr->atim.tv_nsec=current_time.tv_nsec;
 
 		}
 
-            } else {
+	    } else {
 
-                break;
+		/* update, possibly analyse differences
 
-            }
+		*/
 
-        }
+		copy_stat(&attr->cached_st, st);
+		copy_stat_times(&attr->cached_st, st);
 
-	if (entry->mount>=0) {
+	    }
 
-	    logoutput("create_notifyfs_path: got mountindex %i on %s", entry->mount, tmppath);
+	} else {
 
-	    call_info->mount=entry->mount;
+	    if (error) *error=ENOMEM;
+	    goto out;
 
 	}
 
@@ -429,50 +506,24 @@ void create_notifyfs_path(struct call_info_struct *call_info, struct stat *buff_
 
         } else {
 
-            /* make slash a slash again (was turned into a \0) */
-
-            *slash='/';
-            path=slash+1;
+            name=slash+1;
             parent=entry;
 
         }
 
     }
 
-    if (entry) {
+    out:
 
-	if (buff_st) {
+    if (gidlist.list) {
 
-	    if (entrycreated==0) {
-
-		if (lstat(tmppath, &st)==-1) {
-
-		    if (errno==ENOENT) {
-
-			logoutput("create_notifyfs_path: error %i at %s", errno, tmppath);
-
-			/* additional action.. */
-
-		    }
-
-            	    /* what to do here?? the path does not exist */
-
-            	    entry=NULL;
-		    goto out;
-
-		}
-
-	    }
-
-	    copy_stat(buff_st, &st);
-	    copy_stat_times(buff_st, &st);
-
-	}
+	free(gidlist.list);
+	gidlist.list=NULL;
 
     }
 
-    out:
-
-    call_info->entry=entry;
+    return entry;
 
 }
+
+

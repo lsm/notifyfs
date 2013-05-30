@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -16,24 +16,13 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef NOTIFYFS_CLIENT_IO_H
-#define NOTIFYFS_CLIENT_IO_H
 
-/* define the different buffer sizes:
+#ifndef NOTIFYFS_FILESYSTEM_NFS_H
+#define NOTIFYFS_FILESYSTEM_NFS_H
 
-- when receiving a message from the server it can be two paths (mountpoint and mountsource), or a list of entries
-- when sending a message to the server it can be a path and a name of an entry
 
-*/
+// Prototypes
 
-#define NOTIFYFS_CLIENT_RECVBUFFERSIZE	PATH_MAX + PATH_MAX
-#define NOTIFYFS_CLIENT_SENDBUFFERSIZE	PATH_MAX + 256
-
-#define NOTIFYFS_SERVER_RECVBUFFERSIZE 	NOTIFYFS_CLIENT_SENDBUFFERSIZE
-#define NOTIFYFS_SERVER_SENDBUFFERSIZE 	NOTIFYFS_CLIENT_RECVBUFFERSIZE
-
-#define NOTIFYFS_CLIENTTYPE_NONE	0
-#define NOTIFYFS_CLIENTTYPE_APPLICATION	1
-#define NOTIFYFS_CLIENTTYPE_FILESYSTEM	2
+void register_nfs_functions();
 
 #endif

@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -16,18 +16,12 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef NOTIFYFS_NETWORKUTILS_H
-#define NOTIFYFS_NETWORKUTILS_H
 
+#ifndef NOTIFYFS_FILESYSTEM_SMB_H
+#define NOTIFYFS_FILESYSTEM_SMB_H
 
 // Prototypes
 
-int get_hostname(char *address, const char *service, char *host, int len, unsigned char *islocal);
-
-unsigned char isvalid_ipv4(char *address);
-unsigned char isvalid_ipv6(char *address);
-
-struct notifyfs_connection_struct *compare_notifyfs_connections(struct notifyfs_connection_struct *new_connection);
-int get_value_mountoptions(char *options, const char *option, char *value, int len);
+void register_smb_functions();
 
 #endif

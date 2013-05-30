@@ -31,6 +31,9 @@
 #define LOG_LOGAREA_MESSAGE		256
 #define LOG_LOGAREA_MAX			511
 
+
+#ifdef LOGGING
+
 #define logoutput(args ...) syslog(LOG_DEBUG, args)
 
 #define logoutput0(args ...) writelog(0, args)
@@ -38,17 +41,25 @@
 #define logoutput2(args ...) writelog(2, args)
 #define logoutput3(args ...) writelog(3, args)
 
-#ifdef LOGGING
-
 extern unsigned char loglevel;
 extern int logarea;
 #define writelog(arg1, ...) if ( loglevel>arg1 && (logarea&LOG_LOGAREA) ) syslog(LOG_DEBUG, __VA_ARGS__)
+
 #else
+
 static inline void dummy_nolog()
 {
     return;
 }
-#define writelog(args ...) dummy_nolog()
+
+#define logoutput(args ...) dummy_nolog()
+
+#define logoutput0(args ...) dummy_nolog()
+#define logoutput1(args ...) dummy_nolog()
+#define logoutput2(args ...) dummy_nolog()
+#define logoutput3(args ...) dummy_nolog()
+
+
 #endif
 
 

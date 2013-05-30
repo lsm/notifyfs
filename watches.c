@@ -53,25 +53,29 @@
 #include <fuse/fuse_lowlevel.h>
 
 #include "logging.h"
+#include "workerthreads.h"
 #include "epoll-utils.h"
+
+#include "notifyfs-fsevent.h"
 #include "notifyfs-io.h"
 #include "notifyfs.h"
 
-#include "workerthreads.h"
-
+#include "socket.h"
 #include "entry-management.h"
+#include "backend.h"
+#include "networkservers.h"
+
 #include "path-resolution.h"
 #include "options.h"
 #include "mountinfo.h"
-#include "message.h"
-#include "message-server.h"
-#include "client-io.h"
 #include "client.h"
 #include "watches.h"
 #include "changestate.h"
 #include "utils.h"
-#include "socket.h"
-#include "networkutils.h"
+
+#include "message-base.h"
+#include "message-send.h"
+
 
 #ifdef HAVE_INOTIFY
 #include "watches-backend-inotify.c"
@@ -87,84 +91,6 @@ unsigned long watchctr = 1;
 struct watch_struct *watch_list=NULL;
 pthread_mutex_t watchctr_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-static int check_pathlen(struct notifyfs_entry_struct *entry)
-{
-    int len=1;
-    char *name;
-
-    while(entry) {
-
-	/* add the lenght of entry->name plus a slash for every name */
-
-	name=get_data(entry->name);
-
-	len+=strlen(name)+1;
-
-	entry=get_entry(entry->parent);
-
-	if (isrootentry(entry)==1) break;
-
-    }
-
-    return len;
-
-}
-
-char *determine_path_entry(struct notifyfs_entry_struct *entry)
-{
-    char *pos;
-    int nreturn=0, len;
-    char *name;
-    char *path;
-
-    if (isrootentry(entry)==1) {
-
-	nreturn=3;
-
-    } else {
-
-	nreturn=check_pathlen(entry);
-	if (nreturn<0) goto out;
-
-    }
-
-    path=malloc(nreturn);
-
-    if ( ! path) {
-
-	nreturn=-ENOMEM;
-	goto out;
-
-    }
-
-    pos=path+nreturn-1;
-    *pos='\0';
-
-    while (entry) {
-
-	name=get_data(entry->name);
-
-	len=strlen(name);
-	pos-=len;
-
-	memcpy(pos, name, len);
-
-	pos--;
-	*pos='/';
-
-	entry=get_entry(entry->parent);
-
-	if (! entry || isrootentry(entry)==1) break;
-
-    }
-
-    out:
-
-    return path;
-
-}
-
-
 void lock_watch(struct watch_struct *watch)
 {
     pthread_mutex_lock(&watch->mutex);
@@ -174,7 +100,6 @@ void unlock_watch(struct watch_struct *watch)
 {
     pthread_mutex_unlock(&watch->mutex);
 }
-
 
 void init_watch_hashtables()
 {
@@ -269,9 +194,9 @@ void add_watch_to_list(struct watch_struct *watch)
     watch->prev=NULL;
     watch_list=watch;
 
-    watchctr++;
-
     watch->ctr=watchctr;
+
+    watchctr++;
 
     pthread_mutex_unlock(&watchctr_mutex);
 
@@ -291,14 +216,22 @@ void remove_watch_from_list(struct watch_struct *watch)
 
 }
 
-void set_watch_backend_os_specific(struct watch_struct *watch, char *path)
+int set_watch_backend_os_specific(struct watch_struct *watch)
 {
-    set_watch_backend_inotify(watch, path);
+    int res=0;
+
+    res=set_watch_backend_inotify(watch);
+
+    return res;
 }
 
-void change_watch_backend_os_specific(struct watch_struct *watch, char *path)
+int change_watch_backend_os_specific(struct watch_struct *watch)
 {
-    change_watch_backend_inotify(watch, path);
+    int res=0;
+
+    res=change_watch_backend_inotify(watch);
+
+    return res;
 }
 
 void remove_watch_backend_os_specific(struct watch_struct *watch)
@@ -306,279 +239,7 @@ void remove_watch_backend_os_specific(struct watch_struct *watch)
     remove_watch_backend_inotify(watch);
 }
 
-void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
-{
 
-    fsevent->status=0;
-
-    fsevent->fseventmask.attrib_event=0;
-    fsevent->fseventmask.xattr_event=0;
-    fsevent->fseventmask.file_event=0;
-    fsevent->fseventmask.move_event=0;
-    fsevent->fseventmask.fs_event=0;
-
-    fsevent->entry=NULL;
-    fsevent->path=NULL;
-    fsevent->pathallocated=0;
-
-    fsevent->detect_time.tv_sec=0;
-    fsevent->detect_time.tv_nsec=0;
-    fsevent->process_time.tv_sec=0;
-    fsevent->process_time.tv_nsec=0;
-
-    fsevent->lock_entry=NULL;
-    fsevent->watch=NULL;
-    fsevent->mount_entry=NULL;
-
-    fsevent->next=NULL;
-    fsevent->prev=NULL;
-
-}
-
-void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
-{
-
-    if (fsevent->pathallocated==1) {
-
-	if (fsevent->path) {
-
-	    free(fsevent->path);
-	    fsevent->path=NULL;
-
-	}
-
-	fsevent->pathallocated=0;
-
-    }
-
-    free(fsevent);
-
-}
-
-unsigned char compare_fseventmasks(struct fseventmask_struct *maska, struct fseventmask_struct *maskb)
-{
-    unsigned char differ=0;
-
-    if (maska->attrib_event != maskb->attrib_event) {
-
-	differ=1;
-	goto out;
-
-    }
-
-    if (maska->xattr_event != maskb->xattr_event) {
-
-	differ=1;
-	goto out;
-
-    }
-
-    if (maska->file_event != maskb->file_event) {
-
-	differ=1;
-	goto out;
-
-    }
-
-    if (maska->move_event != maskb->move_event) {
-
-	differ=1;
-	goto out;
-
-    }
-
-    if (maska->fs_event != maskb->fs_event) {
-
-	differ=1;
-
-    }
-
-    out:
-
-    return differ;
-
-}
-
-/* merge two fsevent masks */
-
-unsigned char merge_fseventmasks(struct fseventmask_struct *maska, struct fseventmask_struct *maskb)
-{
-    unsigned char differ=0;
-
-    if (compare_fseventmasks(maska, maskb)==1) {
-	struct fseventmask_struct maskc;
-
-	maskc.attrib_event = maska->attrib_event | maskb->attrib_event;
-	maskc.xattr_event = maska->xattr_event | maskb->xattr_event;
-	maskc.file_event = maska->file_event | maskb->file_event;
-	maskc.move_event = maska->move_event | maskb->move_event;
-	maskc.fs_event = maska->fs_event | maskb->fs_event;
-
-	if (compare_fseventmasks(maska, &maskc)==1) {
-
-	    maska->attrib_event = maskc.attrib_event;
-	    maska->xattr_event = maskc.xattr_event;
-	    maska->file_event = maskc.file_event;
-	    maska->move_event = maskc.move_event;
-	    maska->fs_event = maskc.fs_event;
-
-	    differ=1;
-
-	}
-
-    }
-
-    return differ;
-
-}
-
-/* replace one fseventmask by another */
-
-void replace_fseventmask(struct fseventmask_struct *maska, struct fseventmask_struct *maskb)
-{
-
-    maska->attrib_event = maskb->attrib_event;
-    maska->xattr_event = maskb->xattr_event;
-    maska->file_event = maskb->file_event;
-    maska->move_event = maskb->move_event;
-    maska->fs_event = maskb->fs_event;
-
-}
-
-void send_setwatch_message_remote(struct notifyfs_server_struct *notifyfs_server, struct watch_struct *watch, char *url)
-{
-    struct notifyfs_message_body message;
-    int lenpath, count=0;
-    struct notifyfs_connection_struct *connection=notifyfs_server->connection;
-
-    if (! connection) {
-
-	logoutput("send_watch_message_remote: remote server no connection");
-	return;
-
-    }
-
-    message.type=NOTIFYFS_MESSAGE_TYPE_SETWATCH;
-
-    /* fill the buffer with path and name (of entry ) */
-
-    message.body.setwatch_message.watch_id=watch->ctr;
-    message.body.setwatch_message.unique=new_uniquectr();
-
-    message.body.setwatch_message.fseventmask.attrib_event=watch->fseventmask.attrib_event;
-    message.body.setwatch_message.fseventmask.xattr_event=watch->fseventmask.xattr_event;
-    message.body.setwatch_message.fseventmask.file_event=watch->fseventmask.file_event;
-    message.body.setwatch_message.fseventmask.move_event=watch->fseventmask.move_event;
-    message.body.setwatch_message.fseventmask.fs_event=0;
-
-    logoutput("send_watch_message_remote: ctr %li", message.body.setwatch_message.unique);
-
-    send_message(connection->fd, &message, (void *) url, strlen(url)+1);
-
-}
-
-/*
-    function to test a mount has a backend, and if so, forward the watch to that backend
-
-    the path on the remote host depends on the "root" of what has been shared (smb) or exported (nfs)
-
-    for example a nfs export from 192.168.0.2:/usr/share
-    is mounted at /data for example
-
-    now if a watch is set on /data/some/dir/to/watch, the corresponding path on 192.168.0.2 is
-    /usr/share/some/dir/to/watch
-
-    this is simple for nfs, it's a bit difficult for smb: the "rootpath" of the share is in
-    netbioslanguage, and is not a directory. For example:
-    the source of a mount is //mainserver/public, so the "share" name is public. For this 
-    host it's impossible to detect what directory/path this share is build with. So, it sends
-    the share name to the notifyfs server on mainserver like:
-
-    cifs:/public/some/dir/to/watch
-
-    and let it to the notifyfs process on mainserver to find out what directory the share
-    public is on (by parsing the smb.conf file for example)
-
-    for sshfs this can be also very complicated
-
-    using sshfs like:
-
-    sshfs sbon@192.168.0.2:/ ~/mount -o allow_other
-
-    works ok, since it mounts the root (/) at ~/mount, but it's a bit more complicated when
-
-    sshfs sbon@192.168.0.2: ~/mount -o allow_other
-
-    will take the home directory on 192.168.0.2 of sbon as root.
-
-    Now this host is also not able to determine the home of sbon on 192.168.0.2. To handle this case
-
-    a template is send:
-
-    sshfs:sbon@%HOME%/some/dir/to/watch
-
-*/
-
-
-static void forward_watch_backend(int mountindex, struct watch_struct *watch, char *path)
-{
-    struct notifyfs_mount_struct *mount=get_mount(mountindex);
-    struct notifyfs_server_struct *notifyfs_server=get_mount_backend(mount);
-
-    logoutput("forward_watch_backend");
-
-    if (notifyfs_server) {
-
-	/* here to test allow errors */
-
-	if (notifyfs_server->status==NOTIFYFS_SERVERSTATUS_UP || notifyfs_server->status==NOTIFYFS_SERVERSTATUS_ERROR) {
-	    char *mountpoint=NULL;
-	    struct notifyfs_entry_struct *entry=NULL;
-	    logoutput("forward_watch_backend: remote server found");
-
-	    /* path must be a subdirectory of mountpoint of mount */
-
-	    entry=get_entry(mount->entry);
-
-	    mountpoint=determine_path_entry(entry);
-
-	    if (mountpoint) {
-
-		if (issubdirectory(path, mountpoint, 1)==1) {
-		    int lenpath=strlen(path);
-		    int lenmountpoint=strlen(mountpoint);
-
-		    if (lenpath==lenmountpoint) {
-			pathstring url;
-
-			/* send a watch on the root of remote backend */
-
-			/* determine what to send ?? 
-			    test the filesystem
-			*/
-
-			determine_remotepath(mount, "/", url, sizeof(pathstring));
-
-			send_setwatch_message_remote(notifyfs_server, watch, url);
-
-		    } else {
-			pathstring url;
-
-			determine_remotepath(mount, path+lenmountpoint, url, sizeof(pathstring));
-
-			send_setwatch_message_remote(notifyfs_server, watch, url);
-
-		    }
-
-		}
-
-	    }
-
-	}
-
-    }
-
-}
 
 static void add_clientwatch_owner(struct notifyfs_owner_struct *notifyfs_owner, struct clientwatch_struct *clientwatch)
 {
@@ -615,26 +276,41 @@ static void add_clientwatch_owner(struct notifyfs_owner_struct *notifyfs_owner, 
 
 }
 
-
-
-void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, char *path, int mountindex)
+struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, struct pathinfo_struct *pathinfo, struct timespec *update_time)
 {
     struct clientwatch_struct *clientwatch=NULL;
     struct watch_struct *watch=NULL;
-    int new_fsevent_mask, new_type;
-    unsigned char watchcreated=0, fseventmask_changed=0;
+    unsigned char watchcreated=0;
+    int nreturn=0;
+    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+    struct fseventmask_struct zero_fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
 
-    if (path) {
+    watch=lookup_watch_inode(inode);
 
-	logoutput("add_clientwatch: on %s client watch id %i, %i:%i:%i:%i", path, id, fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
+    if (pathinfo->path) {
+
+	/* possible here compare the pathinfo->path with the one stored in watch->pathinfo.path*/
+
+	logoutput("add_clientwatch: on %s client watch id %i, %i:%i:%i:%i", pathinfo->path, id, fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
 
     } else {
 
-	logoutput("add_clientwatch: on UNKNOWN client watch id %i, %i:%i:%i:%i", id, fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
+	if (! watch) {
+
+	    if (compare_fseventmasks(&zero_fseventmask, fseventmask)==1) {
+
+		logoutput("add_clientwatch: path not set for client watch id %i, while fseventmask is not zero, cannot continue", id);
+		goto out;
+
+	    } else {
+
+		logoutput("add_clientwatch: on UNKNOWN path client watch id %i, %i:%i:%i:%i", id, fseventmask->attrib_event, fseventmask->xattr_event, fseventmask->file_event, fseventmask->move_event);
+
+	    }
+
+	}
 
     }
-
-    watch=lookup_watch_inode(inode);
 
     if ( ! watch ) {
 
@@ -647,37 +323,72 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 	    watch->ctr=0;
 	    watch->inode=inode;
 
-	    watch->fseventmask.attrib_event=0;
-	    watch->fseventmask.xattr_event=0;
-	    watch->fseventmask.file_event=0;
-	    watch->fseventmask.move_event=0;
-	    watch->fseventmask.fs_event=0;
+	    /* take over the path only if allocated and not inuse */
+
+	    if ((!(pathinfo->flags & NOTIFYFS_PATHINFOFLAGS_INUSE)) && (pathinfo->flags & NOTIFYFS_PATHINFOFLAGS_ALLOCATED)) {
+
+		watch->pathinfo.path=pathinfo->path;
+		watch->pathinfo.len=pathinfo->len;
+		watch->pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_INUSE | NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+		pathinfo->flags-=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
+	    } else {
+
+		watch->pathinfo.path=strdup(pathinfo->path);
+
+		if (watch->pathinfo.path) {
+
+		    watch->pathinfo.len=pathinfo->len;
+		    watch->pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_INUSE | NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
+		} else {
+
+		    logoutput("add_clientwatch: error alloacting memory for path %s", pathinfo->path);
+		    free(watch);
+		    watch=NULL;
+		    goto out;
+
+		}
+
+	    }
+
+	    replace_fseventmask(&watch->fseventmask, &zero_fseventmask);
 
 	    watch->nrwatches=0;
 	    watch->clientwatches=NULL;
 
 	    pthread_mutex_init(&watch->mutex, NULL);
-	    pthread_cond_init(&watch->cond, NULL);
 
-	    watch->lock=0;
+	    watch->count=0;
 
 	    watch->next_hash=NULL;
 	    watch->prev_hash=NULL;
-
 	    watch->next=NULL;
 	    watch->prev=NULL;
 
-	    add_watch_to_table(watch);
-	    add_watch_to_list(watch);
+	    add_watch_to_table(watch); /* lookup table per inode */
+	    add_watch_to_list(watch); /* lookup table per ctr */
 
-	    watchcreated=1;
+	    watch->create_time.tv_sec=update_time->tv_sec;
+	    watch->create_time.tv_nsec=update_time->tv_nsec;
+
+	    watch->change_time.tv_sec=update_time->tv_sec;
+	    watch->change_time.tv_nsec=update_time->tv_nsec;
 
 	} else {
 
 	    logoutput("add_clientwatch: unable to allocate a watch");
+	    nreturn=-ENOMEM;
 	    goto out;
 
 	}
+
+    } else {
+
+	/* existing watch found */
+
+	watch->change_time.tv_sec=update_time->tv_sec;
+	watch->change_time.tv_nsec=update_time->tv_nsec;
 
     }
 
@@ -718,16 +429,13 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 
 	if (clientwatch) {
 
-	    clientwatch->fseventmask.attrib_event=fseventmask->attrib_event;
-	    clientwatch->fseventmask.xattr_event=fseventmask->xattr_event;
-	    clientwatch->fseventmask.file_event=fseventmask->file_event;
-	    clientwatch->fseventmask.move_event=fseventmask->move_event;
-	    clientwatch->fseventmask.fs_event=fseventmask->fs_event;
+	    replace_fseventmask(&clientwatch->fseventmask, fseventmask);
 
 	    clientwatch->watch=watch;
 	    watch->nrwatches++;
 
 	    clientwatch->owner_watch_id=id;
+	    clientwatch->view=NULL;
 
 	    /* add it to list per watch */
 
@@ -757,6 +465,7 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 	} else {
 
 	    logoutput("add_clientwatch: unable to allocate a clientwatch");
+	    nreturn=-ENOMEM;
 	    goto unlock;
 
 	}
@@ -765,96 +474,37 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 
 	/* replace existing mask: todo maybe also merge */
 
-	clientwatch->fseventmask.attrib_event=fseventmask->attrib_event;
-	clientwatch->fseventmask.xattr_event=fseventmask->xattr_event;
-	clientwatch->fseventmask.file_event=fseventmask->file_event;
-	clientwatch->fseventmask.move_event=fseventmask->move_event;
-	clientwatch->fseventmask.fs_event=fseventmask->fs_event;
+	replace_fseventmask(&clientwatch->fseventmask, fseventmask);
 
     }
 
     /* test there is a new mask */
 
     if ( merge_fseventmasks(&watch->fseventmask, fseventmask)==1) {
-	struct notifyfs_attr_struct *attr=get_attr(inode->attr);
+	int res=0;
 
-	if ( S_ISDIR(attr->cached_st.st_mode)) {
-	    unsigned char fullsync=0;
-	    struct stat st;
+	res=set_watch_backend_os_specific(watch);
 
-	    /* check the directory is up to date */
+	if (res==-1) {
 
-	    if (lstat(path, &st)==0) {
+	    nreturn=-errno;
 
-		if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec)) fullsync=1;
+	    if (nreturn==-EACCES) {
+
+		logoutput("add_clientwatch: no access to %s", pathinfo->path);
 
 	    } else {
 
-		logoutput("add_clientwatch: error %i setting watch on %s", errno, path);
-
-		/* TODO: add action to react on this event */
+		logoutput("add_clientwatch: error %i setting watch on %s", nreturn, pathinfo->path);
 
 	    }
 
-	    if (fullsync==1) {
-		struct notifyfs_entry_struct *parent=get_entry(inode->alias);
-		struct timespec rightnow;
-		int res;
-
-		get_current_time(&rightnow);
-
-		/* a full sync, because this directory is not in cache yet, or no watch and the contents has changed */
-
-		res=sync_directory_full(path, parent, &rightnow);
-
-		if (res==-ENOENT) {
-
-		    logoutput("add_clientwatch: error %i setting watch on %s", res, path);
-
-		    /* additional action required: check what happened, why is this enoent?? */
-
-		} else if (res==-ENOTDIR) {
-
-		    logoutput("add_clientwatch: error %i setting watch on %s", res, path);
-
-		    /* additional action required: correct the fs..*/
-
-		} else if (res<0) {
-
-		    logoutput("add_clientwatch: error %i setting watch on %s", res, path);
-
-		} else {
-
-		    attr->mtim.tv_sec=st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=st.st_mtim.tv_nsec;
-
-		    remove_old_entries(parent, &rightnow);
-
-		}
-
-	    } else {
-		struct notifyfs_entry_struct *parent=get_entry(inode->alias);
-		struct timespec rightnow;
-
-		get_current_time(&rightnow);
-
-		sync_directory_simple(path, parent, &rightnow);
-
-	    }
-
-	}
-
-	set_watch_backend_os_specific(watch, path);
-
-	if (notifyfs_options.listennetwork==0) {
-
-	    /* test it's on a network or fuse fs */
-
-	    if (mountindex>=0) forward_watch_backend(mountindex, watch, path);
+	    goto unlock;
 
 	}
 
     }
+
 
     unlock:
 
@@ -862,7 +512,7 @@ void add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_str
 
     out:
 
-    return;
+    return clientwatch;
 
 }
 
@@ -903,6 +553,16 @@ void remove_clientwatch_from_watch(struct clientwatch_struct *clientwatch)
 	watch->fseventmask.fs_event=0;
 
 	/* just leave it hanging around for now.. */
+
+	/* additional action:
+	    - remove any watch on the backend if forwarded
+	    howto detect that there are watches forwared??
+
+	    watch -> mount -> backend
+
+	    is it required to store the mount in the watch
+
+	*/
 
     } else {
 
@@ -957,7 +617,7 @@ void remove_clientwatch_from_owner(struct clientwatch_struct *clientwatch, unsig
     } else if (clientwatch->notifyfs_owner.type==NOTIFYFS_OWNERTYPE_SERVER) {
 	struct notifyfs_server_struct *server=clientwatch->notifyfs_owner.owner.remoteserver;
 
-	lock_notifyfs_server(server);
+	pthread_mutex_lock(&server->mutex);
 
 	if (clientwatch->prev_per_owner) clientwatch->prev_per_owner->next_per_owner=clientwatch->next_per_owner;
 	if (clientwatch->next_per_owner) clientwatch->next_per_owner->prev_per_owner=clientwatch->prev_per_owner;
@@ -966,12 +626,11 @@ void remove_clientwatch_from_owner(struct clientwatch_struct *clientwatch, unsig
 
 	if (sendmessage==1) {
 
-    	    if ( server->status==NOTIFYFS_SERVERSTATUS_UP ) connection=server->connection;
+    	    if ( server->status==NOTIFYFS_BACKENDSTATUS_UP ) connection=server->connection;
 
 	}
 
-
-	unlock_notifyfs_server(server);
+	pthread_mutex_unlock(&server->mutex);
 
     }
 
@@ -1018,7 +677,7 @@ void remove_clientwatches_server(struct notifyfs_server_struct *server)
 {
     struct clientwatch_struct *clientwatch=NULL;
 
-    lock_notifyfs_server(server);
+    pthread_mutex_lock(&server->mutex);
 
     clientwatch=(struct clientwatch_struct *) server->clientwatches;
 
@@ -1037,7 +696,7 @@ void remove_clientwatches_server(struct notifyfs_server_struct *server)
 
     }
 
-    unlock_notifyfs_server(server);
+    pthread_mutex_unlock(&server->mutex);
 
 }
 
@@ -1066,7 +725,16 @@ void close_fsnotify_backends()
     close_inotify();
 }
 
-int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time)
+/*
+
+    sync a directory by calling opendir/readdir/closedir on the underlying filesystem
+    do a stat for every entry found
+
+    TODO: add action when an entry is created or removed
+
+*/
+
+int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent)
 {
     DIR *dp=NULL;
     int nreturn=0;
@@ -1085,24 +753,25 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 	int res, lenname=0;
 	struct stat st;
 	char tmppath[lenpath+256];
-	unsigned char attrcreated=0;
+	unsigned char attrcreated=0, entrycreated=0;
 
 	memcpy(tmppath, path, lenpath);
 	*(tmppath+lenpath)='/';
 
 	parent_inode=get_inode(parent->inode);
 
-	while((de=readdir(dp))) {
+	if (*createfsevent==1) {
+	    struct watch_struct *watch=lookup_watch_inode(parent_inode);
 
-	    /* here check the entry exist... */
+	    if (directory_is_viewed(watch)==0 && ! watch) *createfsevent=0;
+
+	}
+
+	while((de=readdir(dp))) {
 
 	    name=de->d_name;
 
-	    if ( strcmp(name, ".")==0 ) {
-
-		continue;
-
-	    } else if ( strcmp(name, "..")==0 ) {
+	    if ( strcmp(name, ".")==0 || strcmp(name, "..")==0 ) {
 
 		continue;
 
@@ -1133,7 +802,16 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 	    if ( entry ) {
 
-		if (entry->inode==-1) assign_inode(entry);
+		entrycreated=0;
+
+		if (entry->inode==-1) {
+
+		    /* when no inode: just created */
+
+		    assign_inode(entry);
+		    entrycreated=1;
+
+		}
 
 		if (entry->inode>=0) {
 
@@ -1194,6 +872,22 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 		    }
 
+		    if (*createfsevent==1 && entrycreated==1) {
+			struct notifyfs_fsevent_struct *fsevent=NULL;
+
+			/* here create an fsevent */
+
+			fsevent=create_fsevent(entry);
+
+			if (fsevent) {
+
+			    fsevent->fseventmask.cache_event=NOTIFYFS_FSEVENT_CACHE_ADDED;
+			    queue_fsevent(fsevent);
+
+			}
+
+		    }
+
 		} else {
 
 		    continue;
@@ -1204,13 +898,11 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 	}
 
-
 	closedir(dp);
 
     } else {
 
 	nreturn=-errno;
-
 	logoutput("sync_directory: error %i opening directory..", errno);
 
     }
@@ -1219,20 +911,30 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 }
 
-void remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time)
+unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent)
 {
     struct notifyfs_entry_struct *entry, *next_entry;
     struct notifyfs_inode_struct *inode, *parent_inode;
     struct notifyfs_attr_struct *attr;
+    unsigned char removeentry=0;
+    unsigned int count=0;
 
     logoutput("remove_old_entries");
 
     parent_inode=get_inode(parent->inode);
 
+    if (*createfsevent==1) {
+	struct watch_struct *watch=lookup_watch_inode(parent_inode);
+
+	if (directory_is_viewed(watch)==0 && ! watch) *createfsevent=0;
+
+    }
+
     entry=get_next_entry(parent, NULL);
 
     while (entry) {
 
+	removeentry=0;
 	inode=get_inode(entry->inode);
 	attr=get_attr(inode->attr);
 
@@ -1240,25 +942,52 @@ void remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *s
 
 	if (attr) {
 
-	    /* if stime is less then parent entry access it's is gone */
+	    /* if stime is less then parent entry access it's gone */
 
-	    if (attr->atim.tv_sec<sync_time->tv_sec ||(attr->atim.tv_sec==sync_time->tv_sec && attr->atim.tv_nsec<sync_time->tv_nsec) ) {
-		char *name=get_data(entry->name);
-
-		logoutput("remove_old_entries: remove %s", name);
-
-		remove_entry_from_name_hash(entry);
-		remove_entry(entry);
-
-		/* TODO:
-		correct the fs & signals */
-
-	    }
+	    if (attr->atim.tv_sec<sync_time->tv_sec ||(attr->atim.tv_sec==sync_time->tv_sec && attr->atim.tv_nsec<sync_time->tv_nsec)) removeentry=1;
 
 	} else {
 
+	    removeentry=1;
+
+	}
+
+	if (removeentry==1) {
+	    unsigned char dofsevent=0;
+
+	    if (*createfsevent==0) {
+		struct watch_struct *watch=lookup_watch_inode(inode);
+
+		if (watch) dofsevent=1;
+
+	    } else {
+
+		dofsevent=1;
+
+	    }
+
+	    if (dofsevent==1) {
+		struct notifyfs_fsevent_struct *fsevent=NULL;
+
+		/* here create an fsevent */
+
+		fsevent=create_fsevent(entry);
+
+		if (fsevent) {
+
+		    fsevent->fseventmask.cache_event=NOTIFYFS_FSEVENT_CACHE_REMOVED;
+		    queue_fsevent(fsevent);
+
+		}
+
+	    }
+
 	    remove_entry_from_name_hash(entry);
 	    remove_entry(entry);
+
+	} else {
+
+	    count++;
 
 	}
 
@@ -1266,9 +995,11 @@ void remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *s
 
     }
 
+    return count;
+
 }
 
-void sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time)
+unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time)
 {
     struct notifyfs_entry_struct *entry, *next_entry;
     struct notifyfs_inode_struct *inode, *parent_inode;
@@ -1277,6 +1008,7 @@ void sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, str
     int lenpath=strlen(path), lenname;
     char tmppath[lenpath+256];
     struct stat st;
+    unsigned int count=0;
 
     memcpy(tmppath, path, lenpath);
     *(tmppath+lenpath)='/';
@@ -1351,11 +1083,15 @@ void sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, str
 
 	    }
 
+	    count++;
+
 	}
 
 	entry=get_next_entry(parent, entry);
 
     }
+
+    return count;
 
 }
 
