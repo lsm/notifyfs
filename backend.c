@@ -512,7 +512,7 @@ struct notifyfs_backend_struct *connect_remote_notifyfs_server(int family, char 
 		backend->type=NOTIFYFS_BACKENDTYPE_SERVER;
 		backend->connection=connection;
 
-		connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
+		connection->typedata=NOTIFYFS_OWNERTYPE_BACKEND;
 		connection->data=(void *) backend;
 
 		backend->status=NOTIFYFS_BACKENDSTATUS_UP;
