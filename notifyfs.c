@@ -3021,15 +3021,15 @@ int add_networkserver(struct notifyfs_connection_struct *new_connection, uint32_
 
 	    if (notifyfs_server) {
 
-		notifyfs_server->connection=connection;
+		notifyfs_server->connection=new_connection;
 		notifyfs_server->status=NOTIFYFS_SERVERSTATUS_UP;
 		notifyfs_server->type=NOTIFYFS_SERVERTYPE_NETWORK;
 
 		get_current_time(&notifyfs_server->connect_time);
 
-		connection->data=(void *) notifyfs_server;
-		connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
-		connection->process_event=process_connection_event;
+		new_connection->data=(void *) notifyfs_server;
+		new_connection->typedata=NOTIFYFS_OWNERTYPE_SERVER;
+		new_connection->process_event=process_connection_event;
 
 	    }
 
