@@ -426,6 +426,8 @@ struct fsfunctions_struct *lookup_fsfunctions_byservice(char *service)
 {
     struct fsfunctions_struct *fsfunctions=NULL;
 
+    logoutput("lookup_fsfunctions_byservice: lookup for service %s", service);
+
     pthread_mutex_lock(&fsfunctions_mutex);
 
     fsfunctions=fsfunctions_list;
@@ -433,6 +435,8 @@ struct fsfunctions_struct *lookup_fsfunctions_byservice(char *service)
     while(fsfunctions) {
 
 	if (fsfunctions->name) {
+
+	    logoutput("lookup_fsfunctions_byservice: compare with %s", fsfunctions->name);
 
 	    if (strcmp(fsfunctions->name, service)==0) break;
 

@@ -609,6 +609,8 @@ char *process_notifyfsurl(char *url)
     char *sep=NULL;
     char *path=NULL;
 
+    logoutput("process_notifyfsurl: url %s", url);
+
     /*
 	find the first part, which is the name of the service, like:
 
