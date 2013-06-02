@@ -1505,41 +1505,138 @@ static unsigned char queue_required(struct notifyfs_fsevent_struct *fsevent)
 
 void queue_fsevent(struct notifyfs_fsevent_struct *fsevent)
 {
-    struct fseventmask_struct *fseventmask=&fsevent->fseventmask;
+    struct fseventmask_struct *fseventmask=&fsevent->fseventmask, fseventmask_keep;
     int res=0;
-    struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *)fsevent->data;
+    struct notifyfs_mount_struct *mount=NULL;
+    struct supermount_struct *supermount=NULL;
+    struct pathinfo_struct pathinfo={NULL, 0, 0};
 
     logoutput("queue_fsevent");
 
-    /* 
-	in some cases the path is already set 
-	and in some cases it's not required that the data is set..
+    if (fseventmask->fs_event==0) {
+	struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *)fsevent->data;
+	int len=1;
+
+	mount=get_mount(entry->mount);
+
+	supermount=find_supermount_majorminor(mount->major, mount->minor);
+
+	if (supermount->refcount>1) {
+	    char *name=NULL;
+
+	    /* determine the path on this mount
+
+	    */
+
+	    while(entry->index>0) {
+
+		if (entry->mount==mount->index && mount->entry != entry->index) {
+
+		    name=get_data(entry->name);
+
+		    len+=strlen(name)+1;
+
+		    entry=get_entry(entry->parent);
+
+		} else {
+
+		    break;
+
+		}
+
+	    }
+
+	    if (len>1) {
+
+		pathinfo.path=malloc(len);
+
+		if (pathinfo.path) {
+		    char *pos=pathinfo.path+len-1;
+		    int len0;
+
+		    *pos='\0';
+
+		    while(entry->index>0) {
+
+			if (entry->mount==mount->index && mount->entry != entry->index) {
+
+			    name=get_data(entry->name);
+
+			    len0=strlen(name);
+
+			    pos-=len0;
+
+			    memcpy(pos, name, len0);
+			    pos--;
+			    *pos='/';
+
+			    entry=get_entry(entry->parent);
+
+			} else {
+
+			    break;
+
+			}
+
+		    }
+
+		    pathinfo.len=len;
+		    pathinfo.flags=NOTIFYFS_PATHINFOFLAGS_ALLOCATED;
+
+		    replace_fseventmask(&fseventmask_keep, fseventmask);
+
+		}
+
+	    }
+
+	}
+
+	/* adjust the status of this inode in case of an remove */
+
+	if (fseventmask->move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED)) {
+	    struct notifyfs_inode_struct *inode=get_inode(entry->inode);
+
+	    if (inode) inode->status=FSEVENT_INODE_STATUS_TOBEREMOVED;
+
+	}
+
+    }
+
+	/* not an mount event */
+
+    /*
+	in some cases the path is not set
 
     */
 
-    if (! fsevent->pathinfo.path && (fseventmask->move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED | NOTIFYFS_FSEVENT_FS_UNMOUNT))) {
+    if (! fsevent->pathinfo.path) {
 
-	res=determine_path(entry, &fsevent->pathinfo);
+	if (fseventmask->move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED )) {
+	    struct notifyfs_entry_struct *entry=(struct notifyfs_entry_struct *)fsevent->data;
 
-	if (res<0) {
+	    res=determine_path(entry, &fsevent->pathinfo);
 
-	    if (res==-EINPROGRESS) {
+	    if (res<0) {
 
-		/* some upper directory is to be removed : ignore */
+		if (res==-EINPROGRESS) {
 
-		return;
+		    /* some upper directory is to be removed : ignore */
 
-	    } else if (res==-ENOMEM) {
+		    return;
 
-		logoutput("queue_fsevent: dropping fsevent due to memory allocation");
+		} else if (res==-ENOMEM) {
 
-		return;
+		    logoutput("queue_fsevent: dropping fsevent due to memory allocation");
 
-	    } else {
+		    return;
 
-		logoutput("queue_fsevent: dropping fsevent due to unknown error %i", res);
+		} else {
 
-		return;
+		    logoutput("queue_fsevent: dropping fsevent due to unknown error %i", res);
+
+		    return;
+
+		}
 
 	    }
 
@@ -1547,21 +1644,8 @@ void queue_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
     }
 
-    /* adjust the status of this inode in case of an remove or unmount */
 
-    if (fseventmask->move_event & (NOTIFYFS_FSEVENT_MOVE_MOVED | NOTIFYFS_FSEVENT_MOVE_MOVED_FROM | NOTIFYFS_FSEVENT_MOVE_DELETED)) {
-	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
-
-	if (inode) inode->status=FSEVENT_INODE_STATUS_TOBEREMOVED;
-
-    }
-
-    if (fseventmask->fs_event & NOTIFYFS_FSEVENT_FS_UNMOUNT_REMOVE) {
-	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
-
-	if (inode) inode->status=FSEVENT_INODE_STATUS_TOBEUNMOUNTED;
-
-    }
+    /* test it's required to queue this event */
 
     fsevent->status=NOTIFYFS_FSEVENT_STATUS_WAITING;
 
@@ -1632,6 +1716,14 @@ void queue_fsevent(struct notifyfs_fsevent_struct *fsevent)
     } else {
 
 	destroy_notifyfs_fsevent(fsevent);
+
+    }
+
+    if (pathinfo.path) {
+
+	logoutput("queue_fsevent: found path %s on %i:%i, total mounts %i", pathinfo.path, supermount->major, supermount->minor, supermount->refcount);
+
+	free_path_pathinfo(&pathinfo);
 
     }
 

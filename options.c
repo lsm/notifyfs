@@ -596,7 +596,7 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *notifyfs_fuse_args
 
 			notifyfs_options.mountpoint=check_path(optarg);
 
-			if ( ! notifyfs_options.conffile ) {
+			if ( ! notifyfs_options.mountpoint ) {
 
 			    nreturn=-1;
 			    fprintf(stderr, "Error:(%i) option --mountpoint=%s cannot be parsed. Cannot continue.\n", errno, optarg);

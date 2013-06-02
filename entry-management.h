@@ -85,6 +85,7 @@ void remove_attr(struct notifyfs_attr_struct *attr);
 struct notifyfs_mount_struct *create_mount(struct notifyfs_entry_struct *entry, int major, int minor);
 void remove_mount(struct notifyfs_mount_struct *mount);
 struct notifyfs_mount_struct *find_mount_majorminor(int major, int minor, struct notifyfs_mount_struct *new_mount);
+struct notifyfs_mount_struct *get_next_mount(int major, int minor, void **index);
 struct notifyfs_backend_struct *get_mount_backend(struct notifyfs_mount_struct *mount);
 
 struct supermount_struct *add_supermount(int major, int minor, char *source, char *options);

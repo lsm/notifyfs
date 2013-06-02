@@ -1049,7 +1049,6 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
 			logoutput("handle_data_on_inotify_fd: received notifyfs_fsevent");
 
 			get_current_time(&notifyfs_fsevent->detect_time);
-
 			queue_fsevent(notifyfs_fsevent);
 
 		    }

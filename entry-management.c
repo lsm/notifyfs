@@ -217,6 +217,36 @@ struct notifyfs_mount_struct *find_mount_majorminor(int major, int minor, struct
 
 }
 
+struct notifyfs_mount_struct *get_next_mount(int major, int minor, void **index)
+{
+    struct simple_list_struct *element=NULL;
+
+    if (! *index) {
+	int hashvalue=calculate_mount_hash(major, minor) % group_mount.len;
+
+	element=group_mount.hash[hashvalue];
+
+	*index=(void *) element;
+
+    } else {
+
+	element=(struct simple_list_struct *) *index;
+
+	element=element->next;
+	*index=(struct simple_list_struct *) element;
+
+    }
+
+    if (element) return element->data;
+
+    return NULL;
+
+}
+
+
+
+
+
 void lock_supermounts()
 {
     pthread_mutex_lock(&supermount_mutex);

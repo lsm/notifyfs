@@ -3253,8 +3253,12 @@ int main(int argc, char *argv[])
 
 	if ( inet_fd<=0 ) {
 
-    	    logoutput("Error creating socket fd: error %i.", inet_fd);
+    	    logoutput("Error creating network socket fd: error %i.", inet_fd);
     	    goto out;
+
+	} else {
+
+	    logoutput("Network socket fd %i created.", inet_fd);
 
 	}
 

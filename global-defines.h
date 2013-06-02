@@ -45,5 +45,5 @@
 
 #define LINE_MAXLEN 		64
 
-//#define LOGGING
+#define LOGGING
 #define LOG_DEFAULT_LEVEL	1
