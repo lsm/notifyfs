@@ -567,7 +567,7 @@ static void constructSMBurl(char *source, char *options, char *path, char *url, 
 
 		pos=snprintf(url, len, "smb://%s@", user);
 
-		memcpy(url+pos, sep+1, len0);
+		memcpy(url+pos, sep, len0);
 		pos+=len0;
 
 		memcpy(url+pos, path, len1);
@@ -586,7 +586,7 @@ static void constructSMBurl(char *source, char *options, char *path, char *url, 
 
 		pos=snprintf(url, len, "smb://");
 
-		memcpy(url+pos, sep+1, len0);
+		memcpy(url+pos, sep, len0);
 		pos+=len0;
 
 		memcpy(url+pos, path, len1);

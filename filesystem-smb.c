@@ -127,34 +127,43 @@ char *processSMBurl(char *url)
 
     }
 
-    /* skip the servername */
+    ///* skip the servername */
 
     sep++;
     url=sep;
 
-    sep=strchr(url, '/');
+    //sep=strchr(url, '/');
 
-    if (!sep) {
+    //if (!sep) {
 
-	logoutput("process_url_smb: no share found, cannot continue");
-	goto out;
+	//logoutput("process_url_smb: no share found, cannot continue");
+	//goto out;
 
-    }
+    //}
 
     /* the share */
 
     share=url;
-    *sep='\0';
-    sep++; /* the rest is the path in the share */
+
+    sep=strchr(share, '/');
+
+    if (sep) {
+
+	*sep='\0';
+	sep++; /* the rest is the path in the share */
+
+    }
 
     sharepath=translateSMBshareintopath(user, share);
 
     if (sharepath) {
-	int len0=strlen(sep);
+	int len0=0;
 
 	logoutput("process_notifyfsurl_smb: path %s found, test it does exist", sharepath);
 
-	if (strlen(sep)>0) {
+	if (sep) len0=strlen(sep);
+
+	if (len0>0) {
 	    int len1=strlen(sharepath);
 
 	    path=malloc(len1 + 2 + len0);

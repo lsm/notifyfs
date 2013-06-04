@@ -1587,7 +1587,7 @@ void handle_setwatch_message(int fd, void *data, struct notifyfs_setwatch_messag
 
 		clientcommand->command.setwatch.pathinfo.path=strdup((char *) buff);
 
-	    } else if (typedata==NOTIFYFS_OWNERTYPE_BACKEND) {
+	    } else if (typedata==NOTIFYFS_OWNERTYPE_SERVER) {
 
 		clientcommand->command.setwatch.pathinfo.path=process_notifyfsurl((char *) buff);
 
