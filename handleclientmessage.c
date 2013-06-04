@@ -672,7 +672,18 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 
 		watch=clientwatch->watch;
 
-		if (watch->inode != inode) clientwatch->view=NULL;
+		if (watch->inode != inode) {
+
+		    /*
+			this view has been used for another directory before
+			maybe stop additional actions here for this directory like
+			polling (the poor mans fs notify method)
+
+		    */
+
+		    clientwatch->view=NULL;
+
+		}
 
 	    }
 
@@ -687,6 +698,12 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 	activate_view(view);
 
     }
+
+    /*
+	check the underlying fs first to make sure the right watch is set:
+	- on linux an inotify watch is not usefull on virtual filesystems like proc, sys and dev
+
+    */
 
     get_current_time(&current_time);
 
@@ -806,6 +823,7 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 
     logoutput("process_command_setwatch: error (%i:%s)", error, strerror(error));
     send_clientcommand_reply(clientcommand, error);
+    free_path_pathinfo(&command_setwatch->pathinfo);
 
 }
 
