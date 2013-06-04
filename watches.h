@@ -88,7 +88,7 @@ struct watch_struct *lookup_watch_list(unsigned long ctr);
 void add_watch_to_list(struct watch_struct *watch);
 void remove_watch_from_list(struct watch_struct *watch);
 
-struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, struct pathinfo_struct *pathinfo, struct timespec *update_time);
+struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, struct pathinfo_struct *pathinfo, struct timespec *update_time, unsigned char systemfs);
 void remove_clientwatch_from_owner(struct clientwatch_struct *clientwatch, unsigned char sendmessage);
 
 void remove_clientwatches(struct notifyfs_owner_struct *owner);

@@ -276,7 +276,7 @@ static void add_clientwatch_owner(struct notifyfs_owner_struct *notifyfs_owner, 
 
 }
 
-struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, struct pathinfo_struct *pathinfo, struct timespec *update_time)
+struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, struct pathinfo_struct *pathinfo, struct timespec *update_time, unsigned char onsystemfs)
 {
     struct clientwatch_struct *clientwatch=NULL;
     struct watch_struct *watch=NULL;
@@ -483,23 +483,27 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
     if ( merge_fseventmasks(&watch->fseventmask, fseventmask)==1) {
 	int res=0;
 
-	res=set_watch_backend_os_specific(watch);
+	if (onsystemfs==0) {
 
-	if (res==-1) {
+	    res=set_watch_backend_os_specific(watch);
 
-	    nreturn=-errno;
+	    if (res==-1) {
 
-	    if (nreturn==-EACCES) {
+		nreturn=-errno;
 
-		logoutput("add_clientwatch: no access to %s", pathinfo->path);
+		if (nreturn==-EACCES) {
 
-	    } else {
+		    logoutput("add_clientwatch: no access to %s", pathinfo->path);
 
-		logoutput("add_clientwatch: error %i setting watch on %s", nreturn, pathinfo->path);
+		} else {
+
+		    logoutput("add_clientwatch: error %i setting watch on %s", nreturn, pathinfo->path);
+
+		}
+
+		goto unlock;
 
 	    }
-
-	    goto unlock;
 
 	}
 

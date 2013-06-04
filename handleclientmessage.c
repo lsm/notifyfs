@@ -1,6 +1,6 @@
 /*
- 
-  2010, 2011, 2012 Stef Bon <stefbon@gmail.com>
+
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -387,6 +387,43 @@ static void forward_watch_backend(int mountindex, struct watch_struct *watch, ch
 
 }
 
+unsigned char on_systemfs(struct notifyfs_entry_struct *entry)
+{
+    struct notifyfs_mount_struct *mount=get_mount(entry->mount);
+
+    if (mount) {
+	struct supermount_struct *supermount=NULL;
+
+	supermount=find_supermount_majorminor(mount->major, mount->minor);
+
+	if (supermount) {
+	    struct notifyfs_filesystem_struct *fs=NULL;
+
+    	    fs=supermount->fs;
+
+	    if (fs) {
+
+		if (fs->mode & NOTIFYFS_FILESYSTEM_SYSTEM) {
+
+		    return 1;
+
+		} else {
+
+		    return 0;
+
+		}
+
+	    }
+
+	}
+
+    }
+
+    return 0;
+
+}
+
+
 void send_clientcommand_reply(struct clientcommand_struct *clientcommand, int error)
 {
     struct notifyfs_connection_struct *connection=NULL;
@@ -702,12 +739,21 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
     /*
 	check the underlying fs first to make sure the right watch is set:
 	- on linux an inotify watch is not usefull on virtual filesystems like proc, sys and dev
+	maybe something like capabilities of underlying fs
 
     */
 
     get_current_time(&current_time);
 
-    clientwatch=add_clientwatch(inode, fseventmask, command_setwatch->owner_watch_id, &clientcommand->owner, &command_setwatch->pathinfo, &current_time);
+    if (on_systemfs(entry)==1) {
+
+	clientwatch=add_clientwatch(inode, fseventmask, command_setwatch->owner_watch_id, &clientcommand->owner, &command_setwatch->pathinfo, &current_time, 1);
+
+    } else {
+
+	clientwatch=add_clientwatch(inode, fseventmask, command_setwatch->owner_watch_id, &clientcommand->owner, &command_setwatch->pathinfo, &current_time, 0);
+
+    }
 
     if (clientwatch) {
 	struct watch_struct *watch=clientwatch->watch;
