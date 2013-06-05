@@ -125,6 +125,43 @@ struct clientcommand_struct {
 
 static struct workerthreads_queue_struct *workerthreads_queue=NULL;
 
+unsigned char on_systemfs(struct notifyfs_entry_struct *entry)
+{
+    struct notifyfs_mount_struct *mount=get_mount(entry->mount);
+
+    if (mount) {
+	struct supermount_struct *supermount=NULL;
+
+	supermount=find_supermount_majorminor(mount->major, mount->minor);
+
+	if (supermount) {
+	    struct notifyfs_filesystem_struct *fs=NULL;
+
+    	    fs=supermount->fs;
+
+	    if (fs) {
+
+		if (fs->mode & NOTIFYFS_FILESYSTEM_SYSTEM) {
+
+		    return 1;
+
+		} else {
+
+		    return 0;
+
+		}
+
+	    }
+
+	}
+
+    }
+
+    return 0;
+
+}
+
+
 
 /*
     function to test a mount has a backend, and if so, forward the watch to that backend
@@ -368,7 +405,15 @@ static void forward_watch_backend(int mountindex, struct watch_struct *watch, ch
 
 			get_current_time(&current_time);
 
-			add_clientwatch(inode, &watch->fseventmask, watch->ctr, &owner, &backend_pathinfo, &current_time);
+			if (on_systemfs(entry)==1) {
+
+			    add_clientwatch(inode, &watch->fseventmask, watch->ctr, &owner, &backend_pathinfo, &current_time, 1);
+
+			} else {
+
+			    add_clientwatch(inode, &watch->fseventmask, watch->ctr, &owner, &backend_pathinfo, &current_time, 0);
+
+			}
 
 		    }
 
@@ -387,41 +432,6 @@ static void forward_watch_backend(int mountindex, struct watch_struct *watch, ch
 
 }
 
-unsigned char on_systemfs(struct notifyfs_entry_struct *entry)
-{
-    struct notifyfs_mount_struct *mount=get_mount(entry->mount);
-
-    if (mount) {
-	struct supermount_struct *supermount=NULL;
-
-	supermount=find_supermount_majorminor(mount->major, mount->minor);
-
-	if (supermount) {
-	    struct notifyfs_filesystem_struct *fs=NULL;
-
-    	    fs=supermount->fs;
-
-	    if (fs) {
-
-		if (fs->mode & NOTIFYFS_FILESYSTEM_SYSTEM) {
-
-		    return 1;
-
-		} else {
-
-		    return 0;
-
-		}
-
-	    }
-
-	}
-
-    }
-
-    return 0;
-
-}
 
 
 void send_clientcommand_reply(struct clientcommand_struct *clientcommand, int error)

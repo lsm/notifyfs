@@ -45,6 +45,7 @@
 */
 
 struct watch_struct {
+    unsigned char type;
     unsigned long ctr;
     struct notifyfs_inode_struct *inode;
     struct pathinfo_struct pathinfo;

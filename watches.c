@@ -77,10 +77,45 @@
 #include "message-send.h"
 
 
+#ifdef __gnu_linux__
+
 #ifdef HAVE_INOTIFY
-#include "watches-backend-inotify.c"
+#include "watches-linux-inotify.c"
+
+int set_watch_backend_os_specific(struct watch_struct *watch)
+{
+    return set_watch_backend_inotify(watch);
+}
+
+int change_watch_backend_os_specific(struct watch_struct *watch)
+{
+    return change_watch_backend_inotify(watch);
+}
+
+void remove_watch_backend_os_specific(struct watch_struct *watch)
+{
+    remove_watch_backend_inotify(watch);
+}
+
+void initialize_watches_backend()
+{
+    initialize_inotify();
+}
+
+void close_watches_backend()
+{
+    close_inotify();
+
+}
+
 #else
-#include "watches-backend-inotify-notsup.c"
+#include "watches-notsup.c"
+#endif
+
+#else
+
+#include "watches-notsup.c"
+
 #endif
 
 struct watch_struct *first_watch;
@@ -216,28 +251,6 @@ void remove_watch_from_list(struct watch_struct *watch)
 
 }
 
-int set_watch_backend_os_specific(struct watch_struct *watch)
-{
-    int res=0;
-
-    res=set_watch_backend_inotify(watch);
-
-    return res;
-}
-
-int change_watch_backend_os_specific(struct watch_struct *watch)
-{
-    int res=0;
-
-    res=change_watch_backend_inotify(watch);
-
-    return res;
-}
-
-void remove_watch_backend_os_specific(struct watch_struct *watch)
-{
-    remove_watch_backend_inotify(watch);
-}
 
 
 
