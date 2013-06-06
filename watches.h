@@ -103,8 +103,4 @@ int set_watch_backend_os_specific(struct watch_struct *watch);
 int change_watch_backend_os_specific(struct watch_struct *watch);
 void remove_watch_backend_os_specific(struct watch_struct *watch);
 
-int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent);
-unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent);
-unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time);
-
 #endif
