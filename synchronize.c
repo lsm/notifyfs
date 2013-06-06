@@ -65,6 +65,8 @@
 #include "utils.h"
 
 
+
+
 /*
 
     sync a directory by calling opendir/readdir/closedir on the underlying filesystem
@@ -138,11 +140,18 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 	    if ( res==-1 ) {
 
+		/*
+		    huh??
+		    readdir gives this entry, but stat not??
+		*/
+
 		continue;
 
-		/* here additional action: lookup the entry and if exist: a delete */
-
 	    }
+
+	    /*
+		find the entry (and create it when not found)
+	    */
 
 	    entry=find_entry_raw(parent, parent_inode, name, 1, create_entry);
 
