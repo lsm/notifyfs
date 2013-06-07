@@ -155,6 +155,129 @@ void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
 }
 
+unsigned char compare_attributes(struct stat *cached_st, struct stat *st, struct fseventmask_struct *fseventmask)
+{
+    unsigned char changed=0;
+
+    /* compare mode, owner and group */
+
+    if (cached_st->st_mode!=st->st_mode) {
+
+	fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_MODE;
+	cached_st->st_mode=st->st_mode;
+
+	changed=1;
+
+    }
+
+    if (cached_st->st_uid!=st->st_uid) {
+
+	fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_OWNER;
+	cached_st->st_uid=st->st_uid;
+
+	changed=1;
+
+    }
+
+    if (cached_st->st_gid!=st->st_gid) {
+
+	fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_GROUP;
+	cached_st->st_gid=st->st_gid;
+
+	changed=1;
+
+    }
+
+    /* nlinks belongs to group MOVE */
+
+    if (cached_st->st_nlink!=st->st_nlink) {
+
+	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_NLINKS;
+	cached_st->st_nlink=st->st_nlink;
+
+	changed=1;
+
+    }
+
+    /* size belongs to group FILE */
+
+    if (cached_st->st_size!=st->st_size) {
+
+	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_SIZE;
+	cached_st->st_size=st->st_size;
+
+	changed=1;
+
+    }
+
+    /* not yet obvious what happened: xattr or contents changed in directory??
+
+	with linux when adding or removing an entry, the timestamp st_mtime is changed of the parent directory
+
+	when changing the xattr, the timestamp st_ctime is changed
+
+	when using an utility like touch, the timestamps st_atime and possibly st_mtime is changed 
+    */
+
+    /* check the mtime */
+
+    if (cached_st->st_mtim.tv_sec<st->st_mtim.tv_sec || (cached_st->st_mtim.tv_sec==st->st_mtim.tv_sec && cached_st->st_mtim.tv_nsec<st->st_mtim.tv_nsec)) {
+
+	/*
+	    with a directory the mtime is changed when an entry is added or deleted, this change is not interesting here
+	    with a file, when the mtime is changed it should be picked up with the other checks...(like size or contents of file altered by write)
+
+	*/
+
+	cached_st->st_mtim.tv_sec=st->st_mtim.tv_sec;
+	cached_st->st_mtim.tv_nsec=st->st_mtim.tv_nsec;
+
+    }
+
+    /* check the ctime */
+
+    if (cached_st->st_ctim.tv_sec<st->st_ctim.tv_sec || (cached_st->st_ctim.tv_sec==st->st_ctim.tv_sec && cached_st->st_ctim.tv_nsec<st->st_ctim.tv_nsec)) {
+
+	/* check for the xattr */
+
+	if (fseventmask->attrib_event==0) {
+
+	    /*
+
+		it's not one of the other attributes, so
+		probably something with xattr
+		what changed exactly is todo .... 
+
+	    */
+
+	    fseventmask->xattr_event|=NOTIFYFS_FSEVENT_XATTR_NOTSET;
+
+	    changed=1;
+
+	}
+
+	cached_st->st_ctim.tv_sec=st->st_ctim.tv_sec;
+	cached_st->st_ctim.tv_nsec=st->st_ctim.tv_nsec;
+
+
+    }
+
+    /* check for utilities like touch, which change only the timestamps */
+
+    /* check the atime */
+
+    if (attr->cached_st.st_atim.tv_sec<st.st_atim.tv_sec || (attr->cached_st.st_atim.tv_sec==st.st_atim.tv_sec && attr->cached_st.st_atim.tv_nsec<st.st_atim.tv_nsec)) {
+
+	attr->cached_st.st_atim.tv_sec=st.st_atim.tv_sec;
+	attr->cached_st.st_atim.tv_nsec=st.st_atim.tv_nsec;
+
+    }
+
+    return changed;
+
+}
+
+
 /* function to test a fsevent (fseventmaskb) applies to the mask of a (clientwatch) fseventmask (fseventmaska) */
 
 static unsigned char check_fsevent_applies(struct fseventmask_struct *fseventmaska, struct fseventmask_struct *fseventmaskb, unsigned char indir)

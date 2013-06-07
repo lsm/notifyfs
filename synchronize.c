@@ -64,6 +64,20 @@
 #include "changestate.h"
 #include "utils.h"
 
+	if (*createfsevent==1) {
+	    struct watch_struct *watch=lookup_watch_inode(parent_inode);
+
+	    /*
+		when directory is not watched (= no watch)
+		or when no one cares (no view on watch) do not create fsevents
+		no one is interested...
+	    */
+
+	    if (! watch || directory_is_viewed(watch)==0 || ) *createfsevent=0;
+
+	}
+
+
 
 
 
@@ -76,7 +90,7 @@
 
 */
 
-int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent)
+int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char createfsevent)
 {
     DIR *dp=NULL;
     int nreturn=0;
@@ -102,19 +116,6 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 	parent_inode=get_inode(parent->inode);
 
-	if (*createfsevent==1) {
-	    struct watch_struct *watch=lookup_watch_inode(parent_inode);
-
-	    /*
-		when directory is not watched (= no watch)
-		or when no one cares (no view on watch) do not create fsevents
-		no one is interested...
-	    */
-
-	    if (! watch || directory_is_viewed(watch)==0 || ) *createfsevent=0;
-
-	}
-
 	while((de=readdir(dp))) {
 
 	    name=de->d_name;
@@ -135,8 +136,6 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 	    /* read the stat */
 
 	    res=lstat(tmppath, &st);
-
-	    /* huh?? */
 
 	    if ( res==-1 ) {
 
@@ -178,6 +177,12 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 			attr=get_attr(inode->attr);
 			attrcreated=0;
+
+			if (createfsevent==1) {
+			    struct fseventmask_struct fseventmask
+
+
+			    
 
 			copy_stat(&attr->cached_st, &st);
 			copy_stat_times(&attr->cached_st, &st);
@@ -266,7 +271,7 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 
 }
 
-unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char *createfsevent)
+unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char createfsevent)
 {
     struct notifyfs_entry_struct *entry, *next_entry;
     struct notifyfs_inode_struct *inode, *parent_inode;
@@ -277,19 +282,6 @@ unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct tim
     logoutput("remove_old_entries");
 
     parent_inode=get_inode(parent->inode);
-
-    if (*createfsevent==1) {
-	struct watch_struct *watch=lookup_watch_inode(parent_inode);
-
-	/*
-	    when directory is not watched, or there is a watch, 
-	    but no one cares (no view on watch) do not create fsevents 
-	    no one is interested...
-	*/
-
-	if (! watch || directory_is_viewed(watch)==0) *createfsevent=0;
-
-    }
 
     entry=get_next_entry(parent, NULL);
 
@@ -319,7 +311,7 @@ unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct tim
 	    if (*createfsevent==0) {
 		struct watch_struct *watch=lookup_watch_inode(inode);
 
-		if (watch) dofsevent=1;
+		if (watch && directory_is_viewed(watch)==1) dofsevent=1;
 
 	    } else {
 
@@ -364,7 +356,7 @@ unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct tim
 
 }
 
-unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time)
+unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *parent, struct timespec *sync_time, unsigned char createfsevent)
 {
     struct notifyfs_entry_struct *entry, *next_entry;
     struct notifyfs_inode_struct *inode, *parent_inode;
@@ -408,10 +400,33 @@ unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *par
 
 		next_entry=get_next_entry(parent, entry);
 
+		if (createfsevent==1) {
+		    struct notifyfs_fsevent_struct *fsevent=NULL;
+
+		    /* here create an fsevent */
+
+		    fsevent=create_fsevent(entry);
+
+		    if (fsevent) {
+
+			/*
+			    it unknown here how this entry is removed, so use the fsevent_cache_removed
+
+			    (TODO: add the path here??)
+
+			*/
+
+			fsevent->fseventmask.cache_event=NOTIFYFS_FSEVENT_CACHE_REMOVED;
+			queue_fsevent(fsevent);
+
+		    }
+
+		}
+
 		remove_entry_from_name_hash(entry);
 		remove_entry(entry);
 
-		/* TODO: here send messages .... */
+		entry=next_entry;
 
 	    }
 
