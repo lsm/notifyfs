@@ -111,8 +111,6 @@ void close_watches_backend()
 
 #endif
 
-struct watch_struct *first_watch;
-struct watch_struct *last_watch;
 struct watch_struct *watch_table[WATCHES_TABLESIZE];
 
 unsigned long watchctr = 1;
@@ -245,8 +243,6 @@ void remove_watch_from_list(struct watch_struct *watch)
 }
 
 
-
-
 static void add_clientwatch_owner(struct notifyfs_owner_struct *notifyfs_owner, struct clientwatch_struct *clientwatch)
 {
 
@@ -281,6 +277,85 @@ static void add_clientwatch_owner(struct notifyfs_owner_struct *notifyfs_owner, 
     }
 
 }
+
+int sync_directory(struct notifyfs_inode_struct *inode, struct timespec *current_time, struct stat *st, 
+{
+    struct notifyfs_attr_struct *attr;
+    int res=0;
+
+    attr=get_attr(inode->attr);
+    if (! attr) attr=assign_attr(st, inode);
+
+    /*
+	check the directory needs a full sync or a simple one
+	this depends of course
+    */
+
+    if (attr->mtim.tv_sec<st->st_mtim.tv_sec || (attr->mtim.tv_sec==st->st_mtim.tv_sec && attr->mtim.tv_nsec<st->st_mtim.tv_nsec) ) {
+
+	res=sync_directory_full(command_setwatch->pathinfo.path, entry, &current_time, 1);
+
+	if (res>=0) {
+	    unsigned int count=0;
+
+		    logoutput("process_command_setwatch: remove old entries");
+
+		    count=remove_old_entries(entry, &current_time, 1);
+		    update_directory_count(watch, count);
+
+		} else {
+
+		    /* */
+
+		    logoutput("process_command_view: error %i sync directory %s", res, command_setwatch->pathinfo.path);
+
+		}
+
+	    } else {
+		unsigned int count=0;
+
+		logoutput("process_command_setwatch: simple synchronize");
+
+		count=sync_directory_simple(command_setwatch->pathinfo.path, entry, &current_time, 1);
+		update_directory_count(watch, count);
+
+	    }
+
+
+/*
+    polling functions
+*/
+
+
+
+int set_watch_polling(struct watch_struct *watch)
+{
+    int res;
+    struct timerspec expiretime;
+    struct timerentry_struct *timerentry=NULL;
+
+    /* here:
+    - create a timer with a certain expire time
+    - what command to run??
+    - this command should "reset" the timer
+    */
+
+    get_current_time(&expiretime);
+
+    expiretime.tv_sec+=5; /* to be configured */
+
+    if (watch->mode & NOTIFYFS_WATCHMODE_OSSPECIFIC) watch->mode-=NOTIFYFS_WATCHMODE_OSSPECIFIC;
+    watch->mode|=NOTIFYFS_WATCHMODE_POLLING;
+
+    timerentry=create_timerentry(&expiretime);
+
+    if (timerentry) {
+
+	
+
+
+
+
 
 struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, struct fseventmask_struct *fseventmask, int id, struct notifyfs_owner_struct *notifyfs_owner, struct pathinfo_struct *pathinfo, struct timespec *update_time, unsigned char onsystemfs)
 {
@@ -327,6 +402,7 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
 	if (watch) {
 
 	    watch->ctr=0;
+	    watch->mode=0;
 	    watch->inode=inode;
 
 	    /* take over the path only if allocated and not inuse */
@@ -510,6 +586,10 @@ struct clientwatch_struct *add_clientwatch(struct notifyfs_inode_struct *inode, 
 		goto unlock;
 
 	    }
+
+	} else {
+
+	    res=set_watch_polling(watch);
 
 	}
 

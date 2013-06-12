@@ -79,6 +79,7 @@ void remove_entry(struct notifyfs_entry_struct *entry);
 
 void assign_inode(struct notifyfs_entry_struct *entry);
 
+void cache_stat_notifyfs(struct notifyfs_attr_struct *attr, struct stat *st);
 struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_struct *inode);
 void remove_attr(struct notifyfs_attr_struct *attr);
 

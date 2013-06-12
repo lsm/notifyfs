@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -242,10 +242,6 @@ struct notifyfs_mount_struct *get_next_mount(int major, int minor, void **index)
     return NULL;
 
 }
-
-
-
-
 
 void lock_supermounts()
 {
@@ -559,6 +555,33 @@ void remove_entry(struct notifyfs_entry_struct *entry)
 
 }
 
+void cache_stat_notifyfs(struct notifyfs_attr_struct *attr, struct stat *st)
+{
+    attr->c_mode=st->st_mode;
+    attr->c_uid=st->st_uid;
+    attr->c_gid=st->st_gid;
+
+    if (S_ISDIR(st->st_mode)) {
+
+	attr->type.dirattr.c_nlink=st->st_nlink;
+
+    } else {
+
+	attr->type.fileattr.c_size=st->st_size;
+
+    }
+
+    attr->c_atim.tv_sec=st->st_atim.tv_sec;
+    attr->c_atim.tv_nsec=st->st_atim.tv_nsec;
+
+    attr->c_mtim.tv_sec=st->st_mtim.tv_sec;
+    attr->c_mtim.tv_nsec=st->st_mtim.tv_nsec;
+
+    attr->c_ctim.tv_sec=st->st_ctim.tv_sec;
+    attr->c_ctim.tv_nsec=st->st_ctim.tv_nsec;
+
+}
+
 int attr_hashfunction(void *data)
 {
     struct notifyfs_attr_struct *attr=(struct notifyfs_attr_struct *) data;
@@ -608,12 +631,7 @@ struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_
 
 	inode->attr=attr->index;
 
-	if (st) {
-
-	    copy_stat(&attr->cached_st, st);
-	    copy_stat_times(&attr->cached_st, st);
-
-	}
+	if (st) cache_stat_notifyfs(attr, st);
 
 	insert_in_used(&group_attr, element);
 
@@ -881,54 +899,7 @@ void copy_stat_to_notifyfs(struct stat *st, struct notifyfs_entry_struct *entry)
 	if (inode->attr>=0) {
 	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
-	    attr->cached_st.st_dev=st->st_dev;
-	    attr->cached_st.st_ino=st->st_ino;
-	    attr->cached_st.st_nlink=st->st_nlink;
-	    attr->cached_st.st_mode=st->st_mode;
-	    attr->cached_st.st_uid=st->st_uid;
-	    attr->cached_st.st_gid=st->st_gid;
-	    attr->cached_st.st_rdev=st->st_rdev;
-	    attr->cached_st.st_size=st->st_size;
-	    attr->cached_st.st_blksize=st->st_blksize;
-	    attr->cached_st.st_blocks=st->st_blocks;
-	    attr->cached_st.st_atim.tv_sec=st->st_atim.tv_sec;
-	    attr->cached_st.st_atim.tv_nsec=st->st_atim.tv_nsec;
-	    attr->cached_st.st_mtim.tv_sec=st->st_mtim.tv_sec;
-	    attr->cached_st.st_mtim.tv_nsec=st->st_mtim.tv_nsec;
-	    attr->cached_st.st_ctim.tv_sec=st->st_ctim.tv_sec;
-	    attr->cached_st.st_ctim.tv_nsec=st->st_ctim.tv_nsec;
-
-	}
-
-    }
-
-}
-
-void get_stat_from_cache(struct stat *st, struct notifyfs_entry_struct *entry)
-{
-
-    if (entry->inode>=0) {
-	struct notifyfs_inode_struct *inode=get_inode(entry->inode);
-
-	if (inode->attr>=0) {
-	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
-
-	    st->st_dev=attr->cached_st.st_dev;
-	    st->st_ino=attr->cached_st.st_ino;
-	    st->st_mode=attr->cached_st.st_mode;
-	    st->st_nlink=attr->cached_st.st_nlink;
-	    st->st_uid=attr->cached_st.st_uid;
-	    st->st_gid=attr->cached_st.st_gid;
-	    st->st_rdev=attr->cached_st.st_rdev;
-	    st->st_size=attr->cached_st.st_size;
-	    st->st_blksize=attr->cached_st.st_blksize;
-	    st->st_blocks=attr->cached_st.st_blocks;
-	    st->st_atim.tv_sec=attr->cached_st.st_atim.tv_sec;
-	    st->st_atim.tv_nsec=attr->cached_st.st_atim.tv_nsec;
-	    st->st_mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-	    st->st_mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-	    st->st_ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-	    st->st_ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
+	    cache_stat_notifyfs(attr, st);
 
 	}
 
@@ -947,19 +918,35 @@ void get_stat_from_notifyfs(struct stat *st, struct notifyfs_entry_struct *entry
 
 	    st->st_dev=0;
 	    st->st_ino=inode->ino;
-	    st->st_mode=attr->cached_st.st_mode;
-	    st->st_nlink=attr->cached_st.st_nlink;
+
+	    st->st_mode=attr->c_mode;
 	    st->st_uid=attr->cached_st.st_uid;
 	    st->st_gid=attr->cached_st.st_gid;
-	    st->st_rdev=attr->cached_st.st_rdev;
-	    st->st_size=attr->cached_st.st_size;
+
+	    if (S_ISDIR(attr->c_mode)) {
+
+		st->st_nlink=attr->type.dirattr.c_nlink;
+
+	    } else {
+
+		st->st_size=attr->type.fileattr.c_size;
+
+	    }
+
+	    st->st_rdev=0;
 
 	    st->st_atim.tv_sec=attr->atim.tv_sec;
 	    st->st_atim.tv_nsec=attr->atim.tv_nsec;
+
 	    st->st_mtim.tv_sec=attr->mtim.tv_sec;
 	    st->st_mtim.tv_nsec=attr->mtim.tv_nsec;
+
 	    st->st_ctim.tv_sec=attr->ctim.tv_sec;
 	    st->st_ctim.tv_nsec=attr->ctim.tv_nsec;
+
+	    /*
+		what to do with st_blksize and st_blocks ??
+	    */
 
 	}
 

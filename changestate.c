@@ -1,6 +1,6 @@
 /*
 
-  2010, 2011, 2012 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -155,58 +155,64 @@ void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
 }
 
-unsigned char compare_attributes(struct stat *cached_st, struct stat *st, struct fseventmask_struct *fseventmask)
+unsigned char compare_attributes(struct notifyfs_attr_struct *attr, struct stat *st, struct fseventmask_struct *fseventmask)
 {
     unsigned char changed=0;
 
     /* compare mode, owner and group */
 
-    if (cached_st->st_mode!=st->st_mode) {
+    if (attr->c_mode!=st->st_mode) {
 
 	fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_MODE;
-	cached_st->st_mode=st->st_mode;
+	attr->c_mode=st->st_mode;
 
 	changed=1;
 
     }
 
-    if (cached_st->st_uid!=st->st_uid) {
+    if (attr->c_uid!=st->st_uid) {
 
 	fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_OWNER;
-	cached_st->st_uid=st->st_uid;
+	attr->c_uid=st->st_uid;
 
 	changed=1;
 
     }
 
-    if (cached_st->st_gid!=st->st_gid) {
+    if (attr->c_gid!=st->st_gid) {
 
 	fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_GROUP;
-	cached_st->st_gid=st->st_gid;
+	attr->c_gid=st->st_gid;
 
 	changed=1;
 
     }
 
-    /* nlinks belongs to group MOVE */
+    if (S_ISDIR(st->st_mode)) {
 
-    if (cached_st->st_nlink!=st->st_nlink) {
+	/* nlinks belongs to group MOVE */
 
-	fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_NLINKS;
-	cached_st->st_nlink=st->st_nlink;
+	if (attr->type.dirattr.c_nlink!=st->st_nlink) {
 
-	changed=1;
+	    fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_NLINKS;
+	    attr->type.dirattr.c_nlink=st->st_nlink;
 
-    }
+	    changed=1;
 
-    /* size belongs to group FILE */
+	}
 
-    if (cached_st->st_size!=st->st_size) {
+    } else {
 
-	fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_SIZE;
-	cached_st->st_size=st->st_size;
+	/* size belongs to group FILE */
 
-	changed=1;
+	if (attr->type.fileattr.c_size!=st->st_size) {
+
+	    fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_SIZE;
+	    attr->type.fileattr.c_size=st->st_size;
+
+	    changed=1;
+
+	}
 
     }
 
@@ -221,7 +227,7 @@ unsigned char compare_attributes(struct stat *cached_st, struct stat *st, struct
 
     /* check the mtime */
 
-    if (cached_st->st_mtim.tv_sec<st->st_mtim.tv_sec || (cached_st->st_mtim.tv_sec==st->st_mtim.tv_sec && cached_st->st_mtim.tv_nsec<st->st_mtim.tv_nsec)) {
+    if (attr->c_mtim.tv_sec<st->st_mtim.tv_sec || (attr->c_mtim.tv_sec==st->st_mtim.tv_sec && attr->c_mtim.tv_nsec<st->st_mtim.tv_nsec)) {
 
 	/*
 	    with a directory the mtime is changed when an entry is added or deleted, this change is not interesting here
@@ -229,18 +235,18 @@ unsigned char compare_attributes(struct stat *cached_st, struct stat *st, struct
 
 	*/
 
-	cached_st->st_mtim.tv_sec=st->st_mtim.tv_sec;
-	cached_st->st_mtim.tv_nsec=st->st_mtim.tv_nsec;
+	attr->c_mtim.tv_sec=st->st_mtim.tv_sec;
+	attr->c_mtim.tv_nsec=st->st_mtim.tv_nsec;
 
     }
 
-    /* check the ctime */
+    /* check the ctime, inode information */
 
-    if (cached_st->st_ctim.tv_sec<st->st_ctim.tv_sec || (cached_st->st_ctim.tv_sec==st->st_ctim.tv_sec && cached_st->st_ctim.tv_nsec<st->st_ctim.tv_nsec)) {
+    if (attr->c_ctim.tv_sec<st->st_ctim.tv_sec || (attr->c_ctim.tv_sec==st->st_ctim.tv_sec && attr->c_ctim.tv_nsec<st->st_ctim.tv_nsec)) {
 
 	/* check for the xattr */
 
-	if (fseventmask->attrib_event==0) {
+	if (fseventmask->attrib_event==0 && ! (fseventmask->move_event & NOTIFYFS_FSEVENT_MOVE_NLINKS)) {
 
 	    /*
 
@@ -256,20 +262,19 @@ unsigned char compare_attributes(struct stat *cached_st, struct stat *st, struct
 
 	}
 
-	cached_st->st_ctim.tv_sec=st->st_ctim.tv_sec;
-	cached_st->st_ctim.tv_nsec=st->st_ctim.tv_nsec;
+	attr->c_ctim.tv_sec=st->st_ctim.tv_sec;
+	attr->c_ctim.tv_nsec=st->st_ctim.tv_nsec;
 
 
     }
 
     /* check for utilities like touch, which change only the timestamps */
-
     /* check the atime */
 
-    if (attr->cached_st.st_atim.tv_sec<st.st_atim.tv_sec || (attr->cached_st.st_atim.tv_sec==st.st_atim.tv_sec && attr->cached_st.st_atim.tv_nsec<st.st_atim.tv_nsec)) {
+    if (attr->c_atim.tv_sec<st.st_atim.tv_sec || (attr->c_atim.tv_sec==st.st_atim.tv_sec && attr->c_atim.tv_nsec<st.st_atim.tv_nsec)) {
 
-	attr->cached_st.st_atim.tv_sec=st.st_atim.tv_sec;
-	attr->cached_st.st_atim.tv_nsec=st.st_atim.tv_nsec;
+	attr->c_atim.tv_sec=st.st_atim.tv_sec;
+	attr->c_atim.tv_nsec=st.st_atim.tv_nsec;
 
     }
 
@@ -894,7 +899,7 @@ static void process_changestate_fsevent_recursive(struct notifyfs_entry_struct *
 
 	if (attr) {
 
-	    if (S_ISDIR(attr->cached_st.st_mode)) {
+	    if (S_ISDIR(attr->c_mode)) {
 		char *name=NULL;
 		int lenname=0;
 		struct notifyfs_entry_struct *entry, *next_entry;
@@ -1185,7 +1190,7 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 	if (inode) {
 	    struct notifyfs_attr_struct *attr=get_attr(inode->attr);
 
-	    if (S_ISDIR(attr->cached_st.st_mode)) {
+	    if (S_ISDIR(attr->c_mode)) {
 		pathstring workpath;
 		struct simple_group_struct group_owner;
 
@@ -1246,31 +1251,22 @@ static void process_one_fsevent(struct notifyfs_fsevent_struct *fsevent)
 
 			if (attr) {
 
-			    copy_stat(&attr->cached_st, &st);
-			    copy_stat_times(&attr->cached_st, &st);
+			    attr->ctim.tv_sec=attr->c_ctim.tv_sec;
+			    attr->ctim.tv_nsec=attr->c_ctim.tv_nsec;
 
-			    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-			    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-			    if ( S_ISDIR(st.st_mode)) {
-
-				/* directory no access yet */
-
-				attr->mtim.tv_sec=0;
-				attr->mtim.tv_nsec=0;
-
-			    } else {
-
-				attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-				attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-			    }
+			    /* here : */
 
 			}
 
 		    } else {
 
-			/* what to do here: a fsevent indicating a change, a create, but not a delete, but stat gives an error */
+			/*
+			    what to do here: a fsevent indicating a change or a create, 
+			    but not a delete, but stat gives an error
+			    note this is possible with filesystems with backends like fuse and/or
+			    network, where the backend does not export files
+			    example: a samba server ignoring dot files.
+			*/
 
 			logoutput("process_one_fsevent: new/changed, but stat gives error %i", errno);
 
@@ -1979,7 +1975,6 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
     }
 
     if (entry->inode<0) assign_inode(entry);
-
     inode=get_inode(entry->inode);
 
     if (inode) {
@@ -1991,22 +1986,8 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 
 	    if (attr) {
 
-		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		if ( S_ISDIR(st.st_mode)) {
-
-		    /* directory no access yet */
-
-		    attr->mtim.tv_sec=0;
-		    attr->mtim.tv_nsec=0;
-
-		} else {
-
-		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-		}
+		attr->ctim.tv_sec=attr->c_ctim.tv_sec;
+		attr->ctim.tv_nsec=attr->c_ctim.tv_nsec;
 
 	    } else {
 
@@ -2055,51 +2036,46 @@ struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *wat
 	    fseventmask->move_event=0;
 	    fseventmask->fs_event=0;
 
-	    if (st.st_mode != attr->cached_st.st_mode) {
+	    if (st.st_mode != attr->c_mode) {
 
 		fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_MODE;
-		attr->cached_st.st_mode=st.st_mode;
+		attr->c_mode=st.st_mode;
 
 	    }
 
-	    if (st.st_uid != attr->cached_st.st_uid) {
+	    if (st.st_uid != attr->c_uid) {
 
 		fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_OWNER;
-		attr->cached_st.st_uid=st.st_uid;
+		attr->c_uid=st.st_uid;
 
 	    }
 
-	    if (st.st_gid != attr->cached_st.st_gid) {
+	    if (st.st_gid != attr->c_gid) {
 
 		fseventmask->attrib_event|=NOTIFYFS_FSEVENT_ATTRIB_GROUP;
-		attr->cached_st.st_gid=st.st_gid;
+		attr->c_gid=st.st_gid;
 
 	    }
 
-	    if (st.st_nlink != attr->cached_st.st_nlink) {
+	    if (S_ISDIR(st.st_mode)) {
 
-		fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_NLINKS;
-		attr->cached_st.st_nlink=st.st_nlink;
+		if (st.st_nlink != attr->type.dirattr.c_nlink) {
+
+		    fseventmask->move_event|=NOTIFYFS_FSEVENT_MOVE_NLINKS;
+		    attr->type.dirattr.c_nlink=st.st_nlink;
+
+		}
+
+	    } else {
+
+		if (st.st_size != attr->type.fileattr.c_size) {
+
+		    fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_SIZE;
+		    attr->type.fileattr.c_size=st.st_size;
+
+		}
 
 	    }
-
-	    if (st.st_size != attr->cached_st.st_size) {
-
-		fseventmask->file_event|=NOTIFYFS_FSEVENT_FILE_SIZE;
-		attr->cached_st.st_size=st.st_size;
-
-	    }
-
-	    /*
-
-		what to do with changes in ctime and mtime ??
-
-		attr->cached_st.st_ctime.tv_sec<st.st_ctim.tv_sec || 
-		(attr->cached_st.st_ctim.tv_sec==st.st_ctim.tv_sec && attr->cached_st.st_ctim.tv_nsec<st.st_ctim.tv_nsec) ||
-		attr->cached_st.st_mtim.tv_sec<st.st_mtim.tv_sec || 
-		(attr->cached_st.st_mtim.tv_sec==st.st_mtim.tv_sec && attr->cached_st.st_mtim.tv_nsec<st.st_mtim.tv_nsec)) {
-	    */
-
 
 	    if (fseventmask->file_event>0 || fseventmask->move_event>0 || fseventmask->xattr_event>0 || fseventmask->attrib_event>0) {
 

@@ -23,22 +23,12 @@
 #define INOTIFY_WATCH_LOOKUP_WD			1
 #define INOTIFY_WATCH_LOOKUP_WATCH		2
 
+#define NOTIFYFS_WATCHMODE_INOTIFY		4
+
 extern struct notifyfs_options_struct notifyfs_options;
 
 static int inotify_fd=0;
 static struct epoll_extended_data_struct xdata_inotify;
-
-struct inotify_watch_struct {
-	int wd;
-	struct watch_struct *watch;
-	int mask;
-	int mask_final;
-	struct inotify_watch_struct *next;
-	struct inotify_watch_struct *prev;
-};
-
-struct inotify_watch_struct *inotify_watches=NULL;
-pthread_mutex_t inotify_watches_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct INTEXTMAP {
                 const char *name;
@@ -108,101 +98,35 @@ int print_mask(unsigned int mask, char *string, size_t size)
 
 }
 
-static struct inotify_watch_struct *create_inotify_watch()
+/* lookup watch using wd */
+
+struct watch_struct *lookup_watch_inotify_wd(int wd)
 {
-    struct inotify_watch_struct *inotify_watch=NULL;
+    struct watch_struct *watch=NULL;
 
-    inotify_watch=malloc(sizeof(struct inotify_watch_struct));
+    /* lookup using the wd */
 
-    if (inotify_watch) {
+    pthread_mutex_lock(&watchctr_mutex);
 
-	inotify_watch->wd=0;
-	inotify_watch->watch=NULL;
-	inotify_watch->mask=0;
-	inotify_watch->mask_final=0;
-	inotify_watch->next=NULL;
-	inotify_watch->prev=NULL;
+    watch=watch_list;
 
-	pthread_mutex_lock(&inotify_watches_mutex);
+    while(watch) {
 
-	/* add at start */
+	if (watch->mode &(NOTIFYFS_WATCHMODE_INOTIFY | NOTIFYFS_WATCHMODE_OSSPECIFIC)) {
 
-	if(inotify_watches) inotify_watches->prev=inotify_watch;
-	inotify_watch->next=inotify_watches;
-	inotify_watches=inotify_watch;
+	    if (watch->backend.wd==wd) break;
 
-	pthread_mutex_unlock(&inotify_watches_mutex);
+	}
+
+	watch=watch->next;
 
     }
 
-    return inotify_watch;
+    pthread_mutex_unlock(&watchctr_mutex);
+
+    return watch;
 
 }
-
-static void remove_inotify_watch(struct inotify_watch_struct *inotify_watch)
-{
-
-    pthread_mutex_lock(&inotify_watches_mutex);
-
-    if (inotify_watch->next) inotify_watch->next->prev=inotify_watch->prev;
-    if (inotify_watch->prev) inotify_watch->prev->next=inotify_watch->next;
-    if (inotify_watches==inotify_watch) inotify_watches=inotify_watch->next;
-
-    pthread_mutex_unlock(&inotify_watches_mutex);
-
-    free(inotify_watch);
-
-}
-
-/* lookup inotify watch using wd */
-
-static struct inotify_watch_struct *lookup_inotify_watch_wd(int wd)
-{
-    struct inotify_watch_struct *inotify_watch=NULL;
-
-    pthread_mutex_lock(&inotify_watches_mutex);
-
-    inotify_watch=inotify_watches;
-
-    while(inotify_watch) {
-
-	if (inotify_watch->wd==wd) break;
-
-	inotify_watch=inotify_watch->next;
-
-    }
-
-    pthread_mutex_unlock(&inotify_watches_mutex);
-
-    return inotify_watch;
-
-}
-
-/* lookup inotify watch using watch */
-
-static struct inotify_watch_struct *lookup_inotify_watch_watch(struct watch_struct *watch)
-{
-    struct inotify_watch_struct *inotify_watch=NULL;
-
-    pthread_mutex_lock(&inotify_watches_mutex);
-
-    inotify_watch=inotify_watches;
-
-    while(inotify_watch) {
-
-	if (inotify_watch->watch==watch) break;
-
-	inotify_watch=inotify_watch->next;
-
-    }
-
-    pthread_mutex_unlock(&inotify_watches_mutex);
-
-    return inotify_watch;
-
-}
-
-
 
 /* translate a fsevent mask to inotify mask \
     since fsevent describes an event different and in more detail
@@ -314,25 +238,18 @@ static int translate_fseventmask_to_inotify(struct fseventmask_struct *fseventma
 }
 
 /* function which set a os specific watch on the backend on path with mask mask
-
-    NOTE:
-    20121017 notifyfs uses internally the inotify format to describe a watch and event
-    this will change since the inotify format has some shortcomings, like describing
-    the extended attributes
-    so the internal format will change, so a translation from the internal notifyfs format to inotify format
-    is required here in future
-
 */
 
 int set_watch_backend_inotify(struct watch_struct *watch)
 {
     int wd;
-    int inotify_mask, inotify_mask_final;
-    struct inotify_watch_struct *inotify_watch=NULL;
+    int inotify_mask;
     char maskstring[64];
     int nreturn=0;
 
     logoutput("set_watch_backend_inotify");
+
+    watch->mode=NOTIFYFS_WATCHMODE_OSSPECIFIC | NOTIFYFS_WATCHMODE_INOTIFY;
 
     /* first translate the fsevent mask into a inotify mask */
 
@@ -347,24 +264,6 @@ int set_watch_backend_inotify(struct watch_struct *watch)
 
     }
 
-    /* lookup the inotify watch, if it's ok then it does not exist already */
-
-    inotify_watch=lookup_inotify_watch_watch(watch);
-
-    if (inotify_watch) {
-
-	/* watch has been set before, check the mask */
-
-	if (inotify_watch->mask==inotify_mask) {
-
-	    logoutput("set_watch_backend_inotify: watch has been set before with the same mask: doing nothing");
-	    nreturn=-EEXIST;
-	    goto out;
-
-	}
-
-    }
-
     print_mask(inotify_mask, maskstring, 64);
 
     logoutput("set_watch_backend_inotify: call inotify_add_watch on path %s and mask %i/%s", watch->pathinfo.path, inotify_mask, maskstring);
@@ -373,28 +272,15 @@ int set_watch_backend_inotify(struct watch_struct *watch)
     /* add some sane flags and all events:
     */
 
-    inotify_mask_final=inotify_mask | IN_DONT_FOLLOW | IN_ALL_EVENTS;
+    inotify_mask|=IN_DONT_FOLLOW | IN_ALL_EVENTS;
 
 #ifdef IN_EXCL_UNLINK
 
-    inotify_mask_final|=IN_EXCL_UNLINK;
+    inotify_mask|=IN_EXCL_UNLINK;
 
 #endif
 
-    if (inotify_watch) {
-
-	if (inotify_watch->mask_final==inotify_mask_final) {
-
-	    /* this will be probably always be true when the watch has been set before */
-
-	    logoutput("set_watch_backend_inotify: watch has been set before with the same mask: doing nothing");
-	    goto out;
-
-	}
-
-    }
-
-    wd=inotify_add_watch(inotify_fd, watch->pathinfo.path, inotify_mask_final);
+    wd=inotify_add_watch(inotify_fd, watch->pathinfo.path, inotify_mask);
 
     if ( wd==-1 ) {
 
@@ -402,37 +288,11 @@ int set_watch_backend_inotify(struct watch_struct *watch)
 
         logoutput("set_watch_backend_inotify: setting inotify watch gives error: %i", errno);
 
-	/* safe to return ?? */
-
-	goto out;
-
-    }
-
-    /* lookup the inotify watch, if it's ok then it does not exist already */
-
-    if (! inotify_watch) {
-
-	inotify_watch=create_inotify_watch();
-
-	if (inotify_watch) {
-
-	    inotify_watch->wd=wd;
-	    inotify_watch->watch=watch;
-	    inotify_watch->mask=inotify_mask;
-
-	}
+	watch->backend.wd=nreturn
 
     } else {
 
-	inotify_watch->mask=inotify_mask;
-
-	if ( ! wd==inotify_watch->wd ) {
-
-	    /* this should not happen !! */
-
-	    logoutput("set_watch_backend_inotify: warning: inotify watch returns a different id: %i versus %i", wd, inotify_watch->wd);
-
-	}
+	watch->backend.wd=wd;
 
     }
 
@@ -455,25 +315,22 @@ int change_watch_backend_inotify(struct watch_struct *watch)
 void remove_watch_backend_inotify(struct watch_struct *watch)
 {
     int res;
-    struct inotify_watch_struct *inotify_watch=NULL;
 
     logoutput("remove_watch_backend_inotify");
 
     /* lookup the inotify watch, if it's ok then it does not exist already */
 
-    inotify_watch=lookup_inotify_watch_watch(watch);
+    if ( watch->backend.wd>=0 ) {
 
-    if ( inotify_watch ) {
-
-	res=inotify_rm_watch(inotify_fd, inotify_watch->wd);
+	res=inotify_rm_watch(inotify_fd, watch->backend.wd);
 
 	if ( res==-1 ) {
 
-    	    logoutput("remove_watch_backend_inotify: deleting inotify watch %i gives error: %i", inotify_watch->wd, errno);
+    	    logoutput("remove_watch_backend_inotify: deleting inotify watch %i gives error: %i", watch->backend.wd, errno);
 
 	} else {
 
-	    remove_inotify_watch(inotify_watch);
+	    watch->backend.wd=0;
 
 	}
 
@@ -488,7 +345,6 @@ void remove_watch_backend_inotify(struct watch_struct *watch)
 struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i_event)
 {
     int res;
-    struct inotify_watch_struct *inotify_watch=NULL;
     struct watch_struct *watch=NULL;
     struct notifyfs_entry_struct *entry=NULL;
     struct notifyfs_fsevent_struct *notifyfs_fsevent=NULL;
@@ -508,18 +364,14 @@ struct notifyfs_fsevent_struct *evaluate_fsevent_inotify(struct inotify_event *i
 
     /* first lookup the watch set by inotify */
 
-    inotify_watch=lookup_inotify_watch_wd(i_event->wd);
+    watch=lookup_watch_inotify_wd(i_event->wd);
 
-    if (! inotify_watch) {
+    if (! watch) {
 
-	logoutput("evaluate_fsevent_inotify: error: inotify watch %i not found", i_event->wd);
+	logoutput("evaluate_fsevent_inotify: error: no watch found for inotify watch descriptor %i", i_event->wd);
 	goto out;
 
     }
-
-    /* get the notifyfs watch */
-
-    watch=inotify_watch->watch;
 
     notifyfs_fsevent=malloc(sizeof(struct notifyfs_fsevent_struct));
 
@@ -988,86 +840,81 @@ void handle_data_on_inotify_fd(int fd, uint32_t events, int signo)
 {
     int nreturn=0;
     char outputstring[256];
+    int lenread=0;
+    char buff[INOTIFY_BUFF_LEN];
 
     logoutput("handle_data_on_inotify_fd");
 
-    //if ( events & EPOLLIN ) {
-        int lenread=0;
-        char buff[INOTIFY_BUFF_LEN];
+    lenread=read(fd, buff, INOTIFY_BUFF_LEN);
 
-        lenread=read(fd, buff, INOTIFY_BUFF_LEN);
+    if ( lenread<0 ) {
 
-        if ( lenread<0 ) {
+        logoutput("handle_data_on_inotify_fd: error (%i) reading inotify events (fd: %i)", errno, fd);
 
-            logoutput("handle_data_on_inotify_fd: error (%i) reading inotify events (fd: %i)", errno, fd);
+    } else {
+        int i=0, res;
+        struct inotify_event *i_event=NULL;
 
-        } else {
-            int i=0, res;
-            struct inotify_event *i_event=NULL;
+        while(i<lenread) {
 
-            while(i<lenread) {
+            i_event = (struct inotify_event *) &buff[i];
 
-                i_event = (struct inotify_event *) &buff[i];
+            /* handle overflow here */
 
-                /* handle overflow here */
+            if ( (i_event->mask & IN_Q_OVERFLOW) || i_event->wd==-1 ) {
 
-                if ( (i_event->mask & IN_Q_OVERFLOW) && i_event->wd==-1 ) {
+                /* what to do here: read again?? go back ??*/
 
-                    /* what to do here: read again?? go back ??*/
-
-                    logoutput("handle_data_on_inotify_fd: error reading inotify events: buffer overflow.");
-                    goto next;
-
-                }
-
-		if ( (i_event->mask & IN_ISDIR) && (i_event->mask & (IN_OPEN | IN_CLOSE_NOWRITE))) {
-
-		    /* explicit ignore the reading of directories */
-
-		    goto next;
-
-		}
-
-		while (i_event->mask>0) {
-		    uint32_t oldmask=i_event->mask;
-		    struct notifyfs_fsevent_struct *notifyfs_fsevent=NULL;
-
-		    /* translate the inotify event in a general notifyfs fs event */
-
-		    notifyfs_fsevent=evaluate_fsevent_inotify(i_event);
-
-		    if (! notifyfs_fsevent) {
-
-			logoutput("handle_data_on_inotify_fd: no notifyfs_fsevent... break");
-
-			break;
-
-		    } else {
-
-			/* process the event here futher: put it on a queue to be processed by a special thread */
-
-			logoutput("handle_data_on_inotify_fd: received notifyfs_fsevent");
-
-			get_current_time(&notifyfs_fsevent->detect_time);
-			queue_fsevent(notifyfs_fsevent);
-
-		    }
-
-		    /* prevent an endless loop */
-
-		    if (i_event->mask==oldmask) break;
-
-		}
-
-		next:
-
-                i += INOTIFY_EVENT_SIZE + i_event->len;
+                logoutput("handle_data_on_inotify_fd: error reading inotify events: buffer overflow.");
+                goto next;
 
             }
 
-        }
+	    if ( (i_event->mask & IN_ISDIR) && (i_event->mask & (IN_OPEN | IN_CLOSE_NOWRITE))) {
 
-    //}
+		/* explicit ignore the reading of directories */
+
+		goto next;
+
+	    }
+
+	    while (i_event->mask>0) {
+		uint32_t oldmask=i_event->mask;
+		struct notifyfs_fsevent_struct *notifyfs_fsevent=NULL;
+
+		/* translate the inotify event in a general notifyfs fs event */
+
+		notifyfs_fsevent=evaluate_fsevent_inotify(i_event);
+
+		if (! notifyfs_fsevent) {
+
+		    logoutput("handle_data_on_inotify_fd: no notifyfs_fsevent... break");
+		    break;
+
+		} else {
+
+		    /* process the event here futher: put it on a queue to be processed by a special thread */
+
+		    logoutput("handle_data_on_inotify_fd: received notifyfs_fsevent");
+
+		    get_current_time(&notifyfs_fsevent->detect_time);
+		    queue_fsevent(notifyfs_fsevent);
+
+		}
+
+		/* prevent an endless loop */
+
+		if (i_event->mask==oldmask) break;
+
+	    }
+
+	    next:
+
+            i += INOTIFY_EVENT_SIZE + i_event->len;
+
+    	}
+
+    }
 
 }
 

@@ -179,13 +179,33 @@ int sync_directory_full(char *path, struct notifyfs_entry_struct *parent, struct
 			attrcreated=0;
 
 			if (createfsevent==1) {
-			    struct fseventmask_struct fseventmask
+			    struct fseventmask_struct fseventmask;
 
+			    if (compare_attributes(&&attr->cached_st, &st, &fseventmask)==1) {
+				struct notifyfs_fsevent_struct *fsevent=NULL;
 
-			    
+				fsevent=create_fsevent(entry);
 
-			copy_stat(&attr->cached_st, &st);
-			copy_stat_times(&attr->cached_st, &st);
+				if (fsevent) {
+
+				    replace_fseventmask(&fsevent->fseventmask, &fseventmask);
+
+				    /*
+					here also create the path (it's known here) ??
+				    */
+
+				    queue_fsevent(fsevent);
+
+				}
+
+			    }
+
+			} else {
+
+			    copy_stat(&attr->cached_st, &st);
+			    copy_stat_times(&attr->cached_st, &st);
+
+			}
 
 		    } else {
 
@@ -333,6 +353,9 @@ unsigned int remove_old_entries(struct notifyfs_entry_struct *parent, struct tim
 		    */
 
 		    fsevent->fseventmask.cache_event=NOTIFYFS_FSEVENT_CACHE_REMOVED;
+
+		    /* also create here the path?? */
+
 		    queue_fsevent(fsevent);
 
 		}
@@ -453,10 +476,34 @@ unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *par
 
 	    } else {
 
-		copy_stat(&attr->cached_st, &st);
-		copy_stat_times(&attr->cached_st, &st);
+		if (createfsevent==1) {
+		    struct fseventmask_struct fseventmask;
 
-		/* TODO: here compare the mtim and ctim to get an event */
+		    if (compare_attributes(&&attr->cached_st, &st, &fseventmask)==1) {
+			struct notifyfs_fsevent_struct *fsevent=NULL;
+
+			fsevent=create_fsevent(entry);
+
+			if (fsevent) {
+
+			    replace_fseventmask(&fsevent->fseventmask, &fseventmask);
+
+			    /*
+				here also create the path (it's known here) ??
+			    */
+
+			    queue_fsevent(fsevent);
+
+			}
+
+		    }
+
+		} else {
+
+		    copy_stat(&attr->cached_st, &st);
+		    copy_stat_times(&attr->cached_st, &st);
+
+		}
 
 		attr->atim.tv_sec=sync_time->tv_sec;
 		attr->atim.tv_nsec=sync_time->tv_nsec;
@@ -475,3 +522,53 @@ unsigned int sync_directory_simple(char *path, struct notifyfs_entry_struct *par
 
 }
 
+int sync_directory(char *path, struct notifyfs_inode_struct *inode, struct timespec *current_time, struct stat *st, unsigned char createfsevent)
+{
+    struct notifyfs_attr_struct *attr;
+    int res=0;
+
+    attr=get_attr(inode->attr);
+    if (! attr) attr=assign_attr(st, inode);
+
+    if (attr) {
+
+	/*
+	    check the directory needs a full sync or a simple one
+	    change this: get the directory tree and get the change time...
+
+	*/
+
+	if (attr->mtim.tv_sec<st->st_mtim.tv_sec || (attr->mtim.tv_sec==st->st_mtim.tv_sec && attr->mtim.tv_nsec<st->st_mtim.tv_nsec) ) {
+	    struct notifyfs_entry_struct *entry=get_entry(inode->alias);
+
+	    res=sync_directory_full(path, entry, &current_time, 1);
+
+	    if (res>=0) {
+		unsigned int count=0;
+
+		count=remove_old_entries(entry, &current_time, 1);
+		update_directory_count(watch, count);
+
+	    } else {
+
+		logoutput("process_command_view: error %i sync directory %s", res, command_setwatch->pathinfo.path);
+
+	    }
+
+	} else {
+	    unsigned int count=0;
+
+	    count=sync_directory_simple(command_setwatch->pathinfo.path, entry, &current_time, 1);
+	    update_directory_count(watch, count);
+
+	}
+
+    } else {
+
+	res=-ENOMEM;
+
+    }
+
+    return res;
+
+}

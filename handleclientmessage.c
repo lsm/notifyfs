@@ -468,6 +468,8 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 
     logoutput("process_command_update: process path %s", command_update->pathinfo.path);
 
+    st.st_mode=0;
+
     if (clientcommand->owner.type==NOTIFYFS_OWNERTYPE_CLIENT) {
 	struct client_struct *client=clientcommand->owner.owner.localclient;
 
@@ -513,7 +515,6 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
     watch=lookup_watch_inode(inode);
 
     if ( ! watch) {
-	struct timespec current_time;
 	struct notifyfs_attr_struct *attr;
 
 	/* object is not watched : so check it manually */
@@ -528,38 +529,11 @@ static void process_command_update(struct clientcommand_struct *clientcommand)
 	}
 
 	if ( attr) {
+	    struct timespec rightnow;
 
-	    if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec) ) {
-		int res;
-		struct timespec rightnow;
-		unsigned char createfsevent=1;
+	    get_current_time(&rightnow);
 
-		get_current_time(&rightnow);
-
-		/* when contents is changed (mtime is newer than the latest access) sync it */
-
-		res=sync_directory_full(command_update->pathinfo.path, parent, &rightnow, &createfsevent);
-
-		if (res>=0) {
-
-		    remove_old_entries(parent, &rightnow, &createfsevent);
-
-		} else {
-
-		    /* some error syncing the directory... what to do with the error
-		    */
-
-		    logoutput("process_command_update: error %i sync directory %s", res, command_update->pathinfo.path);
-
-		}
-
-	    } else {
-		struct timespec rightnow;
-
-		get_current_time(&rightnow);
-		sync_directory_simple(command_update->pathinfo.path, parent, &rightnow);
-
-	    }
+	    res=sync_directory(command_update->pathinfo.path, inode, &rightnow, &st, 1);
 
 	}
 
@@ -794,66 +768,19 @@ static void process_command_setwatch(struct clientcommand_struct *clientcommand)
 
 	}
 
-	logoutput("process_command_setwatch: synchronize directory");
-
 	if (watch->create_time.tv_sec==current_time.tv_sec && watch->create_time.tv_nsec==current_time.tv_nsec) {
 	    struct notifyfs_attr_struct *attr;
 
-	    /* just created... */
+	    /* watch is just created: synchronize the directory */
 
 	    attr=get_attr(inode->attr);
-
 	    if (! attr) attr=assign_attr(&st, inode);
 
-	    /* check the directory needs a full sync or a simple one */
+	    if ( attr) {
 
-	    if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec) ) {
-		unsigned char createfsevent=1;
-		int res;
-
-		/*
-		    when contents is changed (mtime is newer than the latest access) sync it 
-		    note that when there is created a view 
-
-		*/
-
-		logoutput("process_command_setwatch: full synchronize");
-
-		res=sync_directory_full(command_setwatch->pathinfo.path, entry, &current_time, &createfsevent);
-
-		if (res>=0) {
-		    unsigned int count=0;
-
-		    logoutput("process_command_setwatch: remove old entries");
-
-		    count=remove_old_entries(entry, &current_time, &createfsevent);
-		    update_directory_count(watch, count);
-
-		} else {
-
-		    /* */
-
-		    logoutput("process_command_view: error %i sync directory %s", res, command_setwatch->pathinfo.path);
-
-		}
-
-	    } else {
-		unsigned int count=0;
-
-		logoutput("process_command_setwatch: simple synchronize");
-
-		count=sync_directory_simple(command_setwatch->pathinfo.path, entry, &current_time);
-		update_directory_count(watch, count);
+		res=sync_directory(command_setwatch->pathinfo.path, inode, &current_time, &st, 1);
 
 	    }
-
-	} else {
-	    unsigned int count=0;
-
-	    logoutput("process_command_setwatch: simple synchronize");
-
-	    count=sync_directory_simple(command_setwatch->pathinfo.path, entry, &current_time);
-	    update_directory_count(watch, count);
 
 	}
 
@@ -1172,39 +1099,11 @@ static void process_command_view(struct clientcommand_struct *clientcommand)
 	    }
 
 	    if (attr) {
+		struct timespec rightnow;
 
-		/* check the directory needs a full sync or a simple one */
+		get_current_time(&rightnow);
 
-		if (attr->mtim.tv_sec<st.st_mtim.tv_sec || (attr->mtim.tv_sec==st.st_mtim.tv_sec && attr->mtim.tv_nsec<st.st_mtim.tv_nsec) ) {
-		    struct timespec rightnow;
-		    unsigned char createfsevent=1;
-
-		    get_current_time(&rightnow);
-
-		    /* when contents is changed (mtime is newer than the latest access) sync it */
-
-		    res=sync_directory_full(pathinfo.path, entry, &rightnow, &createfsevent);
-
-		    if (res>=0) {
-
-			remove_old_entries(entry, &rightnow, &createfsevent);
-
-		    } else {
-
-			/* */
-
-			logoutput("process_command_view: error %i sync directory %s", res, pathinfo.path);
-
-		    }
-
-		} else {
-		    struct timespec rightnow;
-
-		    get_current_time(&rightnow);
-
-		    sync_directory_simple(pathinfo.path, entry, &rightnow);
-
-		}
+		res=sync_directory(pathinfo.path, inode, &rightnow, &st, 1);
 
 	    }
 

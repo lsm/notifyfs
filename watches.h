@@ -20,6 +20,9 @@
 #ifndef NOTIFYFS_WATCHES_H
 #define NOTIFYFS_WATCHES_H
 
+#define NOTIFYFS_WATCHMODE_POLLING		1
+#define NOTIFYFS_WATCHMODE_OSSPECIFIC		2
+
 /*
     create a structure to distinguish the different watch masks
 
@@ -45,7 +48,7 @@
 */
 
 struct watch_struct {
-    unsigned char type;
+    unsigned char mode;
     unsigned long ctr;
     struct notifyfs_inode_struct *inode;
     struct pathinfo_struct pathinfo;
@@ -60,6 +63,10 @@ struct watch_struct {
     struct watch_struct *prev_hash;
     struct watch_struct *next;
     struct watch_struct *prev;
+    union {
+	void *data;
+	int wd;
+    } backend;
 };
 
 struct clientwatch_struct {
