@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -174,47 +174,20 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 	    if (inode->attr>=0) {
 
 		attr=get_attr(inode->attr);
-		copy_stat(&attr->cached_st, &(e.attr));
-		copy_stat_times(&attr->cached_st, &(e.attr));
 
-		/* here compare the attr->mtim/ctim with e.attr.mtim/ctim 
-		    and if necessary create an fsevent */
+		cache_stat_notifyfs(attr, &(e.attr));
 
-		if (attr->ctim.tv_sec<attr->cached_st.st_ctim.tv_sec || (attr->ctim.tv_sec==attr->cached_st.st_ctim.tv_sec && attr->ctim.tv_nsec<attr->cached_st.st_ctim.tv_nsec)) {
-
-		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		    logoutput("notifyfs_lookup: difference in ctim");
-
-		}
-
-		if (attr->mtim.tv_sec<attr->cached_st.st_mtim.tv_sec || (attr->mtim.tv_sec==attr->cached_st.st_mtim.tv_sec && attr->mtim.tv_nsec<attr->cached_st.st_mtim.tv_nsec)) {
-
-		    logoutput("notifyfs_lookup: difference in mtim");
-
-		}
 
 	    } else {
 
 		attr=assign_attr(&(e.attr), inode);
 
-		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
+		if (attr) {
 
-		if ( S_ISDIR(e.attr.st_mode)) {
+		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
+		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
 
-		    /* directory no access yet */
-
-		    attr->mtim.tv_sec=0;
-		    attr->mtim.tv_nsec=0;
-
-		} else {
-
-		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-		}
+		]
 
 	    }
 

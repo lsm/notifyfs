@@ -41,7 +41,7 @@ struct notifyfs_fsevent_struct *create_fsevent(struct notifyfs_entry_struct *ent
 void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
 void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
 
-unsigned char compare_attributes(struct stat *cached_st, struct stat *st, struct fseventmask_struct *fseventmask);
+unsigned char compare_attributes(struct notifyfs_attr_struct *attr, struct stat *st, struct fseventmask_struct *fseventmask);
 
 void init_changestate(struct workerthreads_queue_struct *workerthreads_queue);
 struct notifyfs_fsevent_struct *evaluate_remote_fsevent(struct watch_struct *watch, struct fseventmask_struct *fseventmask, char *name);
