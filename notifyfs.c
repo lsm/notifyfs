@@ -94,6 +94,16 @@
 #include "watches.h"
 #include "changestate.h"
 
+#define NOTIFYFS_FUSE_DEV		0
+#define NOTIFYFS_FUSE_BLKSIZE		512
+#define NOTIFYFS_FUSE_BLOCKS		0
+
+#define NOTIFYFS_FUSE_ATTRTIMEOUT	1.0
+#define NOTIFYFS_FUSE_ENTRYTIMEOUT	1.0
+#define NOTIFYFS_FUSE_NEGTIMEOUT	1.0
+
+
+
 struct notifyfs_options_struct notifyfs_options;
 
 struct fuse_chan *notifyfs_chan;
@@ -116,6 +126,8 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
     struct pathinfo_struct pathinfo={NULL, 0, 0};
     struct stat st;
+    struct fseventmask_struct fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
+    unsigned char change=0;
 
     logoutput("LOOKUP, name: %s", name);
 
@@ -175,39 +187,27 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
 		attr=get_attr(inode->attr);
 
-		cache_stat_notifyfs(attr, &(e.attr));
-
+		change|=compare_attributes(attr, &(e.attr), &fseventmask);
 
 	    } else {
 
 		attr=assign_attr(&(e.attr), inode);
 
-		if (attr) {
-
-		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		]
-
 	    }
 
 	    /* other fs values */
 
-	    e.attr.st_dev=0;
-	    e.attr.st_blksize=512;
-	    e.attr.st_blocks=0;
+	    e.attr.st_dev=NOTIFYFS_FUSE_DEV;
+	    e.attr.st_blksize=NOTIFYFS_FUSE_BLKSIZE;
+	    e.attr.st_blocks=NOTIFYFS_FUSE_BLOCKS;
 
 	} else {
 
-	    logoutput("notifyfs_lookup: stat on %s gives error %i", pathinfo.path, errno);
+	    nreturn=-errno;
 
 	}
 
     } else {
-
-	/* get the stat from the cache */
-
-        /* no stat: here copy the stat from inode */
 
 	get_stat_from_notifyfs(&(e.attr), entry);
         nreturn=0;
@@ -218,14 +218,17 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     if ( nreturn==-ENOENT) {
 
-	logoutput("lookup: entry does not exist (ENOENT)");
+	logoutput("notifyfs_lookup: entry does not exist (ENOENT)");
 
 	e.ino=0;
-	e.entry_timeout=notifyfs_options.negative_timeout;
+	e.entry_timeout=NOTIFYFS_FUSE_NEGTIMEOUT;
+
+	fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+	change|=1;
 
     } else if ( nreturn<0 ) {
 
-	logoutput("do_lookup: error (%i)", nreturn);
+	logoutput("notifyfs_lookup: error (%i)", nreturn);
 
     } else {
 
@@ -235,14 +238,10 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 	e.ino = inode->ino;
 	e.attr.st_ino = e.ino;
 	e.generation = 0;
-	e.attr_timeout = notifyfs_options.attr_timeout;
-	e.entry_timeout = notifyfs_options.entry_timeout;
-
-	logoutput("lookup return size: %li", (long) e.attr.st_size);
+	e.attr_timeout = NOTIFYFS_FUSE_ATTRTIMEOUT;
+	e.entry_timeout = NOTIFYFS_FUSE_ENTRYTIMEOUT;
 
     }
-
-    logoutput("lookup: return %i", nreturn);
 
     if ( nreturn<0 ) {
 
@@ -256,7 +255,7 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && pathinfo.path) {
+    if (change>0) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
@@ -268,7 +267,7 @@ static void notifyfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *na
 
 	    if (fsevent) {
 
-		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
+		replace_fseventmask(&fsevent->fseventmask, &fseventmask);
 
 		if (pathinfo.path) {
 
@@ -307,7 +306,7 @@ static void notifyfs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlooku
 
     if ( inode->nlookup < nlookup ) {
 
-	logoutput("internal error: forget ino=%llu %llu from %llu", (unsigned long long) ino, (unsigned long long) nlookup, (unsigned long long) inode->nlookup);
+	logoutput("notifyfs_forget: internal error: forget ino=%llu %llu from %llu", (unsigned long long) ino, (unsigned long long) nlookup, (unsigned long long) inode->nlookup);
 	inode->nlookup=0;
 
 	/* here check the attr and entry are removed ... */
@@ -318,7 +317,7 @@ static void notifyfs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlooku
 
     }
 
-    logoutput("forget, current nlookup value %llu", (unsigned long long) inode->nlookup);
+    logoutput("notifyfs_forget, current nlookup value %llu", (unsigned long long) inode->nlookup);
 
     out:
 
@@ -335,10 +334,10 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
     struct pathinfo_struct pathinfo={NULL, 0, 0};
     struct stat st;
+    struct fseventmask_struct fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
+    unsigned char change=0;
 
     logoutput("GETATTR");
-
-    // get the inode and the entry, they have to exist
 
     inode=find_inode(ino);
 
@@ -386,12 +385,9 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     	    dostat=0;
 
-
         }
 
     }
-
-
 
     if ( dostat==1 ) {
 
@@ -399,57 +395,24 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
         nreturn=lstat(pathinfo.path, &st);
 
-        /* copy the st -> inode->st */
-
         if ( nreturn==0 ) {
 	    struct notifyfs_attr_struct *attr;
 
 	    if (inode->attr>=0) {
 
 		attr=get_attr(inode->attr);
-		copy_stat(&attr->cached_st, &st);
-		copy_stat_times(&attr->cached_st, &st);
 
-		/* here compare the attr->mtim/ctim with e.attr.mtim/ctim 
-		    and if necessary create an fsevent */
-
-		if (attr->ctim.tv_sec<attr->cached_st.st_ctim.tv_sec || (attr->ctim.tv_sec==attr->cached_st.st_ctim.tv_sec && attr->ctim.tv_nsec<attr->cached_st.st_ctim.tv_nsec)) {
-
-		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		    logoutput("notifyfs_getattr: difference in ctim");
-
-		}
-
-		if (attr->mtim.tv_sec<attr->cached_st.st_mtim.tv_sec || (attr->mtim.tv_sec==attr->cached_st.st_mtim.tv_sec && attr->mtim.tv_nsec<attr->cached_st.st_mtim.tv_nsec)) {
-
-		    logoutput("notifyfs_getattr: difference in mtim");
-
-		}
+		change|=compare_attributes(attr, &(e.attr), &fseventmask);
 
 	    } else {
 
 		attr=assign_attr(&st, inode);
 
-		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		if ( S_ISDIR(st.st_mode)) {
-
-		    /* directory no access yet */
-
-		    attr->mtim.tv_sec=0;
-		    attr->mtim.tv_nsec=0;
-
-		} else {
-
-		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-		}
-
 	    }
+
+	} else {
+
+	    nreturn=-errno;
 
 	}
 
@@ -464,7 +427,14 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     out:
 
-    logoutput("getattr, return: %i", nreturn);
+    if (nreturn==-ENOENT) {
+
+	fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+	change|=1;
+
+    }
+
+    logoutput("notifyfs_getattr, return: %i", nreturn);
 
     if (nreturn < 0) {
 
@@ -472,13 +442,13 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
     } else {
 
-	fuse_reply_attr(req, &st, notifyfs_options.attr_timeout);
+	fuse_reply_attr(req, &st, NOTIFYFS_FUSE_ATTRTIMEOUT);
 
     }
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && pathinfo.path) {
+    if (changed>0) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
@@ -487,7 +457,7 @@ static void notifyfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
 
 	    if (fsevent) {
 
-		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
+		replace_fseventmask(&fsevent->fseventmask, &fseventmask);
 
 		if (pathinfo.path) {
 
@@ -520,10 +490,10 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
     struct pathinfo_struct pathinfo={NULL, 0, 0};
     struct stat st;
+    struct fseventmask_struct fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
+    unsigned char change=0;
 
     logoutput("ACCESS, mask: %i", mask);
-
-    // get the inode and the entry, they have to exist
 
     inode=find_inode(ino);
 
@@ -553,7 +523,6 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
     nreturn=check_access_path(pathinfo.path, ctx->pid, ctx->uid, ctx->gid, &st, R_OK);
     if (nreturn<0) goto out;
 
-
     dostat=1;
 
     if (entry->mount>=0) {
@@ -566,9 +535,6 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
     	    dostat=0;
 
-    	    /* here something with times and mount times?? */
-
-
         }
 
     }
@@ -579,57 +545,24 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
         res=lstat(pathinfo.path, &st);
 
-        /* copy the st to inode->st */
-
         if (res==0) {
 	    struct notifyfs_attr_struct *attr;
 
 	    if (inode->attr>=0) {
 
 		attr=get_attr(inode->attr);
-		copy_stat(&attr->cached_st, &st);
-		copy_stat_times(&attr->cached_st, &st);
 
-		/* here compare the attr->mtim/ctim with e.attr.mtim/ctim 
-		    and if necessary create an fsevent */
-
-		if (attr->ctim.tv_sec<attr->cached_st.st_ctim.tv_sec || (attr->ctim.tv_sec==attr->cached_st.st_ctim.tv_sec && attr->ctim.tv_nsec<attr->cached_st.st_ctim.tv_nsec)) {
-
-		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		    logoutput("notifyfs_access: difference in ctim");
-
-		}
-
-		if (attr->mtim.tv_sec<attr->cached_st.st_mtim.tv_sec || (attr->mtim.tv_sec==attr->cached_st.st_mtim.tv_sec && attr->mtim.tv_nsec<attr->cached_st.st_mtim.tv_nsec)) {
-
-		    logoutput("notifyfs_access: difference in mtim");
-
-		}
+		change|=compare_attributes(attr, &(e.attr), &fseventmask);
 
 	    } else {
 
 		attr=assign_attr(&st, inode);
 
-		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		if ( S_ISDIR(st.st_mode)) {
-
-		    /* directory no access yet */
-
-		    attr->mtim.tv_sec=0;
-		    attr->mtim.tv_nsec=0;
-
-		} else {
-
-		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-		}
-
 	    }
+
+	} else {
+
+	    nreturn=-errno;
 
 	}
 
@@ -642,25 +575,11 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
     if ( mask == F_OK ) {
 
-        // check for existence
-
-        if ( res == -1 ) {
-
-            nreturn=-ENOENT;
-
-        } else {
-
-            nreturn=1;
-
-        }
+        if ( res == 0 ) nreturn=1;
 
     } else {
 
-        if ( res == -1 ) {
-
-            nreturn=-ENOENT;
-
-        } else {
+        if ( res==0 ) {
 	    struct gidlist_struct gidlist={0, 0, NULL};
 
 	    res=check_access_process(ctx->pid, ctx->uid, ctx->gid, &st, mask, &gidlist);
@@ -692,22 +611,27 @@ static void notifyfs_access(fuse_req_t req, fuse_ino_t ino, int mask)
 
     out:
 
-    logoutput("access, return: %i", nreturn);
+    if (nreturn==-ENOENT) {
+
+	fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+	change|=1;
+
+    }
+
+    logoutput("notifyfs_access, return: %i", nreturn);
 
     fuse_reply_err(req, abs(nreturn));
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && pathinfo.path ) {
-
-        /* entry in this fs exists but underlying entry not anymore */
+    if (change>0) {
 
         if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
-		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
+		replace_fseventmask(&fsevent->fseventmask, &fseventmask);
 
 		if (pathinfo.path) {
 
@@ -762,7 +686,7 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 		nreturn=-ENOMEM; /* not able to create due to memory problems */
 		goto error;
 
-	    } 
+	    }
 
 	} else { 
 
@@ -803,27 +727,19 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 	    nreturn=-EACCES;
 	    goto error;
 
-    	    /* here something with times and mount times?? */
-
 	}
 
     }
 
     /* only create directory here when it does exist in the underlying fs */
 
-    nreturn=lstat(pathinfo.path, &(e.attr));
+    if (lstat(pathinfo.path, &(e.attr))==-1 ) {
 
-    if ( nreturn==-1 ) {
-
-        /* TODO additional action */
-
-        nreturn=-EACCES; /* does not exist: not permitted */
+        nreturn=-EACCES;
 
     } else {
 
         if ( ! S_ISDIR(e.attr.st_mode) ) {
-
-            /* TODO additional action */
 
             nreturn=-ENOTDIR; /* not a directory */ 
 
@@ -851,24 +767,16 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
 	attr=assign_attr(&(e.attr), inode);
 
-	attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-	attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-	/* directory no access yet */
-
-	attr->mtim.tv_sec=0;
-	attr->mtim.tv_nsec=0;
-
 	inode->nlookup++;
 
 	e.ino = inode->ino;
 	e.attr.st_ino = e.ino;
-	e.attr.st_dev=0;
-	e.attr.st_blksize=512;
-	e.attr.st_blocks=0;
+	e.attr.st_dev=NOTIFYFS_FUSE_DEV;
+	e.attr.st_blksize=NOTIFYFS_FUSE_BLKSIZE;
+	e.attr.st_blocks=NOTIFYFS_FUSE_BLOCKS;
 	e.generation = 0;
-	e.attr_timeout = notifyfs_options.attr_timeout;
-	e.entry_timeout = notifyfs_options.entry_timeout;
+	e.attr_timeout = NOTIFYFS_FUSE_ATTRTIMEOUT;
+	e.entry_timeout = NOTIFYFS_FUSE_ENTRYTIMEOUT;
 
         add_to_name_hash_table(entry);
 
@@ -888,7 +796,7 @@ static void notifyfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *nam
     if (entry) remove_entry(entry);
 
     e.ino = 0;
-    e.entry_timeout = notifyfs_options.negative_timeout;
+    e.entry_timeout = NOTIFYFS_FUSE_NEGTIMEOUT;
 
     fuse_reply_err(req, abs(nreturn));
 
@@ -1015,22 +923,16 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
 
 	attr=assign_attr(&(e.attr), inode);
 
-	attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-	attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-	attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-	attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
 	inode->nlookup++;
 
 	e.ino = inode->ino;
 	e.attr.st_ino = e.ino;
-	e.attr.st_dev=0;
-	e.attr.st_blksize=512;
-	e.attr.st_blocks=0;
+	e.attr.st_dev=NOTIFYFS_FUSE_DEV;
+	e.attr.st_blksize=NOTIFYFS_FUSE_BLKSIZE;
+	e.attr.st_blocks=NOTIFYFS_FUSE_BLOCKS;
 	e.generation = 0;
-	e.attr_timeout = notifyfs_options.attr_timeout;
-	e.entry_timeout = notifyfs_options.entry_timeout;
+	e.attr_timeout = NOTIFYFS_FUSE_ATTRTIMEOUT;
+	e.entry_timeout = NOTIFYFS_FUSE_ENTRYTIMEOUT;
 
         add_to_name_hash_table(entry);
 
@@ -1048,7 +950,7 @@ static void notifyfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *nam
     if (entry) remove_entry(entry);
 
     e.ino = 0;
-    e.entry_timeout = notifyfs_options.negative_timeout;
+    e.entry_timeout = NOTIFYFS_FUSE_NEGTIMEOUT;
 
     fuse_reply_err(req, abs(nreturn));
 
@@ -1358,9 +1260,9 @@ static void notifyfs_statfs(fuse_req_t req, fuse_ino_t ino)
 	/* note the fs does not provide opening/reading/writing of files, so info about blocksize etc
 	   is useless, so do not override the default from the root */ 
 
-	st.f_bsize=512;
+	st.f_bsize=NOTIFYFS_FUSE_BLKSIZE;
 	st.f_frsize=st.f_bsize; /* no fragmentation on this fs */
-	st.f_blocks=0;
+	st.f_blocks=NOTIFYFS_FUSE_BLOCKS;
 	st.f_bfree=0;
 	st.f_bavail=0;
 
@@ -1406,6 +1308,8 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     unsigned dostat;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
     struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct fseventmask_struct fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
+    unsigned char change=0;
 
     logoutput("SETXATTR");
 
@@ -1460,8 +1364,6 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     	    dostat=0;
 
-    	    /* here something with times and mount times?? */
-
 	}
 
     }
@@ -1479,55 +1381,18 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 	    if (inode->attr>=0) {
 
 		attr=get_attr(inode->attr);
-		copy_stat(&attr->cached_st, &st);
-		copy_stat_times(&attr->cached_st, &st);
 
-		/* here compare the attr->mtim/ctim with e.attr.mtim/ctim 
-		    and if necessary create an fsevent */
-
-		if (attr->ctim.tv_sec<attr->cached_st.st_ctim.tv_sec || (attr->ctim.tv_sec==attr->cached_st.st_ctim.tv_sec && attr->ctim.tv_nsec<attr->cached_st.st_ctim.tv_nsec)) {
-
-		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		    logoutput("notifyfs_setxattr: difference in ctim");
-
-		}
-
-		if (attr->mtim.tv_sec<attr->cached_st.st_mtim.tv_sec || (attr->mtim.tv_sec==attr->cached_st.st_mtim.tv_sec && attr->mtim.tv_nsec<attr->cached_st.st_mtim.tv_nsec)) {
-
-		    logoutput("notifyfs_setxattr: difference in mtim");
-
-		}
+		change|=compare_attributes(attr, &(e.attr), &fseventmask);
 
 	    } else {
 
 		attr=assign_attr(&st, inode);
 
-		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		if ( S_ISDIR(st.st_mode)) {
-
-		    /* directory no access yet */
-
-		    attr->mtim.tv_sec=0;
-		    attr->mtim.tv_nsec=0;
-
-		} else {
-
-		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-		}
-
 	    }
 
 	} else {
 
-	    logoutput("notifyfs_setxattr: error %i stat %s", errno, pathinfo.path);
-
-	    /* here some action */
+	    nreturn=-errno;
 
 	}
 
@@ -1539,15 +1404,8 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     }
 
-    if (res==-1) {
 
-        /* entry does not exist.... */
-        /* additional action here: sync fs */
-
-        nreturn=-ENOENT;
-        goto out;
-
-    } else {
+    if (nreturn==0) {
 	struct gidlist_struct gidlist={0, 0, NULL};
 
     	/* check read access : sufficient to create a directory in this fs ... 
@@ -1578,9 +1436,11 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
 	}
 
-    }
+    } else {
 
-    // make this global....
+	goto out;
+
+    }
 
     basexattr=malloc(strlen("system.") + strlen(XATTR_SYSTEM_NAME) + 3); /* plus _ and terminator */
 
@@ -1611,6 +1471,13 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
 	fuse_reply_err(req, -nreturn);
 
+	if (nreturn==-ENOENT) {
+
+	    fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+	    change|=1;
+
+	}
+
     } else {
 
 	fuse_reply_err(req, 0);
@@ -1623,16 +1490,14 @@ static void notifyfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && pathinfo.path) {
-
-        /* entry in this fs exists but underlying entry not anymore */
+    if (change>0) {
 
         if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
-		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
+		replace_fseventmask(&fsevent->fseventmask, &fseventmask);
 
 		if (pathinfo.path) {
 
@@ -1669,6 +1534,8 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     unsigned char dostat;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
     struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct fseventmask_struct fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
+    unsigned char change=0;
 
     logoutput("GETXATTR, name: %s, size: %i", name, size);
 
@@ -1704,15 +1571,6 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     dostat=1;
 
-    /* if watch attached then not stat */
-
-    /* test the inode is watched */
-
-    /* if dealing with an autofs managed fs do not stat
-       but what to do when there is no cached stat??
-       caching???
-    */
-
     if ( entry->mount>=0 ) {
 	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
@@ -1722,8 +1580,6 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
             what with DFS like constructions ?? */
 
     	    dostat=0;
-
-    	    /* here something with times and mount times?? */
 
 	}
 
@@ -1744,76 +1600,29 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 	    if (inode->attr>=0) {
 
 		attr=get_attr(inode->attr);
-		copy_stat(&attr->cached_st, &st);
-		copy_stat_times(&attr->cached_st, &st);
 
-		/* here compare the attr->mtim/ctim with e.attr.mtim/ctim 
-		    and if necessary create an fsevent */
-
-		if (attr->ctim.tv_sec<attr->cached_st.st_ctim.tv_sec || (attr->ctim.tv_sec==attr->cached_st.st_ctim.tv_sec && attr->ctim.tv_nsec<attr->cached_st.st_ctim.tv_nsec)) {
-
-		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		    logoutput("notifyfs_getxattr: difference in ctim");
-
-		}
-
-		if (attr->mtim.tv_sec<attr->cached_st.st_mtim.tv_sec || (attr->mtim.tv_sec==attr->cached_st.st_mtim.tv_sec && attr->mtim.tv_nsec<attr->cached_st.st_mtim.tv_nsec)) {
-
-		    logoutput("notifyfs_getxattr: difference in mtim");
-
-		}
+		change|=compare_attributes(attr, &(e.attr), &fseventmask);
 
 	    } else {
 
 		attr=assign_attr(&st, inode);
 
-		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		if ( S_ISDIR(st.st_mode)) {
-
-		    /* directory no access yet */
-
-		    attr->mtim.tv_sec=0;
-		    attr->mtim.tv_nsec=0;
-
-		} else {
-
-		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-		}
-
 	    }
 
 	} else {
 
-	    logoutput("notifyfs_getxattr: error %i stat %s", errno, pathinfo.path);
-
-	    /* here some action */
+	    nreturn=-errno;
 
 	}
 
     } else {
 
         get_stat_from_notifyfs(&st, entry);
-
         res=0;
 
     }
 
-
-    if (res==-1) {
-
-        /* entry does not exist.... */
-        /* additional action here: sync fs */
-
-        nreturn=-ENOENT;
-        goto out;
-
-    } else {
+    if (nreturn==0) {
 	struct gidlist_struct gidlist={0, 0, NULL};
 
     	/* check read access : sufficient to create a directory in this fs ... 
@@ -1843,6 +1652,10 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 	    gidlist.list=NULL;
 
 	}
+
+    } else {
+
+	goto out;
 
     }
 
@@ -1921,6 +1734,13 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
 	fuse_reply_err(req, -nreturn);
 
+	if (nreturn==-ENOENT) {
+
+	    fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+	    change|=1;
+
+	}
+
     } else {
 
 	if ( size == 0 ) {
@@ -1956,16 +1776,14 @@ static void notifyfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && pathinfo.path ) {
-
-        /* entry in this fs exists but underlying entry not anymore */
+    if (change>0) {
 
         if (entry) {
 	    struct notifyfs_fsevent_struct *fsevent=create_fsevent(entry);
 
 	    if (fsevent) {
 
-		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
+		replace_fseventmask(&fsevent->fseventmask, &fseventmask);
 
 		if (pathinfo.path) {
 
@@ -2000,6 +1818,8 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     unsigned char dostat;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
     struct pathinfo_struct pathinfo={NULL, 0, 0};
+    struct fseventmask_struct fseventmask=NOTIFYFS_ZERO_FSEVENTMASK;
+    unsigned char change=0;
 
     logoutput("LISTXATTR, size: %li", (long) size);
 
@@ -2035,15 +1855,6 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     dostat=1;
 
-    /* if watch attached then not stat */
-
-    /* test the inode s watched */
-
-    /* if dealing with an autofs managed fs do not stat
-       but what to do when there is no cached stat??
-       caching???
-    */
-
     if (entry->mount>=0 ) {
 	struct notifyfs_mount_struct *mount=get_mount(entry->mount);
 
@@ -2053,8 +1864,6 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
             what with DFS like constructions ?? */
 
     	    dostat=0;
-
-    	    /* here something with times and mount times?? */
 
 	}
 
@@ -2074,55 +1883,16 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 	    if (inode->attr>=0) {
 
 		attr=get_attr(inode->attr);
-		copy_stat(&attr->cached_st, &st);
-		copy_stat_times(&attr->cached_st, &st);
-
-		/* here compare the attr->mtim/ctim with e.attr.mtim/ctim 
-		    and if necessary create an fsevent */
-
-		if (attr->ctim.tv_sec<attr->cached_st.st_ctim.tv_sec || (attr->ctim.tv_sec==attr->cached_st.st_ctim.tv_sec && attr->ctim.tv_nsec<attr->cached_st.st_ctim.tv_nsec)) {
-
-		    attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		    attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		    logoutput("notifyfs_setxattr: difference in ctim");
-
-		}
-
-		if (attr->mtim.tv_sec<attr->cached_st.st_mtim.tv_sec || (attr->mtim.tv_sec==attr->cached_st.st_mtim.tv_sec && attr->mtim.tv_nsec<attr->cached_st.st_mtim.tv_nsec)) {
-
-		    logoutput("notifyfs_setxattr: difference in mtim");
-
-		}
 
 	    } else {
 
 		attr=assign_attr(&st, inode);
 
-		attr->ctim.tv_sec=attr->cached_st.st_ctim.tv_sec;
-		attr->ctim.tv_nsec=attr->cached_st.st_ctim.tv_nsec;
-
-		if ( S_ISDIR(st.st_mode)) {
-
-		    /* directory no access yet */
-
-		    attr->mtim.tv_sec=0;
-		    attr->mtim.tv_nsec=0;
-
-		} else {
-
-		    attr->mtim.tv_sec=attr->cached_st.st_mtim.tv_sec;
-		    attr->mtim.tv_nsec=attr->cached_st.st_mtim.tv_nsec;
-
-		}
-
 	    }
 
 	} else {
 
-	    logoutput("notifyfs_listxattr: error %i stat %s", errno, pathinfo.path);
-
-	    /* here some action */
+	    nreturn=-errno;
 
 	}
 
@@ -2134,15 +1904,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     }
 
-    if (res==-1) {
-
-        /* entry does not exist.... */
-        /* additional action here: sync fs */
-
-        nreturn=-ENOENT;
-        goto out;
-
-    } else {
+    if (nreturn==0) {
 	struct gidlist_struct gidlist={0, 0, NULL};
 
     	/* check read access : sufficient to create a directory in this fs ... 
@@ -2173,13 +1935,15 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
 	}
 
+    } else {
+
+	goto out;
+
     }
 
     if ( nreturn==0 ) {
 
 	if ( size>0 ) {
-
-	    // just create a list with the overall size
 
 	    list=malloc(size);
 
@@ -2188,23 +1952,15 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 		nreturn=-ENOMEM;
 		goto out;
 
-	    } else {
+	    }
 
-                memset(list, '\0', size);
-
-            }
+            memset(list, '\0', size);
 
 	}
 
 	nlenlist=listxattr4workspace(entry, list, size);
 
-	if ( nlenlist<0 ) {
-
-	    // some error
-	    nreturn=nlenlist;
-	    goto out;
-
-	}
+	if ( nlenlist<0 ) nreturn=nlenlist;
 
     }
 
@@ -2230,6 +1986,13 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
 	fuse_reply_err(req, abs(nreturn));
 
+	if (nreturn==-ENOENT) {
+
+	    fseventmask.move_event|=NOTIFYFS_FSEVENT_MOVE_DELETED;
+	    change|=1;
+
+	}
+
     } else {
 
 	if ( size == 0 ) {
@@ -2248,7 +2011,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
     /* post reply action */
 
-    if ( nreturn==-ENOENT && pathinfo.path) {
+    if (change>0) {
 
         /* entry in this fs exists but underlying entry not anymore */
 
@@ -2257,7 +2020,7 @@ static void notifyfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 
 	    if (fsevent) {
 
-		fsevent->fseventmask.move_event=NOTIFYFS_FSEVENT_MOVE_DELETED;
+		replace_fseventmask(&fsevent->fseventmask, &fseventmask);
 
 		if (pathinfo.path) {
 
@@ -2667,6 +2430,8 @@ unsigned char skip_mountentry(char *source, char *fs, char *path)
 		    if (stvfs.f_bfree==0) filesystem->mode|=NOTIFYFS_FILESYSTEM_SYSTEM;
 
 		}
+
+		/* remember the stat, prevent doing the stat every next time which is useless */
 
 		filesystem->mode|=NOTIFYFS_FILESYSTEM_STAT;
 
@@ -3116,10 +2881,6 @@ int main(int argc, char *argv[])
 
     loglevel=notifyfs_options.logging;
     logarea=notifyfs_options.logarea;
-
-    notifyfs_options.attr_timeout=1.0;
-    notifyfs_options.entry_timeout=1.0;
-    notifyfs_options.negative_timeout=1.0;
 
     res = fuse_daemonize(0);
 

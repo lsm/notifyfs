@@ -39,9 +39,6 @@ struct notifyfs_options_struct {
     unsigned char ipv6;
     gid_t shm_gid;
     int networkport;
-    double attr_timeout;
-    double entry_timeout;
-    double negative_timeout;
 };
 
 // Prototypes

@@ -592,7 +592,6 @@ int attr_hashfunction(void *data)
 
 }
 
-
 struct notifyfs_attr_struct *assign_attr(struct stat *st, struct notifyfs_inode_struct *inode)
 {
     struct notifyfs_attr_struct *attr=NULL;
